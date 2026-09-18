@@ -179,3 +179,40 @@ test("a risky session op still keeps its risk floor", () => {
   const d = classifyOnly("deploy this to production now");
   expect(d.tier).toBe("complex");
 });
+
+test("a delegation brief floors at execution whatever its vocabulary says", () => {
+  // Measured over 381 turns where a cheap model was actually tried: briefs
+  // finished cleanly 31% of the time vs 69% for everything else, with p50 69
+  // tool calls vs 14. The word "list" inside a 200-line spec is not a listing
+  // task — this is the anomaly that made `mechanical` keywords look unsafe.
+  const brief = [
+    "# Goal",
+    "Implement the vault-task command and list every affected record.",
+    "# Ownership",
+    "You own src/vault/*.ts in this worktree only.",
+    "# Acceptance",
+    "Tests green, no writes outside the checkout.",
+    ...Array.from({ length: 20 }, (_, i) => `Step ${i}: perform the described transformation carefully.`),
+  ].join("\n");
+  const d = classifyOnly(brief);
+  expect(d.tier).toBe("execution");
+  expect(d.phase).toBe("implementation");
+});
+
+test("a genuine mechanical request is still mechanical", () => {
+  const d = classifyOnly("rename the variable tmp to buffer and list the files you touched");
+  expect(d.tier).toBe("mechanical");
+});
+
+test("a brief is not treated as a small session op", () => {
+  const brief = [
+    "# Goal",
+    "Reconcile git and deploy the service once the slice lands.",
+    "# Acceptance",
+    "Clean worktree, tagged release.",
+    ...Array.from({ length: 20 }, (_, i) => `Detail ${i}: follow the runbook precisely and record the outcome.`),
+  ].join("\n");
+  const d = classifyOnly(brief);
+  expect(d.tier).not.toBe("bounded");
+  expect(d.tier).not.toBe("mechanical");
+});

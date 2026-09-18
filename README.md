@@ -87,7 +87,7 @@ state (ledger, quota cache, decision log, session corpus) lives in
 ## Verify
 
 ```sh
-bun test            # 96 tests; policy, quota, ledger, classifier contract, load safety
+bun test            # 99 tests; policy, quota, ledger, classifier contract, load safety
 bun run typecheck   # strict, owned modules
 ```
 
@@ -161,6 +161,16 @@ default. Two rules now fire before that default, each backed by a measurement:
 - **Pasted stack traces / code blocks** are `complex` investigation. 14% of
   cheap-struggled turns carried pasted code against 1% of cheap-clean. This is
   the strongest under-routing signal in the corpus.
+- **Delegation briefs** (>=80 words plus two headings, goal/acceptance
+  scaffolding, or embedded tags) floor at `execution`. Measured over the 381
+  turns where a cheap model was actually tried: briefs finished cleanly 31% of
+  the time against 69% for everything else, with p50 69 tool calls against 14.
+
+  Structure beats vocabulary. This rule resolved a real anomaly: `mechanical`
+  keywords looked *unsafe* (39% cheap success, second worst of every feature
+  measured) purely because a 200-line spec containing the word "list" was
+  being classified as a listing task. Excluding briefs takes mechanical's
+  cheap success to 53%, and a brief is never mechanical however it reads.
 
 Replay on 1,799 labelled turns: 18 cheap-clean and 63 premium-clean moved
 down (median 10 tool calls — light work), **0 cheap-struggled moved down**.

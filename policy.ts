@@ -355,7 +355,23 @@ function classify(input: RouteInput): Classification {
   const visualJudgment = /\b(redesign|critique|critica visual|direcao de arte|art direction|visual judgment|polimento visual|design system|identidade visual)\b/.test(text);
   const review = /\b(review|revis\w*|rever|auditar|audit)\b/.test(text);
   const coding = /\b(implement\w*|implemente|corrig\w*|corrija|fix|refator\w*|refactor\w*|codig\w*|code|test\w*|patch|bug|adicione|add|edite|edit|alter\w*|change|atualiz\w*|update)\b/.test(text);
-  const mechanical = /\b(resum\w*|summari[sz]\w*|format\w*|reformat\w*|renome\w*|rename|list|liste|listar|listing|extra\w*|extract|localiz\w*|find file|which file|onde fica|traduz\w*|translate|changelog|typo|ortograf\w*)\b/.test(text);
+  const mechanicalWords = /\b(resum\w*|summari[sz]\w*|format\w*|reformat\w*|renome\w*|rename|list|liste|listar|listing|extra\w*|extract|localiz\w*|find file|which file|onde fica|traduz\w*|translate|changelog|typo|ortograf\w*)\b/.test(text);
+  /**
+   * A delegation brief: long and structured, with goal/acceptance scaffolding
+   * or embedded tags. Structure beats vocabulary here — measured over 381
+   * turns where a cheap model was actually tried, briefs finished cleanly 31%
+   * of the time against 69% for everything else, with 5x the tool calls
+   * (p50 69 vs 14). This is what made `mechanical` keywords look unsafe: a
+   * 200-line spec that happens to contain the word "list" is not a listing
+   * task. Excluding briefs takes mechanical's cheap success from 39% to 53%.
+   */
+  const words = text.split(/\s+/).filter(Boolean).length;
+  const headingCount = (input.prompt.match(/(^|\n)#{1,3} \S/g) ?? []).length;
+  const briefScaffold = /(^|\n)#{0,3}\s*(goal|ownership|acceptance|content|contexto|escopo|scope|non-goals?|deliverable|constraints)\b/i.test(input.prompt);
+  const embeddedTags = /<instructions>|<file name=|<\/[a-z-]+>/.test(input.prompt);
+  const delegationBriefShape = words >= 80 && (headingCount >= 2 || briefScaffold || embeddedTags);
+  // A brief is never a mechanical task, however its words read.
+  const mechanical = mechanicalWords && !delegationBriefShape;
   // Session and repository operations: deploy, commit, push, reconcile, close
   // the worktree, move the issue. Measured over 2,839 real turns
   // (scripts/relabel.ts, outcome labels): of the no-keyword prompts that fell
@@ -368,7 +384,9 @@ function classify(input: RouteInput): Classification {
   // inside large delegation briefs ("work only in this worktree/branch"),
   // which the replay showed being pushed down; those are the opposite of a
   // small op and are excluded explicitly below.
-  const delegationBrief = /\b(voce e a lane|you are the .{0,40}(?:owner|lane|worker)|leia, nesta ordem|read, in this order|siga-os integralmente|follow (?:them|it) (?:integrally|in full))\b/.test(text);
+  // Phrase-level brief markers, kept alongside the structural test: a short
+  // lane assignment carries the same "do not treat this as a small op" weight.
+  const delegationBrief = delegationBriefShape || /\b(voce e a lane|you are the .{0,40}(?:owner|lane|worker)|leia, nesta ordem|read, in this order|siga-os integralmente|follow (?:them|it) (?:integrally|in full))\b/.test(text);
   const sessionOps = !delegationBrief && /\b(deploy\w*|commit\w*|push|pull|merge|rebase|stash|reconcil\w*|clos(?:e|ing) (?:the )?(?:session|worktree)|finish(?:ing)? (?:the )?session|clean(?:up)? (?:the )?worktree|move (?:the )?issue|check linear|git status|is git|reload|restart|reinicia\w*|sobe|suba|smoke)\b/.test(text);
   // A pasted stack trace or code block with no other signal is a debugging
   // request. Measured: 14% of the turns where a cheap model STRUGGLED carried
@@ -376,7 +394,7 @@ function classify(input: RouteInput): Classification {
   // strongest under-routing signal in the corpus and must not fall to a
   // worker. Uses the raw prompt: normalization strips nothing relevant here.
   const pastedCode = /```|\n\s+at [\w.$<>]+ \(|Error(?:Type|Message)?:|Traceback \(most recent call last\)|^\s*(?:\d+ \|)/m.test(input.prompt);
-  const explicitTask = planning || investigation || risky || difficult || visualJudgment || review || coding || mechanical || sessionOps || pastedCode;
+  const explicitTask = planning || investigation || risky || difficult || visualJudgment || review || coding || mechanical || sessionOps || pastedCode || delegationBriefShape;
   const shortFollowup = !explicitTask && text.split(/\s+/).filter(Boolean).length <= 10;
   if (prior && (continuing || shortFollowup)) return { ...prior, uncertain: false, continuation: true };
 
@@ -387,8 +405,13 @@ function classify(input: RouteInput): Classification {
     result = { tier: "complex", phase: planning ? "planning" : "investigation", uncertain: false, continuation: false };
   } else if (review) {
     result = { tier: "execution", phase: "review", uncertain: false, continuation: false };
-  } else if (input.task?.bounded && input.task.acceptanceDefined && coding) {
+  } else if (input.task?.bounded && input.task.acceptanceDefined && coding && !delegationBriefShape) {
     result = { tier: "bounded", phase: "implementation", uncertain: false, continuation: false };
+  } else if (delegationBriefShape) {
+    // Measured: 31% cheap success against 69% for everything else, p50 69 tool
+    // calls against 14. A brief is sustained multi-step work whatever its
+    // vocabulary suggests, so it floors at execution rather than a worker tier.
+    result = { tier: "execution", phase: "implementation", uncertain: false, continuation: false };
   } else if (mechanical) {
     result = { tier: "mechanical", phase: "lightweight", uncertain: false, continuation: false };
   } else if (coding) {
