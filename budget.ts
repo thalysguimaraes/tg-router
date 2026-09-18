@@ -19,6 +19,13 @@ export interface BudgetSnapshot {
   monthlyCommittedUsd: number;
   dailyRemainingUsd: number;
   monthlyRemainingUsd: number;
+  /**
+   * How conservative the reservation bound has actually been, over settled
+   * requests. A bound far above realized spend blocks affordable work through
+   * the caps; measured drift is the evidence for changing it, and is not a
+   * licence to reserve optimistically.
+   */
+  forecast?: { settledCount: number; forecastUsd: number; realizedUsd: number; ratio: number };
 }
 export type ReserveResult =
   | { ok: true; idempotent: boolean; status: "reserved" | "dispatched"; estimatedUsd: number; snapshot: BudgetSnapshot }
@@ -119,12 +126,11 @@ export class BudgetLedger {
       if (money(before.monthlyCommittedUsd) + estimate > this.monthlyMicro) return { ok: false, reason: "monthly-cap", snapshot: before };
       // Purpose subcaps are INSIDE the global caps: they can only further
       // restrict this purpose, never create spending capacity beyond them.
-      if (purpose !== "execution") {
+      if (purpose !== "execution" && options.subcaps) {
         const perPurpose = this.purposeCommitted(purpose, now);
-        const subDaily = money(options.subcaps?.dailyCapUsd ?? Number.POSITIVE_INFINITY, "down");
-        const subMonthly = money(options.subcaps?.monthlyCapUsd ?? Number.POSITIVE_INFINITY, "down");
-        if (perPurpose.day + estimate > subDaily) return { ok: false, reason: "daily-cap", snapshot: before };
-        if (perPurpose.month + estimate > subMonthly) return { ok: false, reason: "monthly-cap", snapshot: before };
+        const { dailyCapUsd, monthlyCapUsd } = options.subcaps;
+        if (dailyCapUsd !== undefined && perPurpose.day + estimate > money(dailyCapUsd, "down")) return { ok: false, reason: "daily-cap", snapshot: before };
+        if (monthlyCapUsd !== undefined && perPurpose.month + estimate > money(monthlyCapUsd, "down")) return { ok: false, reason: "monthly-cap", snapshot: before };
       }
       this.db.query("INSERT INTO budget_requests(request_id,estimated_micro,status,reserved_at,purpose) VALUES (?,?,'reserved',?,?)").run(requestId, estimate, now, purpose);
       return { ok: true, idempotent: false, status: "reserved", estimatedUsd: estimate / MICRO_USD, snapshot: this.snapshot(now) };
@@ -197,8 +203,12 @@ export class BudgetLedger {
       COALESCE(SUM(CASE WHEN status='settled' AND settled_at>=? AND settled_at<? THEN actual_micro ELSE 0 END),0) AS day,
       COALESCE(SUM(CASE WHEN status='settled' AND settled_at>=? AND settled_at<? THEN actual_micro ELSE 0 END),0) AS month,
       COALESCE(SUM(CASE WHEN status IN ('reserved','dispatched') THEN estimated_micro ELSE 0 END),0) AS pending,
-      COALESCE(SUM(CASE WHEN status IN ('reserved','dispatched') THEN 1 ELSE 0 END),0) AS count
-      FROM budget_requests`).get(dayStart, dayEnd, monthStart, monthEnd) as { day: number; month: number; pending: number; count: number };
+      COALESCE(SUM(CASE WHEN status IN ('reserved','dispatched') THEN 1 ELSE 0 END),0) AS count,
+      COALESCE(SUM(CASE WHEN status='settled' THEN estimated_micro ELSE 0 END),0) AS forecast,
+      COALESCE(SUM(CASE WHEN status='settled' THEN actual_micro ELSE 0 END),0) AS realized,
+      COALESCE(SUM(CASE WHEN status='settled' THEN 1 ELSE 0 END),0) AS settledCount
+      FROM budget_requests`).get(dayStart, dayEnd, monthStart, monthEnd) as
+      { day: number; month: number; pending: number; count: number; forecast: number; realized: number; settledCount: number };
     return {
       timezone: "UTC", dailyCapUsd: this.dailyMicro / MICRO_USD, monthlyCapUsd: this.monthlyMicro / MICRO_USD,
       dailySpentUsd: sums.day / MICRO_USD, monthlySpentUsd: sums.month / MICRO_USD,
@@ -206,6 +216,16 @@ export class BudgetLedger {
       dailyCommittedUsd: (sums.day + sums.pending) / MICRO_USD, monthlyCommittedUsd: (sums.month + sums.pending) / MICRO_USD,
       dailyRemainingUsd: Math.max(0, this.dailyMicro - sums.day - sums.pending) / MICRO_USD,
       monthlyRemainingUsd: Math.max(0, this.monthlyMicro - sums.month - sums.pending) / MICRO_USD,
+      ...(sums.settledCount > 0 ? {
+        forecast: {
+          settledCount: sums.settledCount,
+          forecastUsd: sums.forecast / MICRO_USD,
+          realizedUsd: sums.realized / MICRO_USD,
+          // Realized / forecast. 1.0 means the bound was exactly right; 0.1
+          // means the bound reserved ten times the money actually spent.
+          ratio: sums.forecast > 0 ? sums.realized / sums.forecast : 0,
+        },
+      } : {}),
     };
   }
   close(): void { this.db.close(); }

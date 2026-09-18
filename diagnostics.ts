@@ -3,6 +3,19 @@ const ERROR_CODES = ['ETIMEDOUT', 'ESOCKETTIMEDOUT', 'ECONNRESET', 'ECONNREFUSED
 const object = (value: unknown): Record<string, unknown> => value !== null && typeof value === 'object' ? value as Record<string, unknown> : {};
 const errorStatus = (value: unknown): number | undefined => typeof value === 'number' && Number.isInteger(value) && value >= 400 && value <= 599 ? value : undefined;
 const identifier = (value: unknown): string | undefined => typeof value === 'string' && /^[\w./:-]{1,160}$/.test(value) ? value : undefined;
+/**
+ * An upstream that does not serve the requested model. 9Router wraps the
+ * upstream's 401 in a 503, which the host treats as retryable, so a pinned
+ * unsupported model burned all ten retries against a permanent condition.
+ * Retrying cannot change the answer: the route itself is wrong.
+ */
+const UNSUPPORTED = /\bmodel\b[^.\n]{0,80}?\bis not supported\b|\bunsupported model\b|\bmodel_not_found\b|\bno such model\b|\bmodel\b[^.\n]{0,80}?\bdoes not exist\b/i;
+export function unsupportedModel(error: unknown): boolean {
+  const source = object(error), cause = object(source.cause);
+  const text = [typeof error === 'string' ? error : source.message, cause.message, typeof source.error === 'string' ? source.error : undefined]
+    .filter((value): value is string => typeof value === 'string').join(' ').slice(0, 8192);
+  return UNSUPPORTED.test(text);
+}
 
 export type ProviderFailure = { errorType: string; code?: string; reason: string; status?: number; cancelled: boolean };
 export function errorDetails(error: unknown, httpStatus?: number, signal?: AbortSignal | null): ProviderFailure {
@@ -14,7 +27,7 @@ export function errorDetails(error: unknown, httpStatus?: number, signal?: Abort
   const status = errorStatus(source.status) ?? errorStatus(source.statusCode) ?? errorStatus(object(source.response).status) ?? errorStatus(cause.status) ?? errorStatus(Number(text.match(/(?:\bhttp(?:\s+status)?\s*[:=]?\s*|\bstatus(?:\s+code)?[\s:=]+|^)([45]\d{2})\b/)?.[1])) ?? errorStatus(httpStatus);
   const timeout = /timeout|timed?\s*out/i.test(`${name} ${code ?? ''} ${text}`) || signalReason.name === 'TimeoutError';
   const cancelled = !timeout && (signal?.aborted === true || name === 'AbortError' || code === 'ABORT_ERR');
-  const reason = timeout ? 'timeout' : cancelled ? 'cancelled' : status === 429 || code === 'rate_limit_exceeded' || code === 'insufficient_quota' ? 'rate-limit' : status === 401 || status === 403 || code === 'invalid_api_key' ? 'authentication' : code === 'context_length_exceeded' ? 'context-limit' : status && status >= 500 ? 'provider-unavailable' : code || /fetch failed|network|connection/.test(text) ? 'transport-error' : 'provider-error';
+  const reason = timeout ? 'timeout' : cancelled ? 'cancelled' : unsupportedModel(error) ? 'model-unsupported' : status === 429 || code === 'rate_limit_exceeded' || code === 'insufficient_quota' ? 'rate-limit' : status === 401 || status === 403 || code === 'invalid_api_key' ? 'authentication' : code === 'context_length_exceeded' ? 'context-limit' : status && status >= 500 ? 'provider-unavailable' : code || /fetch failed|network|connection/.test(text) ? 'transport-error' : 'provider-error';
   return { errorType: ERROR_TYPES.includes(name) ? name : 'Error', code, reason, status, cancelled };
 }
 

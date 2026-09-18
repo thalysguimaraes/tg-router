@@ -9,6 +9,14 @@ export type QuotaState = "healthy" | "reserve" | "depleted" | "unknown";
 /** Integration passes every applicable window, scoped to an eligible native account. */
 export interface QuotaWindow {
   id: string;
+  /**
+   * Stable identity of the underlying allowance, when the integration can name
+   * it (`<provider>:<accountHash>:<windowId>`). Two models drawing on the SAME
+   * allowance are not independent capacity: Fable and Sonnet on one Claude
+   * subscription share `weekly-7d`, so spending one spends the other. Absent
+   * means "not known to be shared", never "known independent".
+   */
+  sharedKey?: string;
   remainingFraction?: number;
   usedFraction?: number;
   resetsAt?: number;
@@ -53,6 +61,14 @@ export interface RouteModel {
   /** Explicit task qualification for extra models; unrelated benchmark scores are not used. */
   qualityTiers?: RouteTier[];
   payg?: boolean;
+  /**
+   * Conservative USD upper bound for THIS task on this paid route, from live
+   * rates and the request's own token bounds. Paid candidates share one cost
+   * class and carry no quota window, so without this they were ordered by a
+   * hardcoded preference list and price was ignored entirely. Absent means
+   * "price unknown", which never ranks ahead of a known price.
+   */
+  taskCostUsd?: number;
 }
 export interface CurrentRoute {
   model: string;
@@ -87,10 +103,24 @@ export interface RouteInput {
   paidFallback?: { authorized: boolean; budgetReserved: boolean; allowedModels: string[] };
   /** A visible work-state handoff exists before leaving Fable's reasoning format. */
   handoffReady?: boolean;
+  /**
+   * Resolved classification for THIS request (rules + semantic evidence),
+   * computed by the caller from `classifyTask(input)` and
+   * `resolveClassification`. When present it replaces the internal rules
+   * classification; hard floors, pins and quality escalation still apply.
+   */
+  classification?: { tier: RouteTier; phase: RoutePhase };
   quotaMaxAgeMs?: number;
   promotionMaxAgeMs?: number;
   /** Live canonical models already held by parent + siblings when boundary === "child". */
   siblings?: Array<{ canonicalRef: string; count: number }>;
+  /**
+   * Agents observed to be mid-task against a shared allowance, keyed by
+   * `QuotaWindow.sharedKey`. Sibling counts are provider-level and cannot see
+   * this: two agents on DIFFERENT models of the same subscription consume one
+   * window. Advisory — the provider's own accounting stays authoritative.
+   */
+  inFlightByWindow?: Record<string, number>;
 }
 export interface RouteDecision {
   action: "select" | "preserve" | "unavailable";
@@ -164,6 +194,8 @@ export type SemanticMode = "off" | "shadow" | "assisted" | "calibrated";
 export const SEMANTIC_GATES = {
   overrideTopProbability: 0.80,
   overrideConfidence: 0.80,
+  /** A phase clarification below this confidence is a no-op, not a relabel. */
+  phaseConfidence: 0.70,
   downgradeTopProbability: 0.90,
   downgradeConfidence: 0.90,
   downgradeMargin: 0.20,
@@ -198,15 +230,18 @@ export function resolveClassification(input: ResolveAssessmentInput): { tier: Ro
     return { tier, phase, source: "rules", reason: input.mode === "off" ? "Semantic routing is off." : "No usable semantic assessment; rules baseline applies." };
   }
   const floorRank = input.floorTier ? Math.max(rank(tier), rank(input.floorTier)) : rank(tier);
+  // Phase constraints hold in EVERY branch: a locked child phase and a rules
+  // `review` phase are never reinterpreted (review routing is Fable/Astra
+  // only, so relabeling it would relax eligibility without lowering the tier).
+  const resolvedPhase = constrainedPhase(assessment, phase, input.floorLocksPhase === true);
   if (input.mode === "assisted") {
     // Assisted mode: semantic phase clarification and upward-only tier moves.
     const semanticTier = assessment.tier ? safeTier(assessment.tier.selected) : undefined;
     if (semanticTier && rank(semanticTier) > floorRank && gatesPass(assessment.tier!, SEMANTIC_GATES.overrideTopProbability, SEMANTIC_GATES.overrideConfidence)) {
-      return { tier: semanticTier, phase: phaseOf(assessment, phase), source: "semantic-assisted", reason: `Semantic assessment raised the capability floor (${tier} -> ${semanticTier}).` };
+      return { tier: semanticTier, phase: resolvedPhase, source: "semantic-assisted", reason: `Semantic assessment raised the capability floor (${tier} -> ${semanticTier}).` };
     }
-    const semanticPhase = safePhase(assessment.phase?.selected ?? "");
-    if (semanticPhase && input.floorLocksPhase !== true) {
-      return { tier, phase: semanticPhase, source: "semantic-assisted", reason: `Semantic phase clarification: ${phase} -> ${semanticPhase}.` };
+    if (resolvedPhase !== phase) {
+      return { tier, phase: resolvedPhase, source: "semantic-assisted", reason: `Semantic phase clarification: ${phase} -> ${resolvedPhase}.` };
     }
     return { tier, phase, source: "rules", reason: "Assisted mode keeps the rules baseline." };
   }
@@ -250,16 +285,15 @@ export function resolveClassification(input: ResolveAssessmentInput): { tier: Ro
         // A downgrade may land anywhere from the rules tier down to the role
         // minimum; without a role minimum the semantic tier itself is the floor.
         const floor = input.floorTier && rank(input.floorTier) > rank(semanticTier) ? input.floorTier : semanticTier;
-        return { tier: floor, phase: phaseOf(assessment, phase), source: rank(floor) < rank(tier) ? "semantic-downgrade" : "rules", reason: rank(floor) < rank(tier) ? `Calibrated semantic downgrade (${tier} -> ${floor}) passed all uncertainty gates; child floor honored.` : `Rules tier ${tier} kept; semantic tier ${semanticTier} sits at or above the floor.` };
+        return { tier: floor, phase: resolvedPhase, source: rank(floor) < rank(tier) ? "semantic-downgrade" : "rules", reason: rank(floor) < rank(tier) ? `Calibrated semantic downgrade (${tier} -> ${floor}) passed all uncertainty gates; child floor honored.` : `Rules tier ${tier} kept; semantic tier ${semanticTier} sits at or above the floor.` };
       }
       return { tier, phase, source: "rules", reason: "Semantic downgrade failed an uncertainty gate; rules baseline applies." };
     }
     if (rank(semanticTier) > floorRank && gatesPass(semanticTierObject, SEMANTIC_GATES.overrideTopProbability, SEMANTIC_GATES.overrideConfidence)) {
-      return { tier: semanticTier, phase: phaseOf(assessment, phase), source: "semantic-assisted", reason: `Semantic assessment raised the capability floor (${tier} -> ${semanticTier}).` };
+      return { tier: semanticTier, phase: resolvedPhase, source: "semantic-assisted", reason: `Semantic assessment raised the capability floor (${tier} -> ${semanticTier}).` };
     }
-    const semanticPhase = safePhase(assessment.phase?.selected ?? "");
-    if (semanticPhase && input.floorLocksPhase !== true) {
-      return { tier, phase: semanticPhase, source: "semantic-assisted", reason: `Semantic phase clarification: ${phase} -> ${semanticPhase}.` };
+    if (resolvedPhase !== phase) {
+      return { tier, phase: resolvedPhase, source: "semantic-assisted", reason: `Semantic phase clarification: ${phase} -> ${resolvedPhase}.` };
     }
     return { tier, phase, source: "rules", reason: "Calibrated mode kept the rules baseline." };
   }
@@ -273,8 +307,11 @@ function safeTier(value: string): RouteTier | undefined {
 function safePhase(value: string): RoutePhase | undefined {
   return (["lightweight", "implementation", "review", "investigation", "planning"] as readonly string[]).includes(value) ? value as RoutePhase : undefined;
 }
-function phaseOf(assessment: SemanticAssessment, fallback: RoutePhase): RoutePhase {
-  return safePhase(assessment.phase?.selected ?? "") ?? fallback;
+function constrainedPhase(assessment: SemanticAssessment, rulesPhase: RoutePhase, locked: boolean): RoutePhase {
+  if (locked || rulesPhase === "review") return rulesPhase;
+  const semanticPhase = safePhase(assessment.phase?.selected ?? "");
+  if (!semanticPhase || (assessment.phase?.confidence ?? 0) < SEMANTIC_GATES.phaseConfidence) return rulesPhase;
+  return semanticPhase;
 }
 function gatesPass(tier: { selected: string; confidence?: number; probabilities: Record<string, number> }, topProbabilityGate: number, confidenceGate: number): boolean {
   return topProbability(tier.probabilities, tier.selected) >= topProbabilityGate && (tier.confidence ?? 0) >= confidenceGate;
@@ -452,6 +489,43 @@ function classify(input: RouteInput): Classification {
   return result;
 }
 
+/** The deterministic rules classification of this request, for the caller to combine with semantic evidence. */
+export function classifyTask(input: RouteInput): { tier: RouteTier; phase: RoutePhase } {
+  const { tier, phase } = classify(input);
+  return { tier, phase };
+}
+
+/**
+ * Final check before a provider attempt, including every tool-loop
+ * continuation. Deliberately cheap and stateless: no classification, no quota
+ * refresh, no paid authorization decisions — those belong to the routing
+ * boundary. The caller supplies CURRENT facts (context, quota, clock) with the
+ * committed decision's tier; this refuses an attempt that is already known to
+ * be invalid: an unauthenticated route, a context that no longer fits, a
+ * missing required capability, a route below the committed quality floor, or
+ * a quota window observed as exhausted.
+ */
+export function admitAttempt(model: RouteModel, input: RouteInput, committedTier?: RouteTier): { ok: true } | { ok: false; reason: string } {
+  if (!Number.isFinite(input.contextTokens) || input.contextTokens < 0 ||
+      (input.outputMarginTokens !== undefined && (!Number.isFinite(input.outputMarginTokens) || input.outputMarginTokens < 0))) {
+    return { ok: false, reason: "a valid complete-context token estimate is required" };
+  }
+  if (!model.authenticated) return { ok: false, reason: "route is not authenticated" };
+  if (!Number.isFinite(model.contextWindow) || model.contextWindow <= 0 ||
+      input.contextTokens + (input.outputMarginTokens ?? 16_384) > model.contextWindow) {
+    return { ok: false, reason: "complete context and output margin do not fit" };
+  }
+  if (input.needsImages && !model.supportsImages) return { ok: false, reason: "image input is required" };
+  if (input.needsTools !== false && !model.supportsTools) return { ok: false, reason: "tool use is required" };
+  if (committedTier && !qualifies(model, committedTier, input)) return { ok: false, reason: "route is below the committed task's quality floor" };
+  if (committedTier && canonicalModelRef(model).startsWith("opencode-go/")) {
+    if (input.needsTools !== false && !model.validated?.tools) return { ok: false, reason: "Go tool-loop validation is missing" };
+    if (input.needsImages && !model.validated?.vision) return { ok: false, reason: "Go vision validation is missing" };
+  }
+  if (quotaState(model, input) === "depleted") return { ok: false, reason: "an applicable quota window is exhausted" };
+  return { ok: true };
+}
+
 function quotaState(model: RouteModel, input: RouteInput): QuotaState {
   const snapshot = model.quota;
   if (!snapshot) return "unknown";
@@ -560,6 +634,41 @@ export function pressure(snapshot: QuotaSnapshot | undefined, now: number): numb
 export const PRESSURE_SWAP_RATIO = 0.5;
 
 /**
+ * Fraction of a shared allowance an average task consumes. 9Router reports
+ * windows as PERCENTAGES with no absolute capacity, so a token-denominated
+ * estimate cannot be converted into window units without inventing the
+ * denominator. This is a deliberately coarse per-agent debit: its only job is
+ * to stop N concurrent agents all ranking the same slack as available.
+ */
+export const IN_FLIGHT_WINDOW_DEBIT = 0.05;
+
+/**
+ * Remaining fraction of a window after the work already committed against the
+ * same allowance. Shared identity matters here: two agents on different models
+ * of one subscription draw on one window, which a provider-level sibling count
+ * cannot see.
+ */
+function postRequestFraction(window: QuotaWindow, input: RouteInput): number {
+  const remaining = window.remainingFraction!;
+  const key = window.sharedKey;
+  const inFlight = key ? (input.inFlightByWindow?.[key] ?? 0) : 0;
+  return Math.max(0, remaining - inFlight * IN_FLIGHT_WINDOW_DEBIT);
+}
+
+/**
+ * Headroom after in-flight commitments: remaining fraction per hour until
+ * reset, minus what agents already working against the same shared allowance
+ * will consume. -1 when unknown.
+ */
+export function usableHeadroom(snapshot: QuotaSnapshot | undefined, input: RouteInput): number {
+  const now = input.now ?? 0;
+  const windows = (snapshot?.windows ?? []).filter(window => finiteFraction(window.remainingFraction));
+  if (!windows.length) return -1;
+  return Math.min(...windows.map(window =>
+    postRequestFraction(window, input) / Math.max(1, ((window.resetsAt ?? now + 3600000) - now) / 3600000)));
+}
+
+/**
  * Cost class of a model. The allocator NEVER crosses upward: a task the cheapest
  * qualified class can do is never given to a dearer class, however much slack
  * the dearer class has. Within a class, headroom decides. Order is by what a
@@ -571,19 +680,28 @@ const COST_CLASS: Record<string, number> = {
   [MODELS.sol]: 1, [MODELS.sonnet]: 1,
   [MODELS.astra]: 2, [MODELS.opus]: 2, [MODELS.fable]: 2,
 };
+/** Paid-as-you-go routes: the scarce resource is cash, not a subscription window. */
+export const PAID_COST_CLASS = 3;
 const costClass = (model: RouteModel): number => {
-  if (model.payg === true || model.ref.startsWith("openrouter/") || model.ref.startsWith("deepseek/")) return 3;
+  if (model.payg === true || model.ref.startsWith("openrouter/") || model.ref.startsWith("deepseek/")) return PAID_COST_CLASS;
   return COST_CLASS[canonicalModelRef(model)] ?? 2;
 };
-
 /**
- * Headroom the allocator ranks by. Sibling children already holding the same
- * provider dilute it. Reserve state halves it so a reserve window is used only
- * when nothing else in the class has slack. Unknown quota ranks below any
- * known value: it is not evidence of capacity.
+ * Headroom the allocator ranks by: post-request usable capacity of the scarcest
+ * applicable window. Work already in flight against the same shared allowance
+ * is debited first, so N concurrent agents cannot all count the same slack.
+ * Sibling children holding the same provider dilute it further (a coarser
+ * signal that also covers windows with no shared identity). Reserve state
+ * halves it so a reserve window is used only when nothing else in the class
+ * has slack. Unknown quota ranks below any known value: it is not evidence of
+ * capacity.
  */
 function allocationHeadroom(model: RouteModel, input: RouteInput): number {
-  let value = pressure(model.quota, input.now ?? 0);
+  // Only fresh, unexpired, non-reset observations supply positive headroom:
+  // quotaState applies the freshness and reset checks that pressure() lacks.
+  const state = quotaState(model, input);
+  if (state === "unknown" || state === "depleted") return -1;
+  let value = usableHeadroom(model.quota, input);
   if (value < 0) return -1;
   if (input.boundary === "child") {
     const load = (input.siblings ?? [])
@@ -591,12 +709,22 @@ function allocationHeadroom(model: RouteModel, input: RouteInput): number {
       .reduce((sum, entry) => sum + entry.count, 0);
     value = value / (1 + load);
   }
-  if (!input.task?.highValue && quotaState(model, input) === "reserve") value = value / 2;
+  if (!input.task?.highValue && state === "reserve") value = value / 2;
   return value;
 }
 
 export function decideRoute(input: RouteInput): RouteDecision {
   const classification = classify(input);
+  if (input.classification && (input.classification.tier !== classification.tier || input.classification.phase !== classification.phase)) {
+    // An explicit resolved classification is authoritative for this request;
+    // it is not a continuation signal, so the current route is not preserved
+    // merely because the prompt looked uncertain.
+    classification.tier = input.classification.tier;
+    classification.phase = input.classification.phase;
+    classification.uncertain = false;
+    classification.continuation = false;
+    classification.phaseLocked = undefined;
+  }
   const failures = input.task?.failedQualityChecks ?? 0;
   if (failures >= 2) {
     const previousTier = input.previous?.tier ?? input.current?.tier ?? classification.tier;
@@ -666,29 +794,44 @@ export function decideRoute(input: RouteInput): RouteDecision {
     rejected.push({ model: model.ref, reason: "a mapped 9Router route owns this canonical identity; direct fallback requires an explicit pin" });
     return false;
   });
-  // Allocation. Lexicographic by cost class (never cross upward), then by
-  // headroom within the class (spend the most abundant window first), then by
-  // the phase preference list as a tie-break, then gateway-first.
-  // Reserve and unknown quota are folded into headroom, not treated as walls:
-  // a reserve window in the cheapest class still beats spending a dearer class.
+  // Allocation. Fix the cheapest eligible cost class (never cross upward),
+  // then shortlist the candidates whose known headroom is within
+  // PRESSURE_SWAP_RATIO of the class maximum, then order the shortlist by the
+  // reviewed preference list, gateway-first, then ref. Global thresholds keep
+  // the ordering total: a pairwise ratio comparator was cyclic.
   const headroomOf = new Map<RouteModel, number>(automaticEligible.map(model => [model, allocationHeadroom(model, input)]));
-  const candidates = [...automaticEligible].sort((a, b) => {
-    const byClass = costClass(a) - costClass(b);
-    if (byClass !== 0) return byClass;
-    const ha = headroomOf.get(a)!, hb = headroomOf.get(b)!;
-    // Known headroom beats unknown; among known, more slack first, but only
-    // when the difference is meaningful. Small differences fall through to
-    // the reviewed preference order so quality within a class still counts.
-    if ((ha < 0) !== (hb < 0)) return ha < 0 ? 1 : -1;
-    if (ha >= 0 && hb >= 0 && (Math.min(ha, hb) < PRESSURE_SWAP_RATIO * Math.max(ha, hb))) return hb - ha;
+  const cheapest = Math.min(...automaticEligible.map(costClass));
+  const inClass = automaticEligible.filter(model => costClass(model) === cheapest);
+  const known = inClass.filter(model => headroomOf.get(model)! >= 0);
+  const maxHeadroom = known.length ? Math.max(...known.map(model => headroomOf.get(model)!)) : -1;
+  const shortlist = known.length ? known.filter(model => headroomOf.get(model)! >= PRESSURE_SWAP_RATIO * maxHeadroom) : inClass;
+  // Inside the paid class the scarce resource is cash, not a quota window, so
+  // a known cheaper forecast wins before the reviewed preference order. A
+  // route with no price never outranks one with a known price.
+  const byCost = (a: RouteModel, b: RouteModel) => {
+    if (cheapest !== PAID_COST_CLASS) return 0;
+    const ca = a.taskCostUsd, cb = b.taskCostUsd;
+    if (ca === cb) return 0;
+    if (ca === undefined) return 1;
+    if (cb === undefined) return -1;
+    return ca - cb;
+  };
+  const byPreference = (a: RouteModel, b: RouteModel) => {
     const aIndex = order.indexOf(canonicalModelRef(a)), bIndex = order.indexOf(canonicalModelRef(b));
-    const byPreference = (aIndex < 0 ? order.length : aIndex) - (bIndex < 0 ? order.length : bIndex);
-    if (byPreference !== 0) return byPreference;
-    return Number(isGatewayModel(b)) - Number(isGatewayModel(a));
-  });
+    return byCost(a, b)
+      || ((aIndex < 0 ? order.length : aIndex) - (bIndex < 0 ? order.length : bIndex))
+      || (Number(isGatewayModel(b)) - Number(isGatewayModel(a)))
+      || (a.ref < b.ref ? -1 : a.ref > b.ref ? 1 : 0);
+  };
+  const rest = automaticEligible.filter(model => !shortlist.includes(model))
+    .sort((a, b) => (costClass(a) - costClass(b)) || (headroomOf.get(b)! - headroomOf.get(a)!) || byPreference(a, b));
+  const candidates = [...[...shortlist].sort(byPreference), ...rest];
   if (candidates.length === 0) return unavailable("No authenticated route meets capability, context, quota and payment constraints; the quality floor is unchanged.");
   const runnerUp = candidates[1];
-  const swapReason = runnerUp && costClass(runnerUp) === costClass(candidates[0]!) && order.indexOf(canonicalModelRef(runnerUp)) < order.indexOf(canonicalModelRef(candidates[0]!))
+  const selectedCost = candidates[0]!.taskCostUsd;
+  const swapReason = runnerUp && costClass(runnerUp) === costClass(candidates[0]!) && cheapest === PAID_COST_CLASS && selectedCost !== undefined
+    ? ` Forecast: ${canonicalModelRef(candidates[0]!)} at $${selectedCost.toFixed(4)}${runnerUp.taskCostUsd !== undefined ? ` under ${canonicalModelRef(runnerUp)} at $${runnerUp.taskCostUsd.toFixed(4)}` : ""}.`
+    : runnerUp && costClass(runnerUp) === costClass(candidates[0]!) && order.indexOf(canonicalModelRef(runnerUp)) < order.indexOf(canonicalModelRef(candidates[0]!))
     ? ` Headroom: ${canonicalModelRef(candidates[0]!)} (${headroomOf.get(candidates[0]!)!.toFixed(3)}/h) over ${canonicalModelRef(runnerUp)} (${headroomOf.get(runnerUp)!.toFixed(3)}/h).`
     : "";
   const selected = candidates[0]!;

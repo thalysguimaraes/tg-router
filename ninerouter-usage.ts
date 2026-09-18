@@ -3,10 +3,16 @@ import { join } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import type { QuotaAccount, QuotaSnapshot, QuotaState, QuotaWindow } from './policy';
 
-/** The 9Router admin surface is intentionally fixed; callers cannot redirect credentials. */
-export const NINE_ROUTER_ORIGIN = 'https://llm.thalys.cloud';
+/**
+ * The 9Router admin surface. Fixed for the lifetime of the process so callers
+ * cannot redirect credentials mid-flight; the deployment supplies it through
+ * the environment because the gateway is self-hosted and per-user. Both the
+ * origin and the 1Password reference are deployment facts, not defaults worth
+ * shipping.
+ */
+export const NINE_ROUTER_ORIGIN = process.env.OMP_NINEROUTER_ORIGIN ?? 'https://9router.example';
 export const NINE_ROUTER_USAGE_FILE = '9router-usage.json';
-export const NINE_ROUTER_PASSWORD_REF = 'op://Personal/9Router - llm.thalys.cloud/password';
+export const NINE_ROUTER_PASSWORD_REF = process.env.OMP_NINEROUTER_OP_REF ?? 'op://Personal/9Router/password';
 export const NINE_ROUTER_CACHE_TTL_MS = 120_000;
 export const NINE_ROUTER_STALE_MS = 300_000;
 /**
@@ -692,17 +698,19 @@ function reserveFraction(window: { id: string; resetAt?: number }, observedAt: n
   return 0;
 }
 
-function isLockedForModel(account: NineRouterAccountUsage, modelId: string, now: number): boolean {
-  if (!account.modelLocks) return false;
+/** Latest unexpired modelLock expiry (ms) for this model, or undefined when not locked. */
+function modelLockUntil(account: NineRouterAccountUsage, modelId: string, now: number): number | undefined {
+  if (!account.modelLocks) return undefined;
   // Locks are keyed by bare model id; strips a provider-qualified prefix.
   const bare = modelId.toLowerCase().split('/').pop()!;
   const ids = new Set([bare, modelId.toLowerCase(), '___all']);
+  let latest: number | undefined;
   for (const [model, expiry] of Object.entries(account.modelLocks)) {
     if (!ids.has(model.toLowerCase())) continue;
     const until = typeof expiry === 'string' ? Date.parse(expiry) : undefined;
-    if (until !== undefined && Number.isFinite(until) && until > now) return true;
+    if (until !== undefined && Number.isFinite(until) && until > now && (latest === undefined || until > latest)) latest = until;
   }
-  return false;
+  return latest;
 }
 
 function windowIdOf(source: NineRouterQuotaWindow, observedAt: number): string {
@@ -712,9 +720,13 @@ function windowIdOf(source: NineRouterQuotaWindow, observedAt: number): string {
   return source.id;
 }
 
-function accountPressure(account: NineRouterAccountUsage, observedAt: number): number {
+function accountPressure(account: NineRouterAccountUsage, modelId: string, observedAt: number, now: number): number {
   const hours: number[] = [];
   for (const window of account.windows) {
+    // Same scoping as account eligibility: irrelevant model-specific windows
+    // and readings taken before a passed reset carry no headroom evidence.
+    if (!windowRelevant(modelId, window.id)) continue;
+    if (window.resetAt !== undefined && window.resetAt <= now && observedAt < window.resetAt) continue;
     const fractions = windowFractions(window);
     if (fractions.remaining === undefined) continue;
     const hoursToReset = window.resetAt !== undefined ? Math.max(1, (window.resetAt - observedAt) / 3600_000) : 1;
@@ -723,9 +735,21 @@ function accountPressure(account: NineRouterAccountUsage, observedAt: number): n
   return hours.length ? Math.min(...hours) : -1;
 }
 
-function classifyAccount(account: NineRouterAccountUsage, modelId: string, observedAt: number, now: number): { state: QuotaState; windows: QuotaWindow[]; locked: boolean } {
+/**
+ * `provider:accountHash:windowId` — the identity of the underlying allowance.
+ * Two models of the same subscription that map to the same window id are
+ * spending one meter, so a caller can debit in-flight work against it. The
+ * account hash is already non-reversible; no credential material is exposed.
+ */
+function sharedWindowKey(provider: string, account: NineRouterAccountUsage, windowId: string): string | undefined {
+  const accountId = account.idHash ?? account.connectionId;
+  return accountId ? `${provider}:${accountId}:${windowId}` : undefined;
+}
+
+function classifyAccount(account: NineRouterAccountUsage, modelId: string, observedAt: number, now: number, provider?: string): { state: QuotaState; windows: QuotaWindow[]; locked: boolean } {
   const windows: QuotaWindow[] = [];
-  const locked = isLockedForModel(account, modelId, now);
+  const lockUntil = modelLockUntil(account, modelId, now);
+  const locked = lockUntil !== undefined;
   let unknown = account.unavailable === true || account.windows.length === 0;
   let depleted = account.limitReached === true;
   let reserve = false;
@@ -736,8 +760,11 @@ function classifyAccount(account: NineRouterAccountUsage, modelId: string, obser
     const elapsedWithoutRefresh = source.resetAt !== undefined && source.resetAt <= now && observedAt < source.resetAt;
     const fractions: { used?: number; remaining?: number } = elapsedWithoutRefresh ? {} : windowFractions(source);
     const horizon = source.resetAt !== undefined && source.resetAt > observedAt ? source.resetAt - observedAt : undefined;
+    const id = windowIdOf(source, observedAt);
+    const shared = provider ? sharedWindowKey(provider, account, id) : undefined;
     const window: QuotaWindow = {
-      id: windowIdOf(source, observedAt),
+      id,
+      ...(shared ? { sharedKey: shared } : {}),
       usedFraction: fractions.used,
       remainingFraction: elapsedWithoutRefresh ? undefined : fractions.remaining,
       resetsAt: source.resetAt,
@@ -750,46 +777,61 @@ function classifyAccount(account: NineRouterAccountUsage, modelId: string, obser
     if (fractions.remaining === undefined) unknown = true;
     else if (fractions.remaining <= window.reserveFraction!) reserve = true;
   }
+  // The lock travels as an explicit exhausted window with its own expiry so
+  // policy keeps blocking while it is active even when capacity evidence is
+  // stale, and stops blocking (unknown, not full) once it expires.
+  if (locked) windows.push({ id: 'model-lock', exhausted: true, resetsAt: lockUntil });
   if (!windows.length) unknown = true;
   let state: QuotaState;
-  if (depleted) state = 'depleted';
+  if (depleted || locked) state = 'depleted';
   else if (unknown) state = 'unknown';
   else state = reserve ? 'reserve' : 'healthy';
-  return { state: locked && state !== 'depleted' ? 'unknown' : state, windows, locked };
+  return { state, windows, locked };
+}
+
+/**
+ * Negative evidence that survives telemetry failure: an account is blocked
+ * when a model lock is unexpired or a relevant window is known exhausted with
+ * its reset still ahead. The pool is depleted only when EVERY account is
+ * blocked; an account with merely stale or missing capacity is unknown, which
+ * is not healthy but also not proof of exhaustion.
+ */
+function retainedBlocking(accounts: Array<{ provider: string; account: NineRouterAccountUsage }>, modelId: string, observedAt: number, now: number): QuotaSnapshot {
+  const unique = new Map<string, { provider: string; account: NineRouterAccountUsage }>();
+  for (const entry of accounts) unique.set(entry.account.idHash ?? JSON.stringify(entry.account), entry);
+  const classified = [...unique.values()].map(({ provider, account }) => ({ account, classification: classifyAccount(account, modelId, observedAt, now, provider) }));
+  const blocked = classified.filter(({ classification }) =>
+    classification.locked || (classification.state === 'depleted' &&
+      classification.windows.some(window => window.resetsAt === undefined || window.resetsAt > now)));
+  if (!classified.length || blocked.length < classified.length) return { observedAt, state: 'unknown', windows: [] };
+  const best = blocked.reduce((a, b) =>
+    a.account.priority !== undefined && (b.account.priority === undefined || a.account.priority <= b.account.priority) ? a : b);
+  return { observedAt, state: 'depleted', windows: best.classification.windows };
 }
 
 /** Pure adapter from sanitized cache data to the policy's QuotaSnapshot contract. */
 export function gatewayQuota(modelId: string, cache: NineRouterUsageCache | undefined | null, now = Date.now()): QuotaSnapshot {
   const observedAt = cache && finite(cache.fetchedAt) && cache.fetchedAt <= now ? cache.fetchedAt : 0;
   const keys = providerKeysForModel(modelId);
+  // The provider key travels with each account so a window can be named by the
+  // allowance it belongs to, not just by its local id.
+  const owned = keys.flatMap(key => {
+    const provider = cache?.providers?.[key];
+    return provider ? (provider.accounts ?? []).map(account => ({ provider: key, account })) : [];
+  });
   const providers = keys.map(key => cache?.providers?.[key]).filter((value): value is NineRouterProviderUsage => !!value);
-  if (!observedAt || now - observedAt > NINE_ROUTER_STALE_MS) {
-    // Stale data loses positive capacity evidence but NOT known exhaustion:
-    // an unreset window stays blocking until it actually rolls over. After a
-    // reset, capacity is unknown, never assumed full. Accounts compare as
-    // alternatives; one account's exhaustion never blocks another's capacity.
-    const allAccounts = providers.flatMap(provider => provider.accounts ?? []);
-    const unique = new Map<string, NineRouterAccountUsage>();
-    for (const account of allAccounts) unique.set(account.idHash ?? JSON.stringify(account), account);
-    const staleAccounts = [...unique.values()].map(account => ({
-      account,
-      classification: classifyAccount(account, modelId, observedAt, now),
-    })).filter(({ classification }) =>
-      !classification.locked && classification.state === 'depleted' &&
-      classification.windows.some(window => window.resetsAt === undefined || window.resetsAt > now));
-    if (!staleAccounts.length) return { observedAt, state: 'unknown', windows: [] };
-    const best = staleAccounts.reduce((a, b) =>
-      a.account.priority !== undefined && (b.account.priority === undefined || a.account.priority <= b.account.priority) ? a : b);
-    return { observedAt, state: 'depleted', windows: best.classification.windows };
+  // Stale data and a failed refresh both lose positive capacity evidence but
+  // NOT known exhaustion: an unreset window stays blocking until it rolls
+  // over. After a reset, capacity is unknown, never assumed full.
+  if (!observedAt || now - observedAt > NINE_ROUTER_STALE_MS || !providers.length || providers.some(provider => provider.unavailable === true)) {
+    return retainedBlocking(owned, modelId, observedAt, now);
   }
-  const providersLive = keys.map(key => cache!.providers?.[key]).filter((value): value is NineRouterProviderUsage => !!value);
-  if (!providersLive.length || providersLive.some(provider => provider.unavailable === true)) return { observedAt, state: 'unknown', windows: [] };
-  const accounts = providersLive.flatMap(provider => provider.accounts ?? []);
-  const uniqueAccounts = new Map<string, NineRouterAccountUsage>();
-  for (const account of accounts) uniqueAccounts.set(account.idHash ?? JSON.stringify(account), account);
-  const selectedAccounts = [...uniqueAccounts.values()];
-  if (!selectedAccounts.length) return { observedAt, state: 'unknown', windows: [] };
-  const classified = selectedAccounts.map(account => classifyAccount(account, modelId, observedAt, now));
+  const uniqueAccounts = new Map<string, { provider: string; account: NineRouterAccountUsage }>();
+  for (const entry of owned) uniqueAccounts.set(entry.account.idHash ?? JSON.stringify(entry.account), entry);
+  const selected = [...uniqueAccounts.values()];
+  if (!selected.length) return { observedAt, state: 'unknown', windows: [] };
+  const selectedAccounts = selected.map(entry => entry.account);
+  const classified = selected.map(entry => classifyAccount(entry.account, modelId, observedAt, now, entry.provider));
   // Locked accounts cannot serve this model. Among the rest, the best state
   // wins: Phase 3 priority steering makes the best usable account the one
   // 9router's fill-first will actually select.
@@ -805,7 +847,7 @@ export function gatewayQuota(modelId: string, cache: NineRouterUsageCache | unde
       connectionId: account.connectionId ?? account.idHash ?? '',
       priority: account.priority ?? Number.MAX_SAFE_INTEGER,
       state: result.state,
-      pressure: accountPressure(account, observedAt),
+      pressure: accountPressure(account, modelId, observedAt, now),
       locked: result.locked,
     };
   });

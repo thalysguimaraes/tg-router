@@ -1,8 +1,13 @@
 {
   "name": "tg-router",
   "version": "1.3.0",
-  "private": true,
   "description": "Quota-aware, Jev-assisted model router for Oh My Pi",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/thalysguimaraes/tg-router.git"
+  },
+  "homepage": "https://github.com/thalysguimaraes/tg-router#readme",
   "type": "module",
   "scripts": {
     "test": "bun test",

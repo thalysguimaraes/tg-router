@@ -12,7 +12,8 @@
 import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { analyzeRoster, fetchCatalogs, ROSTER, type RosterFinding } from './roster-monitor';
-import { probeModel, type ProbeResult } from './roster-probe';
+import { probeModel, type ProbeResult, type QualificationRecord } from './roster-probe';
+import { isObjectGuard } from './type-guards';
 
 export interface RosterUIContext {
   /** omp's extension UI surface (select / confirm / notify). */
@@ -52,15 +53,23 @@ async function loadFindings(context: RosterUIContext): Promise<{ findings: Roste
 
 function settingsPath(root: string): string { return join(root, 'settings.json'); }
 
-function addGoValidated(root: string, modelId: string): { ok: boolean; detail: string } {
+/**
+ * Flip the routing gate AND record what earned it. The settings entry alone
+ * says nothing about which model version, transport or fixture was tested, so
+ * evidence is stored next to it under the probed identity: a regenerated
+ * transport or a bumped fixture no longer looks like a current qualification.
+ */
+function addGoValidated(root: string, modelId: string, qualification: QualificationRecord): { ok: boolean; detail: string } {
   const file = settingsPath(root);
   let settings: Record<string, unknown>;
   try { settings = JSON.parse(readFileSync(file, 'utf8')); } catch { return { ok: false, detail: 'settings.json unreadable' }; }
   const current = Array.isArray(settings.goValidated) ? settings.goValidated.filter((x): x is string => typeof x === 'string') : [];
-  if (current.includes(modelId)) return { ok: true, detail: 'already validated' };
-  settings.goValidated = [...current, modelId];
+  const records = isObjectGuard(settings.goQualifications) ? settings.goQualifications : {};
+  settings.goQualifications = { ...records, [modelId]: qualification };
+  const already = current.includes(modelId);
+  if (!already) settings.goValidated = [...current, modelId];
   writeFileSync(file, JSON.stringify(settings, null, 2) + '\n', { mode: 0o600 });
-  return { ok: true, detail: `goValidated += ${modelId}` };
+  return { ok: true, detail: already ? `already validated; qualification updated (${qualification.fixtureVersion})` : `goValidated += ${modelId} (${qualification.fixtureVersion})` };
 }
 
 export async function showRoster(context: RosterUIContext): Promise<void> {
@@ -112,7 +121,7 @@ export async function showRoster(context: RosterUIContext): Promise<void> {
     }
     const existing = probed.get(finding.model);
     const action = await context.ui.select(`${finding.model}`, [
-      { label: existing ? 'Sondar de novo' : 'Sondar agora', description: '4 chamadas reais: instrução, tools, reasoning, contexto longo' },
+      { label: existing ? 'Sondar de novo' : 'Sondar agora', description: '5 chamadas reais: instrução, tool round-trip completo, reasoning, contexto longo, effort hint' },
       ...(existing?.suggests.goValidated ? [{ label: 'Validar para tool-loop', description: `escreve goValidated += ${bareId} em settings.json` }] : []),
       { label: 'Voltar', description: finding.detail },
     ]);
@@ -122,10 +131,11 @@ export async function showRoster(context: RosterUIContext): Promise<void> {
       context.ui.notify(`Sondando ${wire}…`);
       const result = await probeModel({ baseUrl: context.gateway.baseUrl, apiKey: context.gateway.apiKey, wireModel: wire });
       probed.set(finding.model, result);
-      context.log('roster-probe', { model: wire, routable: result.routable, checks: result.checks.map(c => ({ check: c.check, pass: c.pass, ms: c.elapsedMs })) });
+      context.log('roster-probe', { model: wire, routable: result.routable, qualification: result.qualification, checks: result.checks.map(c => ({ check: c.check, pass: c.pass, ms: c.elapsedMs })) });
       const lines = result.checks.map(c => `${c.pass ? '✓' : '✗'} ${c.check} (${c.elapsedMs}ms): ${c.detail}`).join('\n');
       const hint = result.acceptsEffortHint ? '' : '\nAtenção: o upstream rejeita reasoning_effort; o router não deve enviá-lo para este modelo.';
-      context.ui.notify(`${wire}\n${lines}${hint}\n\n${result.routable ? 'Passou em tudo.' : result.suggests.goValidated ? 'Tools e reasoning OK; elegível para tool-loop.' : 'Não elegível para tool-loop.'}`, result.routable || result.suggests.goValidated ? 'info' : 'warning');
+      const band = result.qualification.validatedContextTokens ? `\nContexto validado: ~${result.qualification.validatedContextTokens / 1000}k (a janela anunciada continua não comprovada).` : '';
+      context.ui.notify(`${wire}\n${lines}${hint}${band}\n\n${result.routable ? 'Passou em tudo.' : result.suggests.goValidated ? 'Tools e reasoning OK; elegível para tool-loop.' : 'Não elegível para tool-loop.'}`, result.routable || result.suggests.goValidated ? 'info' : 'warning');
       continue;
     }
 
@@ -134,7 +144,7 @@ export async function showRoster(context: RosterUIContext): Promise<void> {
       if (!result?.suggests.goValidated) { context.ui.notify('Sonde primeiro: validação exige tools e reasoning aprovados.', 'warning'); continue; }
       const sure = await context.ui.confirm('Validar modelo', `Escrever goValidated += ${bareId}?\n\nIsso só libera o guard de tool-loop. A qualificação por tier continua sendo decisão sua em policy.ts.`);
       if (!sure) continue;
-      const written = addGoValidated(context.root, bareId);
+      const written = addGoValidated(context.root, bareId, result.qualification);
       context.log('roster-validate', { model: bareId, ok: written.ok, detail: written.detail });
       context.ui.notify(written.ok ? `${written.detail}. Vale na próxima sessão.` : written.detail, written.ok ? 'info' : 'error');
     }

@@ -37,24 +37,22 @@ export interface RoutingContext {
   truncated: boolean;
 }
 
-/** Sub-budget a caller must pass so classification never spends without admission. */
-export interface ClassifierBudgetCheck {
-  (estimatedUsd: number): { ok: true } | { ok: false; reason: string };
-}
-
 const MAX_STATE_BYTES = 24_576;
 
 const REDACTION_PATTERNS: Array<[RegExp, string]> = [
   // Secrets: keyword followed by assignment consumes the assigned value
-  // (quoted or bare) so neither key wording nor value leaks.
-  [/\b(api[_-]?key|api[_-]?secret|secret|password|passwd|pwd|token|access[_-]?token|refresh[_-]?token|bearer|authorization|cookie|session[_-]?id|private[_-]?key|client[_-]?secret)\b\s*[:=]\s*(".*?"|'.*?'|`.*?`|[^\s,;)"']+)/gi, '$1=[REDACTED]'],
+  // (quoted or bare) so neither key wording nor value leaks. The keyword may
+  // itself be quoted (JSON/YAML keys: {"api_key": "…"}, 'token': '…').
+  [/(["'`]?)\b(api[_-]?key|api[_-]?secret|secret|password|passwd|pwd|token|access[_-]?token|refresh[_-]?token|bearer|authorization|cookie|session[_-]?id|private[_-]?key|client[_-]?secret)\b\1\s*[:=]\s*(".*?"|'.*?'|`.*?`|[^\s,;)"']+)/gi, '$1$2$1=[REDACTED]'],
   // Prose form: secret keyword directly followed by a quoted value.
   [/\b(api[_-]?key|api[_-]?secret|secret|password|passwd|pwd|token|access[_-]?token|refresh[_-]?token|bearer|authorization|cookie|session[_-]?id|private[_-]?key|client[_-]?secret)\s+(".*?"|'[^']*')/gi, '$1 [REDACTED]'],
   // Env-style compound names (R2_SECRET_ACCESS_KEY=..., MY_APP_TOKEN=...). The
   // keyword regex above needs the keyword as a whole word; compound names
   // embed it. Found in a real session where a pasted .env slipped through.
-  [/\b([A-Z][A-Z0-9_]*(?:KEY|SECRET|TOKEN|PASSWORD|PASSWD|CREDENTIAL)[A-Z0-9_]*)\s*[=:]\s*(".*?"|'.*?'|[^\s,;)"']+)/g, '$1=[REDACTED]'],
+  [/(["'`]?)\b([A-Z][A-Z0-9_]*(?:KEY|SECRET|TOKEN|PASSWORD|PASSWD|CREDENTIAL)[A-Z0-9_]*)\1\s*[=:]\s*(".*?"|'.*?'|[^\s,;)"']+)/g, '$1$2$1=[REDACTED]'],
   [/\b(sk|pk)-[A-Za-z0-9_-]{16,}/g, '[REDACTED-KEY]'],
+  // Opaque prefixed keys (apikey_…, ts_…, key_…, xoxb-…) with a long random tail.
+  [/\b(?:api[_-]?key|apikey|ts|key|xox[a-z])[_-][A-Za-z0-9_-]{20,}\b/gi, '[REDACTED-KEY]'],
   [/\bghp_[A-Za-z0-9]{20,}\b|\bgithub_pat_[A-Za-z0-9_]{20,}\b/g, '[REDACTED-KEY]'],
   [/\bAKIA[0-9A-Z]{16}\b/g, '[REDACTED-KEY]'],
   [/\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/g, '[REDACTED-JWT]'],
@@ -72,6 +70,16 @@ export function redactText(text: string): string {
   let value = text;
   for (const [pattern, replacement] of REDACTION_PATTERNS) value = value.replace(pattern, replacement);
   return value;
+}
+
+/**
+ * The one pipeline for untrusted text: redact on the intact string, then clip.
+ * Clipping first can cut a credential's closing quote so the redactor no
+ * longer recognizes it. Every upstream clipper must go through here.
+ */
+export function redactAndClip(text: string, maxChars: number): { text: string; truncated: boolean } {
+  const value = redactText(text);
+  return value.length <= maxChars ? { text: value, truncated: false } : { text: value.slice(0, maxChars), truncated: true };
 }
 
 /**
@@ -93,26 +101,22 @@ export function buildRoutingContext(parts: {
   previousTurnErrored?: boolean;
   priorUserTurns?: number;
   previousTurnToolCalls?: number;
+  /** Clipping that already happened upstream (episode goal storage). */
+  upstreamTruncated?: boolean;
 }): RoutingContext {
   const goalBudget = 4000;
   const requestBudget = 4000;
   const evidenceBudget = 600;
   const perCriterionBudget = 400;
   const criterionCount = 10;
-  const clip = (value: string, maxChars: number): { text: string; truncated: boolean } =>
-    value.length <= maxChars ? { text: value, truncated: false } : { text: value.slice(0, maxChars), truncated: true };
+  const evidenceCount = 6;
+  const clip = redactAndClip;
 
-  const goal = clip(redactText(parts.taskGoal), goalBudget);
-  const request = clip(redactText(parts.currentUserRequest), requestBudget);
-  const evidence = (parts.recentEvidence ?? []).slice(0, 6).map(entry => {
-    const clipped = clip(redactText(entry), evidenceBudget);
-    return { text: clipped.text, truncated: clipped.truncated };
-  });
-  const criteria = (parts.acceptanceCriteria ?? []).slice(0, criterionCount).map(entry => {
-    const clipped = clip(redactText(entry), perCriterionBudget);
-    return { text: clipped.text, truncated: clipped.truncated };
-  });
-  const scope = parts.scope === undefined ? undefined : clip(redactText(parts.scope), 1000);
+  const goal = clip(parts.taskGoal, goalBudget);
+  const request = clip(parts.currentUserRequest, requestBudget);
+  const evidence = (parts.recentEvidence ?? []).slice(0, evidenceCount).map(entry => clip(entry, evidenceBudget));
+  const criteria = (parts.acceptanceCriteria ?? []).slice(0, criterionCount).map(entry => clip(entry, perCriterionBudget));
+  const scope = parts.scope === undefined ? undefined : clip(parts.scope, 1000);
 
   let context: RoutingContext = {
     schemaVersion: 1,
@@ -132,7 +136,11 @@ export function buildRoutingContext(parts: {
       ...(parts.priorUserTurns !== undefined ? { priorUserTurns: parts.priorUserTurns } : {}),
       ...(parts.previousTurnToolCalls !== undefined ? { previousTurnToolCalls: parts.previousTurnToolCalls } : {}),
     },
-    truncated: goal.truncated || request.truncated || evidence.some(entry => entry.truncated) || criteria.some(entry => entry.truncated) || (parts.acceptanceCriteria?.length ?? 0) > criterionCount,
+    truncated: parts.upstreamTruncated === true
+      || goal.truncated || request.truncated || scope?.truncated === true
+      || evidence.some(entry => entry.truncated) || criteria.some(entry => entry.truncated)
+      || (parts.acceptanceCriteria?.length ?? 0) > criterionCount
+      || (parts.recentEvidence?.length ?? 0) > evidenceCount,
   };
 
   // Hard size ceiling: drop optional evidence first, then trim the goal.

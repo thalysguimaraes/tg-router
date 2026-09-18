@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { MODELS, PRESSURE_SWAP_RATIO, pressure, decideRoute, childFloorFor, type QuotaSnapshot, type RouteInput, type RouteModel } from "./policy";
+import { MODELS, PRESSURE_SWAP_RATIO, pressure, decideRoute, admitAttempt, childFloorFor, type QuotaSnapshot, type RouteInput, type RouteModel } from "./policy";
+import { gatewayQuota } from "./ninerouter-usage";
 
 const NOW = Date.parse("2026-09-16T12:00:00Z");
 const HOUR = 3_600_000;
@@ -35,6 +36,51 @@ test("pressure is remaining fraction normalized by hours to reset", () => {
   expect(pressure(undefined, NOW)).toBe(-1);
   expect(pressure({ observedAt: NOW, windows: [{ id: "x" }] }, NOW)).toBe(-1);
   expect(PRESSURE_SWAP_RATIO).toBe(0.5);
+});
+
+describe("model lock lifetime", () => {
+  // One account, STALE positive usage, unexpired Astra lock. The adapter,
+  // allocator and admission gate must all block while the lock is active and
+  // must all reopen as unknown (not full) once it expires.
+  const lockUntil = NOW + 2 * HOUR;
+  const cache: any = {
+    version: 1, fetchedAt: NOW - 30 * 60_000, total: {},
+    providers: { codex: { accounts: [{ idHash: "h", connectionId: "cx-1", priority: 1, modelLocks: { "gpt-6-astra": new Date(lockUntil).toISOString() },
+      windows: [{ id: "session", used: 10, total: 100, remaining: 90, remainingPercentage: 90, resetAt: NOW + 67 * HOUR }] }] } },
+  };
+  test("active lock blocks end to end despite stale positive usage", () => {
+    const quota = gatewayQuota("openai-codex/gpt-6-astra", cache, NOW);
+    expect(quota.state).toBe("depleted");
+    expect(quota.windows?.find(w => w.id === "model-lock")?.resetsAt).toBe(lockUntil);
+    const decision = decideRoute(input(quota));
+    expect(decision.model).toBe("9router/cc/claude-fable-5-1");
+    expect(decision.rejected.find(r => r.model === "9router/cx/gpt-6-astra")?.reason).toContain("exhausted");
+    expect(admitAttempt(model("astra", quota), input(quota))).toEqual({ ok: false, reason: "an applicable quota window is exhausted" });
+  });
+  test("expired lock reopens as unknown, not as full capacity", () => {
+    const later = lockUntil + 1;
+    const quota = gatewayQuota("openai-codex/gpt-6-astra", cache, later);
+    expect(quota.state).toBe("unknown");
+    expect(quota.windows?.find(w => w.id === "model-lock")).toBeUndefined();
+    expect(admitAttempt(model("astra", quota), input(quota, { now: later })).ok).toBe(true);
+  });
+});
+
+describe("admitAttempt with current facts", () => {
+  const healthy = snapshot(0.9, 67);
+  test("rejects NaN and negative context estimates", () => {
+    expect(admitAttempt(model("astra", healthy), input(healthy, { contextTokens: Number.NaN })).ok).toBe(false);
+    expect(admitAttempt(model("astra", healthy), input(healthy, { contextTokens: -1 })).ok).toBe(false);
+  });
+  test("context grown past the window is refused", () => {
+    expect(admitAttempt(model("astra", healthy), input(healthy, { contextTokens: 2_000_000 }))).toEqual({ ok: false, reason: "complete context and output margin do not fit" });
+  });
+  test("a route below the committed tier is refused; a qualified one passes", () => {
+    const glm: RouteModel = { ref: "9router/ocg/glm-5.3-flash", canonicalRef: MODELS.glm, gateway: true, authenticated: true, contextWindow: 200_000, supportsTools: true, supportsImages: false, quota: healthy, validated: { tools: true, vision: false, reasoning: true } };
+    expect(admitAttempt(glm, input(healthy), "premium")).toEqual({ ok: false, reason: "route is below the committed task's quality floor" });
+    expect(admitAttempt(glm, input(healthy), "bounded").ok).toBe(true);
+    expect(admitAttempt(model("astra", healthy), input(healthy), "premium").ok).toBe(true);
+  });
 });
 
 test("within a cost class, the candidate with meaningfully more headroom wins", () => {
@@ -163,7 +209,7 @@ test("session and repository operations are bounded worker tasks, not complex", 
 
 test("a delegation brief that merely mentions a worktree is not a session op", () => {
   // These carried 53 tool calls and errored on a cheap model in the corpus.
-  const d = classifyOnly("Você é a lane E do Marcha v1.1 (LANE=E). Leia, nesta ordem, /tmp/marcha-v11/COMMON.md e siga-os integralmente. Trabalhe só nesta worktree/branch.");
+  const d = classifyOnly("Você é a lane E do projeto Exemplo v1.1 (LANE=E). Leia, nesta ordem, /tmp/exemplo-v11/COMMON.md e siga-os integralmente. Trabalhe só nesta worktree/branch.");
   expect(d.tier).not.toBe("bounded");
 });
 

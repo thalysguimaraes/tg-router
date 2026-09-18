@@ -13,6 +13,13 @@
     "allowImportingTsExtensions": true
   },
   "include": [
+    "index.ts",
+    "ninerouter-types.ts",
+    "meridian.ts",
+    "guarded-openrouter.ts",
+    "diagnostics.ts",
+    "pipeline.test.ts",
+    "episode.ts",
     "policy.ts",
     "routing-context.ts",
     "jev-client.ts",

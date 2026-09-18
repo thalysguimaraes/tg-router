@@ -1,9 +1,9 @@
 import { readFileSync, writeFileSync, renameSync, unlinkSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
-import { accountQuota } from './quota';
+import { accountQuota, type QuotaEntry } from './quota';
 
 const BASE = 'http://127.0.0.1:3456';
-const PROFILES = ['personal', 'kanastra'];
+const PROFILES = ['personal', 'work'];
 const FAMILIES = ['fable', 'opus', 'sonnet', 'mythos'];
 const flights = new Map<string, Promise<Snapshot>>();
 interface Window { type: string; utilization?: number; resetsAt?: number }
@@ -55,7 +55,7 @@ async function snapshot(file: string): Promise<Snapshot> {
   try { return await promise; } finally { if (flights.get(file) === promise) flights.delete(file); }
 }
 
-export async function inspectMeridian(models: any[], file: string, preferredProfile?: string, unavailableProfiles: Record<string, number> = {}) {
+export async function inspectMeridian(models: any[], file: string, preferredProfile?: string, unavailableProfiles: Record<string, number> = {}): Promise<Map<string, QuotaEntry>> {
   const data = await snapshot(file);
   const now = Date.now();
   return new Map(models.filter(model => model.provider === 'anthropic').map(model => {
@@ -88,7 +88,7 @@ export async function inspectMeridian(models: any[], file: string, preferredProf
     const headroom = (account: any) => account.quota.windows.length ? Math.min(...account.quota.windows.map((window: any) => window.remainingFraction ?? 0)) : 0;
     accounts.sort((a, b) => rank[a.quota.state!] - rank[b.quota.state!] || Number(b.profile === preferredProfile) - Number(a.profile === preferredProfile) || headroom(b) - headroom(a));
     const selected = accounts[0]!;
-    return [`${model.provider}/${model.id}`, { ...selected, accounts, accountOwner: 'meridian', quota: selected.quota }];
+    return [`${model.provider}/${model.id}`, { ...selected, accounts, accountOwner: 'meridian', quota: selected.quota }] as [string, QuotaEntry];
   }));
 }
 

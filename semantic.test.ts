@@ -2,7 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import { BudgetLedger } from './budget';
 import { buildRoutingContext, redactText, assessmentCacheKey } from './routing-context';
 import { AssessmentCache, cacheKeyFor, type TaskAssessment } from './assessment-cache';
-import type { JevResult } from './jev-client';
+import { JEVS_CLASSIFIER_MODEL, type JevResult } from './jev-client';
 import type { RoutingContext } from './routing-context';
 import { readFileSync } from 'node:fs';
 
@@ -60,10 +60,10 @@ describe('purpose-scoped ledger subcaps', () => {
 
 describe('routing context redaction and bounding', () => {
   test('secrets, keys, and home paths are redacted', () => {
-    const text = redactText('use api_key: sk-abc123def456ghi789 with token "hunter2" at /Users/guimaraes/secrets/prod.env');
+    const text = redactText('use api_key: sk-abc123def456ghi789 with token "hunter2" at /Users/alice/secrets/prod.env');
     expect(text).not.toContain('sk-abc123def456ghi789');
     expect(text).not.toContain('hunter2');
-    expect(text).not.toContain('/Users/guimaraes');
+    expect(text).not.toContain('/Users/alice');
     expect(text).toContain('[PATH]');
   });
 
@@ -90,6 +90,26 @@ describe('routing context redaction and bounding', () => {
       confirmedQualityFailures: 0,
     });
     expect(context.truncated).toBe(false);
+  });
+
+  test('a credential straddling the episode clip boundary never survives into the goal', async () => {
+    // Regression: the episode clipped the raw prompt at 2000 chars BEFORE
+    // redaction, cutting the closing quote the JSON-key pattern needs.
+    const { advanceEpisode } = await import('./episode');
+    const secret = 'sk-live-ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+    const prompt = `${'Fix the parser. '.repeat(120)}config: {"api_key": "${secret}"} and rest ${'more context. '.repeat(20)}`;
+    const episode = advanceEpisode(undefined, prompt, NOW, () => 'ep');
+    expect(episode.goal.length).toBeLessThanOrEqual(2000);
+    expect(episode.goal).not.toContain('ABCDEFGHIJKLMNOPQRSTUVWXYZ');
+    expect(episode.goal).not.toContain('sk-live-ABCDEF');
+    const context = buildRoutingContext({ taskGoal: episode.goal, currentUserRequest: prompt, boundary: 'user', hasImages: false, toolsRequired: true, confirmedQualityFailures: 0, upstreamTruncated: episode.goalTruncated === true });
+    expect(JSON.stringify(context)).not.toContain('ABCDEFGHIJKLMNOPQRSTUVWXYZ');
+    expect(context.truncated).toBe(true);
+  });
+
+  test('scope clipping and dropped evidence entries mark the context truncated', () => {
+    const context = buildRoutingContext({ taskGoal: 'g', currentUserRequest: 'r', scope: 'x'.repeat(1500), recentEvidence: Array.from({ length: 7 }, () => 'e'), boundary: 'child', hasImages: false, toolsRequired: true, confirmedQualityFailures: 0 });
+    expect(context.truncated).toBe(true);
   });
 });
 
@@ -288,7 +308,9 @@ describe('native TypeSafe protocol', () => {
     const result = await client.assess(state(), 'hmac');
     expect(seenUrl).toBe('https://api.typesafe.ai/v1/systemone');
     expect(seenAuth).toBe('Bearer apikey_test');
-    expect(seenBody.model).toBe('jev-latest');
+    // Pinned version, not the rolling alias: calibrated gates must not inherit a silent model change.
+    expect(seenBody.model).toBe(JEVS_CLASSIFIER_MODEL);
+    expect(JEVS_CLASSIFIER_MODEL).toBe('jev-1.13.0');
     expect(Object.keys(seenBody.questions as object).sort()).toEqual(
       ['bounded', 'capability', 'highImpact', 'jobFamily', 'phase', 'reasoningDepth', 'underspecified'],
     );

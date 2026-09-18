@@ -1,10 +1,11 @@
+// @ts-nocheck -- generated bundle ships without annotations; the typed surface the router relies on is declared in ninerouter-types.ts
 // @bun
-// work/omp-personal-router/ninerouter.ts
+// src/ninerouter.ts
 import { lstatSync, readFileSync, statSync } from "fs";
 import { join } from "path";
 import { errorDetails } from './diagnostics';
 
-// work/omp-personal-router/node_modules/@oh-my-pi/pi-catalog/src/effort.ts
+// src/node_modules/@oh-my-pi/pi-catalog/src/effort.ts
 var THINKING_EFFORTS = [
   "minimal" /* Minimal */,
   "low" /* Low */,
@@ -14,7 +15,7 @@ var THINKING_EFFORTS = [
   "max" /* Max */
 ];
 
-// work/omp-personal-router/node_modules/@oh-my-pi/pi-catalog/src/hosts.ts
+// src/node_modules/@oh-my-pi/pi-catalog/src/hosts.ts
 var KNOWN_HOSTS = {
   openai: { providers: ["openai"], urlMarkers: ["api.openai.com"] },
   azureOpenAI: {
@@ -116,7 +117,7 @@ function includesAsciiCaseInsensitive(value, lowerNeedle) {
   return false;
 }
 
-// work/omp-personal-router/node_modules/@oh-my-pi/pi-catalog/src/compat/anthropic.ts
+// src/node_modules/@oh-my-pi/pi-catalog/src/compat/anthropic.ts
 var OFFICIAL_ANTHROPIC_URL = "https://api.anthropic.com";
 function isOfficialAnthropicApiUrl(baseUrl) {
   if (!baseUrl)
@@ -135,7 +136,7 @@ function isAnthropicSigningProxyUrl(baseUrl) {
   return hostMatchesUrl(baseUrl, "githubCopilot") || hostMatchesUrl(baseUrl, "zenmux") || baseUrl !== undefined && (CLOUDFLARE_ANTHROPIC_GATEWAY_URL_MARKER.test(baseUrl) || VERTEX_ANTHROPIC_URL_MARKER.test(baseUrl) || BEDROCK_ANTHROPIC_URL_MARKER.test(baseUrl)) || isAzureAnthropicRoute(baseUrl);
 }
 
-// work/omp-personal-router/node_modules/@oh-my-pi/pi-catalog/src/compat/apply.ts
+// src/node_modules/@oh-my-pi/pi-catalog/src/compat/apply.ts
 function applyCompatOverrides(compat, overrides) {
   if (!overrides)
     return;
@@ -147,7 +148,7 @@ function applyCompatOverrides(compat, overrides) {
   }
 }
 
-// work/omp-personal-router/node_modules/@oh-my-pi/pi-catalog/src/compat/axes.ts
+// src/node_modules/@oh-my-pi/pi-catalog/src/compat/axes.ts
 var OAI = ["openai", "openai-responses"];
 var EFFORTS = ["minimal", "low", "medium", "high", "xhigh", "max"];
 var EFFORT_TIERS = [...EFFORTS, "off"];
@@ -372,7 +373,7 @@ var API_COMPAT_RECORDS = {
   "google-gemini-cli": ["google"]
 };
 
-// work/omp-personal-router/node_modules/@oh-my-pi/pi-catalog/src/compat/revision.ts
+// src/node_modules/@oh-my-pi/pi-catalog/src/compat/revision.ts
 function parseComponent(value) {
   if (!value)
     return;
@@ -462,7 +463,7 @@ function revisionSatisfies(revision, terms) {
   }
   return true;
 }
-// work/omp-personal-router/node_modules/@oh-my-pi/pi-catalog/src/compat/rules.json
+// src/node_modules/@oh-my-pi/pi-catalog/src/compat/rules.json
 var rules_default = {
   version: 1,
   files: [
@@ -19607,7 +19608,7 @@ var rules_default = {
   }
 };
 
-// work/omp-personal-router/node_modules/@oh-my-pi/pi-catalog/src/compat/cascade.ts
+// src/node_modules/@oh-my-pi/pi-catalog/src/compat/cascade.ts
 class AmbiguousOverlapError extends Error {
   provider;
   model;
@@ -19773,7 +19774,7 @@ function resolveOverIndex(index, target) {
   };
 }
 
-// work/omp-personal-router/node_modules/@oh-my-pi/pi-catalog/src/compat/taxonomy.ts
+// src/node_modules/@oh-my-pi/pi-catalog/src/compat/taxonomy.ts
 class AmbiguousIdentityError extends Error {
   model;
   first;
@@ -20093,7 +20094,7 @@ function classifyModel(provider, modelId, opts) {
   return identity;
 }
 
-// work/omp-personal-router/node_modules/@oh-my-pi/pi-catalog/src/compat/resolve.ts
+// src/node_modules/@oh-my-pi/pi-catalog/src/compat/resolve.ts
 class IdentityFacts {
   identity;
   revision;
@@ -20911,7 +20912,7 @@ function resolveModelPolicy(spec) {
   };
 }
 
-// work/omp-personal-router/node_modules/@oh-my-pi/pi-catalog/src/identity/id.ts
+// src/node_modules/@oh-my-pi/pi-catalog/src/identity/id.ts
 var bareModelIdCache = new Map;
 function bareModelId(modelId) {
   const cached = bareModelIdCache.get(modelId);
@@ -20923,7 +20924,7 @@ function bareModelId(modelId) {
   return result;
 }
 
-// work/omp-personal-router/node_modules/@oh-my-pi/pi-catalog/src/model-tokenizer.ts
+// src/node_modules/@oh-my-pi/pi-catalog/src/model-tokenizer.ts
 var MAX_TOKENIZER_CACHE_ENTRIES = 2048;
 var modelTokenizerCache = new Map;
 function revisionAtLeast(revision, floor) {
@@ -20972,7 +20973,7 @@ function resolveModelTokenizer(modelId) {
   return tokenizer;
 }
 
-// work/omp-personal-router/node_modules/@oh-my-pi/pi-catalog/src/utils.ts
+// src/node_modules/@oh-my-pi/pi-catalog/src/utils.ts
 import { wrapFetchForExtraCa } from "@oh-my-pi/pi-utils";
 import { isRecord } from "@oh-my-pi/pi-utils";
 var AUTHOR_PREFIX = /^[A-Za-z][A-Za-z0-9 .+&'-]{0,23}: /;
@@ -20982,7 +20983,7 @@ function cleanModelName(name) {
   return cleaned.length > 0 ? cleaned : name;
 }
 
-// work/omp-personal-router/node_modules/@oh-my-pi/pi-catalog/src/pricing.ts
+// src/node_modules/@oh-my-pi/pi-catalog/src/pricing.ts
 function nonnegative(value) {
   return typeof value === "number" && Number.isFinite(value) && value >= 0;
 }
@@ -21059,7 +21060,7 @@ function materializeTimeBasedCost(value) {
   return schedule;
 }
 
-// work/omp-personal-router/node_modules/@oh-my-pi/pi-catalog/src/build.ts
+// src/node_modules/@oh-my-pi/pi-catalog/src/build.ts
 function numberField(source, key) {
   const value = Reflect.get(source, key);
   return typeof value === "number" ? value : undefined;
@@ -21239,11 +21240,11 @@ function buildModel(spec) {
   return model;
 }
 
-// work/omp-personal-router/ninerouter.ts
+// src/ninerouter.ts
 var NINEROUTER_PROVIDER = "9router";
 var NINEROUTER_API = "personal-nine-router";
-var NINEROUTER_BASE_URL = "https://llm.thalys.cloud/v1";
-var NINEROUTER_ORIGIN = "https://llm.thalys.cloud";
+var NINEROUTER_ORIGIN = process.env.OMP_NINEROUTER_ORIGIN ?? "https://9router.example";
+var NINEROUTER_BASE_URL = `${NINEROUTER_ORIGIN}/v1`;
 var NINEROUTER_MAX_OUTPUT_TOKENS = 32768;
 var DEFAULT_CONTEXT_WINDOW = 128000;
 var SUBSCRIBED_PREFIXES = new Set(["cc", "cx", "ocg", "glm"]);

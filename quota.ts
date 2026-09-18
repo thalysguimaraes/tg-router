@@ -1,6 +1,20 @@
 import type { QuotaSnapshot, QuotaState, QuotaWindow } from './policy';
 import { QUOTA_MAX_AGE_MS, pressure } from './policy';
 
+/**
+ * One model's quota view plus the account identity the router should steer to.
+ * `profile` is Meridian's account alias; `accountOwner` names who owns the
+ * account selection (native OMP credentials, Meridian, or the gateway).
+ */
+export interface QuotaEntry {
+  quota: QuotaSnapshot;
+  credentialId?: string;
+  selected?: boolean;
+  accounts?: Array<{ credentialId?: string; selected?: boolean; quota: QuotaSnapshot; profile?: string }>;
+  profile?: string;
+  accountOwner?: 'omp-native' | 'meridian' | 'gateway';
+}
+
 /** Report scopes are provider-specific: "shared" is not always provider-wide. */
 export function scopedLimits(report: any, model: any): any[] {
   const modelId = String(model.id).toLowerCase();
@@ -79,7 +93,7 @@ export function accountQuota(model: any, report: any, health: any, now = Date.no
   return { observedAt: validTimestamp ? report.fetchedAt : 0, state, windows };
 }
 
-export async function inspectQuotas(ctx: any, models: any[], signal: AbortSignal) {
+export async function inspectQuotas(ctx: any, models: any[], signal: AbortSignal): Promise<Map<string, QuotaEntry>> {
   const auth = ctx.modelRegistry.authStorage;
   const sessionId = ctx.sessionManager.getSessionId();
   let reports: any[] = [];
@@ -98,7 +112,7 @@ export async function inspectQuotas(ctx: any, models: any[], signal: AbortSignal
     const rank: Record<QuotaState, number> = { healthy: 0, reserve: 1, unknown: 2, depleted: 3 };
     accounts.sort((a: any, b: any) => rank[a.quota.state as QuotaState] - rank[b.quota.state as QuotaState] || Number(b.selected) - Number(a.selected) || pressure(b.quota, now) - pressure(a.quota, now));
     const chosen = accounts[0];
-    return [`${model.provider}/${model.id}`, { quota: chosen?.quota ?? { observedAt: 0, state: 'unknown', windows: [] }, credentialId: chosen?.credentialId, selected: chosen?.selected, accounts }] as const;
+    return [`${model.provider}/${model.id}`, { quota: chosen?.quota ?? { observedAt: 0, state: 'unknown', windows: [] }, credentialId: chosen?.credentialId, selected: chosen?.selected, accounts }] as [string, QuotaEntry];
   }));
   return new Map(entries);
 }

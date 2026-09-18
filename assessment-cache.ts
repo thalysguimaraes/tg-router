@@ -27,11 +27,13 @@ interface CacheEntry { assessment: TaskAssessment; expiresAt: number }
 const DEFAULT_TTL_MS = 300_000;
 /** Failed assessments cache much shorter: just enough to absorb a burst. */
 const FAILURE_TTL_MS = 30_000;
+/** Bound on live entries; a long session must not grow this map without limit. */
+const MAX_ENTRIES = 256;
 
 /** Process-local TTL cache keyed by the redacted-input HMAC. Stores assessments, never raw input. */
 export class AssessmentCache {
   private readonly entries = new Map<string, CacheEntry>();
-  private readonly inFlight = new Map<string, Promise<TaskAssessment>>();
+  private readonly inFlight = new Map<string, Promise<unknown>>();
   private readonly ttlMs: number;
 
   constructor(ttlMs = DEFAULT_TTL_MS) { this.ttlMs = ttlMs; }
@@ -46,14 +48,20 @@ export class AssessmentCache {
   put(key: string, assessment: TaskAssessment, now = Date.now()): void {
     const ttl = assessment.usable ? this.ttlMs : FAILURE_TTL_MS;
     this.entries.set(key, { assessment: { ...assessment, source: 'cache' }, expiresAt: now + ttl });
+    if (this.entries.size <= MAX_ENTRIES) return;
+    for (const [key, entry] of this.entries) if (entry.expiresAt <= now) this.entries.delete(key);
+    // Map iterates in insertion order, so the oldest survivors go first.
+    for (const key of this.entries.keys()) {
+      if (this.entries.size <= MAX_ENTRIES) break;
+      this.entries.delete(key);
+    }
   }
 
   /** Single-flight: identical concurrent assessments share one classifier call. */
-  dedupe<T extends Promise<TaskAssessment>>(key: string, create: () => T): T {
-    const existing = this.inFlight.get(key);
-    if (existing) return existing as T;
-    const promise = create();
-    const wrapped = promise.finally(() => this.inFlight.delete(key)) as T;
+  dedupe<T>(key: string, create: () => Promise<T>): Promise<T> {
+    const existing = this.inFlight.get(key) as Promise<T> | undefined;
+    if (existing) return existing;
+    const wrapped = create().finally(() => this.inFlight.delete(key));
     this.inFlight.set(key, wrapped);
     return wrapped;
   }

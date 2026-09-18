@@ -1,7 +1,7 @@
-import { mkdirSync, readFileSync, appendFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, appendFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
-import { decideRoute, childFloorFor, QUOTA_MAX_AGE_MS } from './policy';
+import { decideRoute, classifyTask, admitAttempt, childFloorFor, QUOTA_MAX_AGE_MS, type QuotaSnapshot } from './policy';
 import { contextTools } from './context-tools';
 import { inspectQuotas } from './quota';
 import { getPromotion } from './promotion';
@@ -9,26 +9,71 @@ import { inspectMeridian, withMeridianProfile } from './meridian';
 import { BudgetLedger, estimateUpperBoundUsd } from './budget';
 import { streamSimple, registerCustomApi, unregisterCustomApis } from '@oh-my-pi/pi-ai';
 import { installGuardedOpenRouter, guardOpenRouterModel, GUARDED_OPENROUTER_MARKER } from './guarded-openrouter';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, randomBytes } from 'node:crypto';
 import { buildSessionContext, AgentRegistry, MAIN_AGENT_ID } from '@oh-my-pi/pi-coding-agent';
-import { writeFanout, readSiblings, removeFanout } from './fanout';
-import { installNineRouter, type NineRouterController } from './ninerouter';
+import { writeFanout, readSiblings, readInFlightWindows, removeFanout } from './fanout';
+import { installNineRouter as installNineRouterBundle } from './ninerouter';
+import type { NineRouterController } from './ninerouter-types';
 import { gatewayQuota, readNineRouterUsage, refreshNineRouterUsage, nineRouterSession, readPasswordFromOp, NINE_ROUTER_REFRESH_THROTTLE_MS } from './ninerouter-usage';
 import { steerAccounts } from './accounts';
-import { installProviderDiagnostics } from './diagnostics';
+import { installProviderDiagnostics, unsupportedModel } from './diagnostics';
 import { buildRoutingContext, assessmentCacheKey, JEV_SCHEMA_VERSION, JEV_QUESTION_SET_VERSION } from './routing-context';
 import { AssessmentCache, cacheKeyFor } from './assessment-cache';
 import { createJevClient, JEVS_CLASSIFIER_MODEL, JEV_INPUT_USD_PER_MTOK } from './jev-client';
-import { resolveClassification, type RouteTier, type SemanticAssessment, type SemanticMode } from './policy';
+import { advanceEpisode, advanceDecisionEpoch, type TaskEpisode } from './episode';
+import { resolveClassification, type RouteTier, type RoutePhase, type SemanticAssessment, type SemanticMode } from './policy';
 import { showRoster } from './roster-ui';
+import { PROBE_FIXTURE_VERSION } from './roster-probe';
+// The generated bundle is emitted untyped; bind it to the contract the router uses.
+const installNineRouter=installNineRouterBundle as (pi:unknown,options:{root:string;nativeStreamSimple:unknown;log:(event:string,data?:unknown)=>void})=>NineRouterController;
 
 const VERSION='1.3.0';
 const REFS=['openai-codex/gpt-6-astra','openai-codex/gpt-5.6-sol','openai-codex/gpt-5.6-luna','anthropic/claude-fable-5-1','anthropic/claude-sonnet-5','anthropic/claude-opus-5','opencode-go/deepseek-v4.1-flash','opencode-go/glm-5.3-flash'];
 const BACKUPS=['openrouter/openai/gpt-5.6-sol','openrouter/anthropic/claude-opus-5','openrouter/openai/gpt-6-astra'];
 const STEER_INTERVAL_MS=600_000;
 const steerThrottle:Record<string,number>={};
+/** After three consecutive classifier transport failures, stop calling it for this long. */
+const CLASSIFIER_BACKOFF_MS=120_000;
 const ref=(model:any)=>model ? `${model.provider}/${model.id}` : undefined;
 const parse=(file:string,fallback:any)=>{try{return JSON.parse(readFileSync(file,'utf8'));}catch{return fallback;}};
+/**
+ * One effective Go qualification from stored evidence. A goQualifications
+ * record must be about this wire model (or its 9router-prefixed ref), the
+ * current transport and fixture, and must have passed the tool round trip.
+ * A goValidated entry with no record counts only under goLegacyValidated.
+ */
+export function goValidation(cfg:any,goModelId:string,modelRef:string):{tools:boolean;vision:boolean;reasoning:boolean}{
+  const listed=cfg.goValidated?.includes(goModelId)??false;
+  const vision=cfg.goVisionValidated?.includes(goModelId)??false;
+  const record=cfg.goQualifications?.[goModelId];
+  if(!record){const legacy=listed&&cfg.goLegacyValidated===true;return {tools:legacy,vision:vision&&legacy,reasoning:legacy};}
+  const wire=modelRef.startsWith('9router/')?modelRef.slice('9router/'.length):modelRef;
+  const sameModel=record.model===wire||`9router/${record.model}`===modelRef||record.model===goModelId;
+  const current=sameModel&&record.transport==='openai-chat-completions'&&record.fixtureVersion===PROBE_FIXTURE_VERSION;
+  const tools=listed&&current&&record.toolRoundTrip===true;
+  return {tools,vision:vision&&current,reasoning:listed&&current};
+}
+/**
+ * Readers for the fields routing needs off a session message. OMP's message
+ * union does not expose them on every variant, and assistant text lives in
+ * content blocks; routing and mining must read them the same way.
+ */
+const messageText=(message:unknown):string=>{
+  if(!message||typeof message!=='object')return '';
+  const record=message as {text?:unknown;content?:unknown};
+  if(typeof record.text==='string')return record.text;
+  if(typeof record.content==='string')return record.content;
+  if(Array.isArray(record.content))return record.content.filter((c:any)=>c?.type==='text').map((c:any)=>String(c.text??'')).join('\n');
+  return '';
+};
+const messageStopReason=(message:unknown):string|undefined=>{
+  const value=(message as {stopReason?:unknown}|undefined)?.stopReason;
+  return typeof value==='string'?value:undefined;
+};
+const messageToolCalls=(message:unknown):number|undefined=>{
+  const content=(message as {content?:unknown}|undefined)?.content;
+  return Array.isArray(content)?content.filter((c:any)=>c?.type==='toolCall'||c?.type==='tool_use').length:undefined;
+};
 const textLength=(value:any):number=>{
   if(typeof value==='string')return value.length;
   if(!value||typeof value!=='object')return 0;
@@ -39,6 +84,16 @@ const hasImage=(v:any):boolean=>!!v&&typeof v==='object'&&(v.type==='image'||(Ar
 
 export default function personalRouter(pi:any) {
   const root=process.env.OMP_PERSONAL_ROUTER_HOME ?? join(process.env.PI_CODING_AGENT_DIR ?? join(homedir(),'.omp','agent'),'personal-router');
+  // Cache-key HMAC secret: env override, else a random 32-byte key generated
+  // once and stored 0600. A path string is not a secret.
+  const hmacKeyFile=join(root,'hmac.key');
+  const hmacKey=():string=>{
+    if(process.env.OMP_ROUTER_HMAC_KEY)return process.env.OMP_ROUTER_HMAC_KEY;
+    try{const existing=readFileSync(hmacKeyFile,'utf8').trim();if(existing.length>=32)return existing;}catch{}
+    const generated=randomBytes(32).toString('hex');
+    writeFileSync(hmacKeyFile,generated,{mode:0o600});
+    return generated;
+  };
   mkdirSync(root,{recursive:true,mode:0o700});
   const settingsFile=join(root,'settings.json');
   let ctxCurrent:any, state:any={}, child=false, lastActual:string|undefined, lastStatus:any, lastQuota:any, blocked=false;
@@ -49,6 +104,11 @@ export default function personalRouter(pi:any) {
   let usageRefreshPromise:Promise<unknown>|undefined;
   let semanticMode:SemanticMode='off';
   let lastSemanticTrace:any;
+  // Repeated classifier outages must not add the full deadline to every turn.
+  let classifierFailures=0, classifierBackoffUntil=0;
+  // Immutable snapshot of the last routing decision's inputs, so a provider
+  // attempt can be re-admitted without reclassifying or refreshing quota.
+  let lastAttemptContext:any;
   const settings=()=>parse(settingsFile,{enabled:true,goValidated:[],goVisionValidated:[],paidFallbackEnabled:false});
   const TYPESAFE_PROVIDER='typesafe';
   /**
@@ -79,8 +139,11 @@ export default function personalRouter(pi:any) {
     try{return await ctxCurrent?.modelRegistry?.authStorage?.getApiKey(TYPESAFE_PROVIDER)??process.env.TYPESAFE_API_KEY;}
     catch{return process.env.TYPESAFE_API_KEY;}
   };
-  /** 1Password item holding the TypeSafe key (a LOGIN item: the key is in `password`). */
-  const TYPESAFE_OP_REF='op://Personal/AgentKit - Typesafe/password';
+  /**
+   * 1Password item holding the TypeSafe key (a LOGIN item: the key is in
+   * `password`). Vault layout is a deployment fact, so it is overridable.
+   */
+  const TYPESAFE_OP_REF=process.env.OMP_ROUTER_TYPESAFE_OP_REF??'op://Personal/AgentKit - Typesafe/password';
   // `/route key` is the rotation path, so it always reads the vault itself and
   // refreshes the keychain cache; it never serves a stale cached key.
   const readTypesafeKeyFromOp=()=>readPasswordFromOp(TYPESAFE_OP_REF,AbortSignal.timeout(60_000),{forceVaultRead:true});
@@ -94,9 +157,14 @@ export default function personalRouter(pi:any) {
     // return in ~300ms, so raising it only stops discarding the cold answer.
     deadlineMs:1500,
     admit:(estimateUsd)=>{
-      const result=budget().reserve(`classifier-${randomUUID()}`,estimateUsd,Date.now(),{purpose:'classifier',subcaps:{dailyCapUsd:0.10,monthlyCapUsd:1.00}});
+      const id=`classifier-${randomUUID()}`;
+      const result=budget().reserve(id,estimateUsd,Date.now(),{purpose:'classifier',subcaps:{dailyCapUsd:0.10,monthlyCapUsd:1.00}});
       if(!result.ok)return {ok:false as const,reason:result.reason};
-      return {ok:true as const};
+      return {
+        ok:true as const,
+        dispatched:()=>{budget().markDispatched(id);},
+        settle:(actualUsd:number)=>{try{const s=budget().settle(id,actualUsd);log('budget-settled',{requestId:id,purpose:'classifier',actualUsd,overEstimateUsd:s.overEstimateUsd});}catch(error:any){log('budget-settle-error',{requestId:id,errorType:error?.name??'Error'});}},
+      };
     },
     inputUsdPerMillion:JEV_INPUT_USD_PER_MTOK,
     // Resolved per call, never snapshotted: the key can be stored after load.
@@ -153,12 +221,13 @@ export default function personalRouter(pi:any) {
     // biometric cache miss no longer aborts the refresh mid-credential-fetch.
     usageRefreshPromise=Promise.resolve(refreshNineRouterUsage(root,{timeoutMs:2500})).then((cache:any)=>{gatewayUsage=cache;}).catch((error:any)=>{log('ninerouter-usage-refresh-error',{errorType:error?.name??'Error'});}).finally(()=>{usageRefreshPromise=undefined;});
   }
-  function gatewayQuotaFor(model:any,cache:any){
+  function gatewayQuotaFor(model:any,cache:any):QuotaSnapshot|undefined{
     if(!isGateway(model))return undefined;
     const modelRef=ref(model);
     const description=modelRef?nineRouter?.describe(modelRef):undefined;
     const id=description?.canonicalRef??canonical(model)??model.id??modelRef;
-    try{return gatewayQuota(id,cache)??{observedAt:Date.now(),state:'unknown'};}catch(error:any){log('ninerouter-quota-error',{errorType:error?.name??'Error',model:ref(model)});return {observedAt:Date.now(),state:'unknown'};}
+    const unknown:QuotaSnapshot={observedAt:Date.now(),state:'unknown',windows:[]};
+    try{return gatewayQuota(id,cache)??unknown;}catch(error:any){log('ninerouter-quota-error',{errorType:error?.name??'Error',model:ref(model)});return unknown;}
   }
   const fanoutDir=join(root,'fanout');
   function ownAgentId(ctx:any):string|undefined{
@@ -210,7 +279,9 @@ export default function personalRouter(pi:any) {
   }
   pi.on('session_start',(_e:any,ctx:any)=>init(ctx));
   pi.on('session_switch',(_e:any,ctx:any)=>init(ctx));
-  pi.on('session_compact',()=>{state.phase=undefined;state.taskGoal=undefined;state.handoffReady=true;save();});
+  // Compaction removes the evidence a decision leaned on, but not the purpose
+  // of the work: keep the episode goal and open a fresh decision epoch.
+  pi.on('session_compact',()=>{state.phase=undefined;state.episode=advanceDecisionEpoch(state.episode);state.handoffReady=true;save();});
 
   pi.on('before_agent_start',async(event:any,ctx:any)=>{
     ctxCurrent=ctx; blocked=false;
@@ -232,7 +303,9 @@ export default function personalRouter(pi:any) {
       for(const [id,quota] of meridian)quotas.set(id,quota);
       for(const m of models){
         if(!isGateway(m))continue;
-        quotas.set(ref(m),{quota:gatewayQuotaFor(m,gatewayCache),accountOwner:'gateway'});
+        const modelRef=ref(m);
+        const quota=gatewayQuotaFor(m,gatewayCache);
+        if(modelRef&&quota)quotas.set(modelRef,{quota,accountOwner:'gateway'});
       }
       const branch=ctx.sessionManager.getBranch();
       const messages=buildSessionContext(branch).messages;
@@ -260,19 +333,29 @@ export default function personalRouter(pi:any) {
           supportsImages:gateway?(description?.supportsImages===true):(m.provider==='openrouter'?false:(m.input?.includes('image')??false)),
           supportsTools:gateway?(description?.supportsTools===true):true,
           supportedEfforts:m.thinking?.efforts??(gateway?(description?.reasoning?['medium','high']:['off']):(m.reasoning?['medium','high']:['off'])),
-          // OpenCode Go validation belongs to the canonical model id. This
-          // keeps the safeguard intact when a gateway registration uses a
-          // different wire ref (and when the host drops custom fields).
-          validated:goModelId?{tools:cfg.goValidated?.includes(goModelId)??false,vision:cfg.goVisionValidated?.includes(goModelId)??false,reasoning:cfg.goValidated?.includes(goModelId)??false}:undefined,
-          quota:unavailableUntil>Date.now()?{observedAt:Date.now(),state:'depleted',windows:[{id:'runtime-model-backoff',exhausted:true,resetsAt:unavailableUntil}]}:quotas.get(modelRef)?.quota,
+          // OpenCode Go validation belongs to the canonical model id, and only
+          // counts when the stored qualification record is about THIS wire
+          // model/transport/fixture. A bare goValidated entry without a record
+          // is legacy evidence: accepted only when settings.goLegacyValidated
+          // opts in, so an old boolean never silently stands as current proof.
+          validated:goModelId?goValidation(cfg,goModelId,modelRef):undefined,
+          quota:unavailableUntil>Date.now()?({observedAt:Date.now(),state:'depleted',windows:[{id:'runtime-model-backoff',exhausted:true,resetsAt:unavailableUntil}]} satisfies QuotaSnapshot):quotas.get(modelRef)?.quota,
           payg:gateway?(description?.payg===true):m.provider==='openrouter',
           qualityTiers:BACKUPS.includes(modelRef)?(m.id.includes('gpt-5.6-sol')?['mechanical','bounded','execution']:['mechanical','bounded','execution','complex','premium']):undefined,
+          // Same conservative bound the ledger reserves against, so the price
+          // the allocator compares is the price admission will demand.
+          taskCostUsd:m.provider==='openrouter'&&Number.isFinite(m.maxTokens)?(()=>{
+            try{return estimateUpperBoundUsd({inputTokens:contextTokens,maxOutputTokens:Math.min(m.maxTokens,32768),rates:priceCeiling(m)});}catch{return undefined;}
+          })():undefined,
         };
       });
       const contract=child && /(?:scope|escopo)\s*:/i.test(event.prompt) && /(?:acceptance|aceite|criterios? de aceite)\s*:/i.test(event.prompt);
       const input:any={prompt:event.prompt,now:Date.now(),models:routeModels,current:current?{model:current,effort:pi.getThinkingLevel(),tier:state.tier,phase:state.phase}:undefined,previous:state.tier?{tier:state.tier,phase:state.phase}:undefined,childFloor:state.childFloor,manualPin:state.pin,contextTokens,outputMarginTokens:8192,needsImages,needsTools:pi.getActiveTools().length>0,boundary:state.providerFailed?'provider-failure':child&&!state.tier?'child':'user',task:{bounded:contract,acceptanceDefined:contract,failedQualityChecks:state.failedQualityChecks??0,highValue:state.highValue},promotion,paidFallback:{authorized:false,budgetReserved:false,allowedModels:[]},handoffReady:state.handoffReady??false};
       input.hasWorkContext=messages.some((message:any)=>message?.role==='assistant');
       if(child&&!state.tier)input.siblings=fanoutSiblings(ctx).siblings;
+      // Work other live agents already committed against the same shared
+      // allowances. Advisory: the provider's own accounting stays authoritative.
+      try{const self=ownAgentId(ctx);input.inFlightByWindow=readInFlightWindows(fanoutDir,self??'');}catch{}
       // Semantic classification: mode-gated, budget-gated, fail-closed. Shadow
       // records but never changes the executed decision. Classification only
       // happens at a safe boundary (here), never per tool-loop continuation.
@@ -285,25 +368,26 @@ export default function personalRouter(pi:any) {
       let semanticTrace:any;
       // A short follow-up ("yep", "you seem stuck") carries no task of its own.
       // Sending it as the goal made Jev answer `unknown` with high confidence —
-      // correctly, since nothing in the state said what the work was. Keep the
-      // first substantive prompt of the phase as the goal so later turns are
-      // assessed against it. Cleared by /route handoff and session_compact.
-      const substantive=String(event.prompt??'').trim().split(/\s+/).filter(Boolean).length>=8;
-      if(!state.taskGoal&&substantive)state.taskGoal=String(event.prompt).slice(0,2000);
+      // correctly, since nothing in the state said what the work was. The
+      // episode holds the latest substantive statement of the work; a new
+      // substantive request replaces it and opens a fresh decision epoch, so an
+      // unrelated later task is never assessed against the previous one.
+      const episode:TaskEpisode=advanceEpisode(state.episode,String(event.prompt??''),Date.now(),randomUUID);
+      state.episode=episode;
       // Structured difficulty signals from the session itself. Free text is
       // never added here; each field was measured against the outcome corpus.
       const lastAssistant=[...messages].reverse().find((msg:any)=>msg?.role==='assistant');
-      const previousTurnErrored=lastAssistant?.stopReason==='error'||state.providerFailed===true;
-      const previousTurnToolCalls=Array.isArray(lastAssistant?.content)?lastAssistant.content.filter((c:any)=>c?.type==='toolCall'||c?.type==='tool_use').length:undefined;
+      const previousTurnErrored=messageStopReason(lastAssistant)==='error'||state.providerFailed===true;
+      const previousTurnToolCalls=messageToolCalls(lastAssistant);
       const priorUserTurns=messages.filter((msg:any)=>msg?.role==='user').length;
       if(semanticMode!=='off'&&!state.pin){
         const routingContext=buildRoutingContext({
-          taskGoal:state.taskGoal?String(state.taskGoal):String(event.prompt??'').slice(0,2000),
+          taskGoal:episode.goal,
           currentUserRequest:String(event.prompt??''),
-          previousPhase:state.phase,
-          scope:child?String(event.prompt??'').slice(0,2000):undefined,
-          acceptanceCriteria:contract?[String(event.prompt??'').slice(0,1500)]:undefined,
-          recentEvidence:messages.filter((msg:any)=>msg?.role==='assistant').slice(-2).map((msg:any)=>typeof msg?.text==='string'?msg.text.slice(0,600):'').filter(Boolean),
+          previousPhase:episode.phase??state.phase,
+          scope:child?String(event.prompt??''):undefined,
+          acceptanceCriteria:contract?[String(event.prompt??'')]:undefined,
+          recentEvidence:messages.filter((msg:any)=>msg?.role==='assistant').slice(-2).map((msg:any)=>messageText(msg)).filter(Boolean),
           boundary:input.boundary==='child'?'child':input.boundary==='provider-failure'?'provider-failure':'user',
           hasImages:needsImages,
           toolsRequired:input.needsTools,
@@ -311,32 +395,47 @@ export default function personalRouter(pi:any) {
           previousTurnErrored,
           priorUserTurns,
           ...(previousTurnToolCalls!==undefined?{previousTurnToolCalls}:{}),
+          upstreamTruncated:episode.goalTruncated===true,
         });
-        const hmacKey=process.env.OMP_ROUTER_HMAC_KEY??join(root,'keyring');
-        const cacheKey=cacheKeyFor(routingContext,assessmentCacheKey({state:routingContext,schemaVersion:JEV_SCHEMA_VERSION,questionSetVersion:JEV_QUESTION_SET_VERSION,classifierModel:JEVS_CLASSIFIER_MODEL,hmacKey:typeof hmacKey==='string'?hmacKey:join(root,'keyring')}),JEV_QUESTION_SET_VERSION,JEVS_CLASSIFIER_MODEL,String(state.epoch??'global'));
+        const cacheKey=cacheKeyFor(routingContext,assessmentCacheKey({state:routingContext,schemaVersion:JEV_SCHEMA_VERSION,questionSetVersion:JEV_QUESTION_SET_VERSION,classifierModel:JEVS_CLASSIFIER_MODEL,hmacKey:hmacKey()}),JEV_QUESTION_SET_VERSION,JEVS_CLASSIFIER_MODEL,`${episode.id}:${episode.decisionEpoch}`);
         const cached=assessmentCache.get(cacheKey);
         if(cached){semanticAssessment=cached;}
+        else if(Date.now()<classifierBackoffUntil){
+          semanticTrace={result:'backoff',elapsedMs:0,mode:semanticMode,truncated:routingContext.truncated};
+        }
         else{
-          const result=await jev.assess(routingContext,cacheKey).catch(()=>({ok:false as const,reason:'transport' as const,elapsedMs:0}));
-          semanticTrace={result:result.ok?'assessed':result.reason,elapsedMs:result.ok?result.elapsedMs:result.elapsedMs,mode:semanticMode,tierAssessed:result.ok?result.assessment.tier.selected:undefined,phaseAssessed:result.ok?result.assessment.phase.selected:undefined,truncated:routingContext.truncated};
-          if(result.ok){assessmentCache.put(cacheKey,result.assessment);semanticAssessment=result.assessment;}
+          // Single-flight: concurrent identical assessments share one paid call.
+          const result=await assessmentCache.dedupe(cacheKey,()=>jev.assess(routingContext,cacheKey)).catch(()=>({ok:false as const,reason:'transport' as const,elapsedMs:0}));
+          semanticTrace={result:result.ok?'assessed':result.reason,elapsedMs:result.elapsedMs,mode:semanticMode,tierAssessed:result.ok?result.assessment.tier.selected:undefined,phaseAssessed:result.ok?result.assessment.phase.selected:undefined,resolvedModel:result.ok?result.assessment.resolvedModel:undefined,questionSetVersion:JEV_QUESTION_SET_VERSION,truncated:routingContext.truncated};
+          if(result.ok){assessmentCache.put(cacheKey,result.assessment);semanticAssessment=result.assessment;classifierFailures=0;}
+          else if(result.reason!=='budget'&&result.reason!=='no-key'&&result.reason!=='cancelled'){
+            // Repeated outages must not add the full deadline to every turn.
+            classifierFailures+=1;
+            if(classifierFailures>=3){classifierBackoffUntil=Date.now()+CLASSIFIER_BACKOFF_MS;log('semantic-backoff',{untilMs:CLASSIFIER_BACKOFF_MS,failures:classifierFailures});}
+          }
         }
       }
-      const rulesClassification=state.tier&&state.phase?{tier:state.tier,phase:state.phase}:{tier:'complex' as RouteTier,phase:'investigation' as const};
-      let semanticResolution:{tier:RouteTier;phase:typeof rulesClassification.phase;source:'rules'|'semantic-assisted'|'semantic-downgrade';reason:string}|undefined;
+      // The rules baseline is THIS request's classification, computed once and
+      // fed explicitly to the allocator. Semantic evidence may raise the tier
+      // or clarify the phase; nothing is smuggled through session state.
+      const rulesClassification=classifyTask(input);
+      let semanticResolution:{tier:RouteTier;phase:RoutePhase;source:'rules'|'semantic-assisted'|'semantic-downgrade';reason:string}|undefined;
       if(semanticMode!=='off'&&semanticAssessment){
-        semanticResolution=resolveClassification({assessment:semanticAssessment,rulesClassification,mode:semanticMode,floorTier:state.childFloor?.tier,floorLocksPhase:!!state.childFloor,highValue:state.highValue===true,failedQualityChecks:state.failedQualityChecks??0,previousTurnErrored,priorUserTurns});
+        const resolveWith=(mode:SemanticMode)=>resolveClassification({assessment:semanticAssessment,rulesClassification,mode,floorTier:state.childFloor?.tier,floorLocksPhase:!!state.childFloor,highValue:state.highValue===true,failedQualityChecks:state.failedQualityChecks??0,previousTurnErrored,priorUserTurns});
         if(semanticMode==='shadow'){
-          semanticTrace={...(semanticTrace??{}),shadow:{baselineTier:rulesClassification.tier,semanticTier:semanticResolution.tier,proposedSource:semanticResolution.source}};
-        } else if(semanticResolution.source!=='rules'){
-          // Assisted/calibrated: the resolved classification steers the real decision.
-          state={...state,tier:semanticResolution.tier,phase:semanticResolution.phase};
+          // Shadow: a real assisted proposal against the same frozen input, recorded only.
+          const proposal=resolveWith('assisted');
+          const proposed=decideRoute({...input,classification:{tier:proposal.tier,phase:proposal.phase}});
+          semanticTrace={...(semanticTrace??{}),shadow:{baselineTier:rulesClassification.tier,baselinePhase:rulesClassification.phase,semanticTier:proposal.tier,semanticPhase:proposal.phase,proposedSource:proposal.source,proposedModel:proposed.model}};
+        } else {
+          semanticResolution=resolveWith(semanticMode);
+          if(semanticResolution.source!=='rules')input.classification={tier:semanticResolution.tier,phase:semanticResolution.phase};
         }
       }
       if(semanticTrace)log('semantic-router',{...semanticTrace,cacheSize:assessmentCache.size});
       lastSemanticTrace=semanticTrace??lastSemanticTrace;
       // "jev" only when a usable assessment actually shaped the executed decision.
-      lastSource=semanticResolution&&semanticResolution.source!=='rules'&&semanticMode!=='shadow'?'jev':'rules';
+      lastSource=input.classification?'jev':'rules';
       let decision=decideRoute(input);
       if(input.boundary==='user'&&decision.model){
         const target=routeModels.find((m:any)=>m.ref===decision.model);
@@ -365,6 +464,7 @@ export default function personalRouter(pi:any) {
         }
       }
       lastStatus=decision;
+      lastAttemptContext=undefined;
       if(decision.action==='unavailable'||!decision.model){
         blocked=true;ctx.abort();log('blocked',{reason:decision.reason,rejected:decision.rejected,contextTokens});notify('Routing: nenhuma rota adequada disponível. /route status mostra o motivo; /route pin provider/model fixa uma alternativa.','warning');return;
       }
@@ -372,14 +472,22 @@ export default function personalRouter(pi:any) {
       if(!target){releaseUndispatched();blocked=true;ctx.abort();log('blocked',{reason:'selected-model-unavailable',model:decision.model});notify('Routing: catálogo da rota selecionada indisponível.','warning');return;}
       const q=quotas.get(decision.model); lastQuota=q;
       if(target?.provider==='openrouter')target=guardOpenRouterModel(target,guard.apiId);
-      if(target.provider==='anthropic'&&cfg.claudeAccountOwner==='meridian')target=withMeridianProfile(target,q?.profile,ctx.sessionManager.getSessionId());
+      if(target.provider==='anthropic'&&cfg.claudeAccountOwner==='meridian'){
+        // Meridian routing needs a concrete profile; without one the account is unknown and we must not guess.
+        if(!q?.profile){blocked=true;ctx.abort();log('blocked',{reason:'meridian-profile-unknown',model:decision.model});notify('Routing: perfil Meridian indisponível para a rota selecionada.','warning');return;}
+        target=withMeridianProfile(target,q.profile,ctx.sessionManager.getSessionId());
+      }
       if(target.provider!=='9router'&&q?.credentialId&&target.provider!=='opencode-go')ctx.modelRegistry.authStorage.pinSessionOAuthAccount(target.provider,ctx.sessionManager.getSessionId(),q.credentialId);
       if(decision.model!==current||(target.provider==='openrouter'&&!ctx.models.current()?.[GUARDED_OPENROUTER_MARKER])||(target.provider==='anthropic'&&cfg.claudeAccountOwner==='meridian'&&(state.claudeProfile!==q?.profile||ctx.models.current()?.headers?.['x-meridian-profile']!==q?.profile))){
         const ok=await pi.setModel(target);
         if(!ok){releaseUndispatched();blocked=true;ctx.abort();log('blocked',{reason:'native-setModel-unavailable',model:decision.model});notify('Routing: autenticação da rota selecionada indisponível.','warning');return;}
       }
       if(decision.effort&&!state.pin?.effort)pi.setThinkingLevel(decision.effort);
-      state={...state,tier:decision.tier,phase:decision.phase,providerFailed:false,handoffReady:false,...(q?.profile?{claudeProfile:q.profile}:{})};
+      // State is committed only after the route was actually applied.
+      state={...state,tier:decision.tier,phase:decision.phase,episode:{...episode,phase:decision.phase},providerFailed:false,handoffReady:false,...(q?.profile?{claudeProfile:q.profile}:{})};
+      // Frozen DECISION (route identity, committed tier, capability snapshots).
+      // Execution facts (context size, quota, clock) are rebuilt per attempt.
+      lastAttemptContext={models:routeModels,model:decision.model,tier:decision.tier,contextTokens,outputMarginTokens:input.outputMarginTokens,needsImages,needsTools:input.needsTools,quotaMaxAgeMs:input.quotaMaxAgeMs,episodeId:episode.id};
       lastActual=ref(ctx.models.current())??decision.model;
       save();status();
       try{
@@ -392,7 +500,9 @@ export default function personalRouter(pi:any) {
             const childCanonical=a.session?canonical(a.session.model):undefined;
             if(childCanonical)childrenMap[a.id]=childCanonical;
           }
-          writeFanout(fanoutDir,agentId,ownCanonical??lastActual,childrenMap);
+          // Shared windows of the selected route, so siblings can debit them.
+          const ownWindows=[...new Set((quotas.get(decision.model)?.quota?.windows??[]).map((w:any)=>w.sharedKey).filter((k:any):k is string=>typeof k==='string'&&!!k))];
+          writeFanout(fanoutDir,agentId,ownCanonical??lastActual,childrenMap,ownWindows);
           const siblingInfo=fanoutSiblings(ctx);
           log('fanout',{agentId,parentId:siblingInfo.parentId,siblings:siblingInfo.siblings});
         }
@@ -406,8 +516,42 @@ export default function personalRouter(pi:any) {
     }
   });
 
+  /** Current facts for one attempt: latest context size, runtime backoffs and gateway usage; never the first snapshot. */
+  function attemptFacts(ctx:any,record:any,modelRef:string){
+    const base=record.models.find((entry:any)=>entry.ref===modelRef);
+    if(!base)return undefined;
+    const now=Date.now();
+    const unavailableUntil=state.unavailableModels?.[modelRef];
+    const catalog=ctx.models.list().find((m:any)=>ref(m)===modelRef);
+    const gatewayQuota=catalog&&isGateway(catalog)?gatewayQuotaFor(catalog,readGatewayUsage()):undefined;
+    const quota=unavailableUntil>now?({observedAt:now,state:'depleted',windows:[{id:'runtime-model-backoff',exhausted:true,resetsAt:unavailableUntil}]} satisfies QuotaSnapshot):gatewayQuota??base.quota;
+    const reported=ctx.getContextUsage?.()?.tokens;
+    const contextTokens=Number.isFinite(reported)&&reported>0?Math.max(reported,record.contextTokens):record.contextTokens;
+    return {model:{...base,quota},input:{prompt:'',now,models:record.models,contextTokens,outputMarginTokens:record.outputMarginTokens,needsImages:record.needsImages,needsTools:record.needsTools,quotaMaxAgeMs:record.quotaMaxAgeMs,current:{model:record.model,tier:record.tier}}};
+  }
   pi.on('before_provider_request',(_event:any,ctx:any)=>{
-    const m=ctx.model??ctx.models.current();if(m?.provider!=='openrouter')return;
+    const m=ctx.model??ctx.models.current();
+    // Every attempt, including tool-loop continuations, is checked against the
+    // route it is actually about to use. Classification is NOT redone here: a
+    // continuation must not pay for an assessment or change models mid-loop.
+    const modelRef=ref(m);
+    // A pin chooses the route; it does not exempt the attempt from facts the
+    // router already knows. The committed-tier floor is automatic-mode only.
+    const pinned=!!state.pin;
+    if(!state.disabled&&settings().enabled!==false&&modelRef){
+      const blockedUntil=state.unavailableModels?.[modelRef];
+      const facts=lastAttemptContext?attemptFacts(ctx,lastAttemptContext,modelRef):undefined;
+      const admitted=blockedUntil>Date.now()?{ok:false as const,reason:'route is blocked by an observed runtime failure'}
+        :facts?admitAttempt(facts.model,facts.input,pinned?undefined:lastAttemptContext.tier)
+        :pinned?{ok:true as const}
+        :{ok:false as const,reason:lastAttemptContext?'route was never admitted by the routing decision':'no routing decision covers this attempt'};
+      if(!admitted.ok){
+        blocked=true;ctx.abort();log('attempt-blocked',{model:modelRef,decided:lastAttemptContext?.model,pinned,reason:admitted.reason});
+        notify(`Routing: rota atual inválida para esta chamada (${admitted.reason}).`,'warning');
+        return;
+      }
+    }
+    if(m?.provider!=='openrouter')return;
     releaseUndispatched();
     if(!m[GUARDED_OPENROUTER_MARKER]){blocked=true;ctx.abort();log('budget-blocked',{reason:'unguarded-openrouter-transport'});notify('OpenRouter: transporte sem proteção de orçamento; chamada interrompida.','warning');}
   });
@@ -423,15 +567,40 @@ export default function personalRouter(pi:any) {
     if(m.provider==='openrouter')await reconcile(ctx);
     if(m.stopReason==='error'){
       state.providerFailed=true;
-      if(m.provider==='anthropic'&&state.claudeProfile){state.unavailableProfiles={...state.unavailableProfiles,[state.claudeProfile]:Date.now()+180000};}
-      else state.unavailableModels={...state.unavailableModels,[actual]:Date.now()+180000};
+      // A model the upstream does not serve is a permanent property of the
+      // route, not a transient outage: retrying burns the whole retry budget
+      // against a fixed answer. Block it for a day and release a pin that
+      // points at it, so routing can pick something that exists.
+      const permanent=unsupportedModel(m.error??m.errorMessage);
+      // An unidentifiable responder cannot be blocked by ref; the profile path still applies.
+      if(!permanent&&m.provider==='anthropic'&&state.claudeProfile){state.unavailableProfiles={...state.unavailableProfiles,[state.claudeProfile]:Date.now()+180000};}
+      else if(actual)state.unavailableModels={...state.unavailableModels,[actual]:Date.now()+(permanent?86_400_000:180_000)};
+      if(permanent){
+        log('model-unsupported',{model:actual,pinReleased:state.pin?.model===actual});
+        if(state.pin?.model===actual){delete state.pin;notify(`Routing: ${actual} não é servido pelo upstream; pin removido e roteamento automático retomado.`,'warning');}
+        else notify(`Routing: ${actual} não é servido pelo upstream; rota bloqueada.`,'warning');
+      }
       save();
     } else if(m.stopReason==='stop'||m.stopReason==='toolUse'){
       state.providerFailed=false;
-      if(state.unavailableModels)delete state.unavailableModels[actual];
+      if(actual&&state.unavailableModels)delete state.unavailableModels[actual];
       if(m.provider==='anthropic'&&state.claudeProfile&&state.unavailableProfiles)delete state.unavailableProfiles[state.claudeProfile];
       save();
     }
+  });
+  // Retries do not emit message_end, so a permanent "model not supported" must
+  // be recognized here or the host spends its whole retry budget on it. The
+  // block lands before the next before_provider_request, which then refuses.
+  pi.on('auto_retry_start',(event:any)=>{
+    if(!unsupportedModel(event?.errorMessage))return;
+    const target=lastActual??ref(ctxCurrent?.models?.current());
+    if(!target)return;
+    state.unavailableModels={...state.unavailableModels,[target]:Date.now()+86_400_000};
+    const pinReleased=state.pin?.model===target;
+    if(pinReleased)delete state.pin;
+    log('model-unsupported',{model:target,pinReleased,duringRetry:true});
+    notify(`Routing: ${target} não é servido pelo upstream; rota bloqueada${pinReleased?' e pin removido':''}.`,'warning');
+    save();
   });
   pi.on('agent_end',()=>{
     releaseUndispatched();
@@ -447,7 +616,8 @@ export default function personalRouter(pi:any) {
       ctxCurrent=ctx;
       const normalized=args.trim();
       const [cmd,...rest]=(normalized?normalized:'status').split(/\s+/);
-      if(cmd==='auto'){state.pin=undefined;state.tier=undefined;state.phase=undefined;state.taskGoal=undefined;state.disabled=false;state.providerFailed=false;const assisted=!!(await typesafeKey());notify(assisted?'Auto: regras + Jev.':'Auto: só regras. /route key liga o Jev.');}
+      // `auto` is a full reset: a new task, not a continuation of the old one.
+      if(cmd==='auto'){state.pin=undefined;state.tier=undefined;state.phase=undefined;state.episode=undefined;state.disabled=false;state.providerFailed=false;const assisted=!!(await typesafeKey());notify(assisted?'Auto: regras + Jev.':'Auto: só regras. /route key liga o Jev.');}
       else if(cmd==='off'){state.disabled=true;notify('Routing manual nesta sessão. /route auto reativa.');}
       else if(cmd==='pin'){
         const resolved=ctx.models.resolve(rest[0]??'');
@@ -458,7 +628,8 @@ export default function personalRouter(pi:any) {
         state.pin={model:ref(target),effort:pi.getThinkingLevel()};state.disabled=false;lastActual=ref(target);notify(`Modelo fixado: ${lastActual}`);
       }else if(cmd==='feedback'){
         state.failedQualityChecks=rest[0]==='fail'?(state.failedQualityChecks??0)+1:0;notify(`Falhas de aceite registradas: ${state.failedQualityChecks}.`);
-      }else if(cmd==='handoff'){state.handoffReady=true;state.phase=undefined;state.taskGoal=undefined;notify('Estado de trabalho preparado; próxima solicitação pode mudar de modelo/família.');}
+      // A handoff ends the phase but not the work: keep the goal, new epoch.
+      }else if(cmd==='handoff'){state.handoffReady=true;state.phase=undefined;state.episode=advanceDecisionEpoch(state.episode);notify('Estado de trabalho preparado; próxima solicitação pode mudar de modelo/família.');}
       else if(cmd==='high-value'){state.highValue=!state.highValue;notify(`Uso de reserva para tarefa de alto valor: ${state.highValue?'ativo':'inativo'}.`);}
       else if(cmd==='usage'){notify(JSON.stringify({gateway:nineRouter.enabled,gatewayUsage:usageSummary(readGatewayUsage())},null,2));return;}
       else if(cmd==='refresh'){

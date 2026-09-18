@@ -187,12 +187,44 @@ describe('gatewayQuota', () => {
     expect(result.windows?.every(value => (value.remainingFraction ?? 1) > 0)).toBe(true);
   });
 
-  test('fully stale exhausted provider with exhausted accounts only -> depleted', () => {
+  test('fully stale pool: all accounts known exhausted -> depleted; one merely stale -> unknown', () => {
     const a = account('claude-x', 1, [window('session-5h', 0, 3 * HOUR)]);
-    const b = account('claude-y', 2, [window('session-5h', 2, 3 * HOUR)]);
-    const result = gatewayQuota('anthropic/claude-fable-5-1', cache(OBSERVED, { claude: { accounts: [a, b] } }), OBSERVED + 6 * 60_000);
+    const b = account('claude-y', 2, [window('session-5h', 0, 3 * HOUR)]);
+    const all = gatewayQuota('anthropic/claude-fable-5-1', cache(OBSERVED, { claude: { accounts: [a, b] } }), OBSERVED + 6 * 60_000);
+    expect(all.state).toBe('depleted');
+    expect(all.accounts).toBeUndefined(); // stale branch: no per-account summaries claimed
+    // Stale 2% remaining is not proof of exhaustion: b is unknown, so the pool is not known-depleted.
+    const c = account('claude-y', 2, [window('session-5h', 2, 3 * HOUR)]);
+    const partial = gatewayQuota('anthropic/claude-fable-5-1', cache(OBSERVED, { claude: { accounts: [a, c] } }), OBSERVED + 6 * 60_000);
+    expect(partial.state).toBe('unknown');
+  });
+
+  test('provider marked unavailable keeps unexpired exhaustion instead of erasing it', () => {
+    const a = account('cx-1', 1, [window('session', 0, 3 * HOUR)]);
+    const result = injection('openai-codex/gpt-6-astra', { codex: { unavailable: true, accounts: [a] } });
     expect(result.state).toBe('depleted');
-    expect(result.accounts).toBeUndefined(); // stale branch: no per-account summaries claimed
+    expect(result.windows?.[0]?.resetsAt).toBeGreaterThan(NOW);
+  });
+
+  test('two models of one subscription report the same shared window key', () => {
+    // Verified against live telemetry: Fable and Sonnet on one Claude account
+    // both resolve weekly-7d to one allowance, so spending one spends the
+    // other. A provider-level sibling count cannot see that.
+    const a = account('claude-p1', 1, [window('session-5h', 81, 12 * HOUR), window('weekly-7d', 60, 66 * HOUR)]);
+    const fable = injection('anthropic/claude-fable-5-1', { claude: { accounts: [a] } });
+    const sonnet = injection('anthropic/claude-sonnet-5', { claude: { accounts: [a] } });
+    const keyOf = (r: ReturnType<typeof injection>) => r.windows?.find(w => w.id === 'weekly-7d')?.sharedKey;
+    expect(keyOf(fable)).toBeDefined();
+    expect(keyOf(fable)).toBe(keyOf(sonnet));
+    expect(keyOf(fable)).toContain('hash-claude-p1');
+  });
+
+  test('the same window on a different account is a different allowance', () => {
+    const a = account('claude-p1', 1, [window('weekly-7d', 60, 66 * HOUR)]);
+    const b = account('claude-p2', 2, [window('weekly-7d', 60, 66 * HOUR)]);
+    const first = injection('anthropic/claude-sonnet-5', { claude: { accounts: [a] } });
+    const second = injection('anthropic/claude-sonnet-5', { claude: { accounts: [b] } });
+    expect(first.windows?.[0]?.sharedKey).not.toBe(second.windows?.[0]?.sharedKey);
   });
 });
 

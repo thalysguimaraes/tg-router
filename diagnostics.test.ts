@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test';
-import { errorDetails, installProviderDiagnostics, type DiagnosticEvent } from './diagnostics';
+import { errorDetails, unsupportedModel, installProviderDiagnostics, type DiagnosticEvent } from './diagnostics';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -38,6 +38,20 @@ test('successful HTTP status cannot leak into next transport failure; empty text
   expect(terminal).toContain('timeout');
   h.emit('agent_end');
   expect(h.diagnostics.label).toBe(terminal);
+});
+
+test('a gateway-wrapped "model is not supported" 503 is terminal, not a retryable outage', () => {
+  // Observed live: 9Router returns 503 whose body wraps the upstream 401
+  // {"type":"error","error":{"type":"ModelError","message":"Model union-alpha
+  // is not supported"}}. Classified as provider-unavailable it burned all ten
+  // retries against a permanent condition.
+  const body = '503 {"error":{"message":"[opencode-go/union-alpha] [401]: {\\"type\\":\\"error\\",\\"error\\":{\\"type\\":\\"ModelError\\",\\"message\\":\\"Model union-alpha is not supported\\"}} (reset after 2m)"}} retry-after-ms=120000';
+  expect(unsupportedModel(body)).toBe(true);
+  expect(errorDetails(body).reason).toBe('model-unsupported');
+  expect(errorDetails(body).status).toBe(503);
+  // A genuine 503 keeps its retryable classification.
+  expect(errorDetails('503 upstream temporarily unavailable').reason).toBe('provider-unavailable');
+  expect(unsupportedModel('the model is supported but overloaded')).toBe(false);
 });
 
 test('native retry and fallback replace failure status, success clears it, exhausted retry preserves failure', () => {

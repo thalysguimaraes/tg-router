@@ -18,8 +18,13 @@ import type { TaskAssessment } from './assessment-cache';
 import { isObjectGuard } from './type-guards';
 
 export const TYPESAFE_ENDPOINT = 'https://api.typesafe.ai/v1/systemone';
-/** Alias, not a pinned version: the response reports the versioned id that answered. */
-export const JEVS_CLASSIFIER_MODEL = 'jev-latest';
+/**
+ * Pinned version, not the rolling alias. docs.typesafe.ai/models recommends
+ * pinning once thresholds are tuned: the alias can change answer distributions
+ * without this code changing, which would silently inherit stale calibrated
+ * gates. A new alias is evaluated in shadow before it becomes this default.
+ */
+export const JEVS_CLASSIFIER_MODEL = 'jev-1.13.0';
 /** docs.typesafe.ai/models: USD per million input tokens; output tokens are free. */
 export const JEV_INPUT_USD_PER_MTOK = 0.042;
 /**
@@ -39,9 +44,19 @@ export interface JevClientOptions {
   endpoint?: string;
   /** Hard wall-clock deadline from dispatch, enforced by a real transport abort. */
   deadlineMs: number;
-  /** Conservative upper-bound USD estimate is admitted before dispatch; refusal spends nothing. */
-  admit: (estimatedUsd: number) => { ok: true } | { ok: false; reason: string };
+  /**
+   * Conservative upper-bound USD estimate is admitted before dispatch; refusal
+   * spends nothing. The returned handle owns the reservation's lifecycle:
+   * `dispatched()` is called right before the HTTP call and `settle(usd)` with
+   * the cost derived from reported usage. A dispatched request without a
+   * usable usage report keeps its liability; nothing here ever releases it.
+   */
+  admit: (estimatedUsd: number) => { ok: true; dispatched?: () => void; settle?: (actualUsd: number) => void } | { ok: false; reason: string };
   now?: () => number;
+  /** Pinned classifier version override; defaults to JEVS_CLASSIFIER_MODEL. */
+  model?: string;
+  /** Caller cancellation (turn ended); propagated to the HTTP request alongside the deadline. */
+  signal?: AbortSignal;
   /** Injectable for tests; production derives the bound from the serialized state. */
   estimateInputTokens?: (state: RoutingContext) => number;
   /** USD per million input tokens from a verified rate card; absent => classifier disabled. */
@@ -155,6 +170,7 @@ export function createJevClient(options: JevClientOptions) {
   const inputTokens = options.estimateInputTokens ?? defaultEstimateInputTokens;
   const endpoint = options.endpoint ?? TYPESAFE_ENDPOINT;
   const fetchImpl = options.fetchImpl ?? fetch;
+  const classifierModel = options.model ?? JEVS_CLASSIFIER_MODEL;
   return {
     async assess(state: RoutingContext, inputHmac: string): Promise<JevResult> {
       const startedAt = now();
@@ -171,6 +187,7 @@ export function createJevClient(options: JevClientOptions) {
       if (!admission.ok) return { ok: false, reason: 'budget', detail: admission.reason, elapsedMs: elapsed() };
 
       let response: Response;
+      admission.dispatched?.();
       try {
         response = await fetchImpl(endpoint, {
           method: 'POST',
@@ -178,19 +195,25 @@ export function createJevClient(options: JevClientOptions) {
             authorization: `Bearer ${apiKey}`,
             'content-type': 'application/json',
           },
-          body: JSON.stringify({ model: JEVS_CLASSIFIER_MODEL, state, questions: JEV_QUESTIONS }),
+          body: JSON.stringify({ model: classifierModel, state, questions: JEV_QUESTIONS }),
           // One attempt, one real abort. Retries would need their own reservation.
-          signal: AbortSignal.timeout(options.deadlineMs),
+          signal: options.signal ? AbortSignal.any([options.signal, AbortSignal.timeout(options.deadlineMs)]) : AbortSignal.timeout(options.deadlineMs),
         });
       } catch (error) {
         const name = error instanceof Error ? error.name : 'Unknown';
-        // A TimeoutError is our own deadline. An AbortError well inside the
-        // deadline is someone else cancelling us — in practice omp ending the
-        // turn — and reporting that as a timeout sent us chasing a deadline
-        // that was never exceeded. Keep them distinct.
         const spent = elapsed();
-        const timedOut = name === 'TimeoutError' || (name === 'AbortError' && spent >= options.deadlineMs * 0.9);
-        return { ok: false, reason: timedOut ? 'timeout' : 'cancelled', detail: `${name} after ${spent}ms of ${options.deadlineMs}ms`, elapsedMs: spent };
+        // Three distinct failures that were previously conflated:
+        //  - TimeoutError: our own deadline.
+        //  - AbortError: someone cancelled us (in practice omp ending the turn);
+        //    reporting it as a timeout sent us chasing a deadline never exceeded.
+        //  - anything else (fetch throws TypeError on DNS/connection failure):
+        //    a transport failure, not a cancellation.
+        // Either way the request may have reached the server, so the
+        // reservation stays held.
+        const reason = name === 'TimeoutError' || (name === 'AbortError' && spent >= options.deadlineMs * 0.9) ? 'timeout' as const
+          : name === 'AbortError' ? 'cancelled' as const
+          : 'transport' as const;
+        return { ok: false, reason, detail: `${name} after ${spent}ms of ${options.deadlineMs}ms`, elapsedMs: spent };
       }
 
       if (!response.ok) {
@@ -207,6 +230,12 @@ export function createJevClient(options: JevClientOptions) {
       let body: unknown;
       try { body = await response.json(); }
       catch { return { ok: false, reason: 'invalid-schema', detail: 'response was not json', elapsedMs: elapsed() }; }
+      // Billing validation is independent of answer validation: a response
+      // with unusable answers is still billable when it reports valid usage.
+      const usage = isRecord(body) && isRecord(body.usage) ? body.usage : undefined;
+      const reportedInputTokens = typeof usage?.input_tokens === 'number' && Number.isInteger(usage.input_tokens) && usage.input_tokens >= 0
+        ? usage.input_tokens : undefined;
+      if (reportedInputTokens !== undefined) admission.settle?.((reportedInputTokens / 1_000_000) * options.inputUsdPerMillion);
       if (!isRecord(body) || !isRecord(body.answers)) {
         return { ok: false, reason: 'invalid-schema', detail: 'missing answers map', elapsedMs: elapsed() };
       }
@@ -222,9 +251,6 @@ export function createJevClient(options: JevClientOptions) {
           || underspecified === undefined || !reasoningDepth || !jobFamily) {
         return { ok: false, reason: 'invalid-schema', detail: 'one or more answers failed validation', elapsedMs: elapsed() };
       }
-      const usage = isRecord(body.usage) ? body.usage : undefined;
-      const reportedInputTokens = typeof usage?.input_tokens === 'number' && Number.isFinite(usage.input_tokens)
-        ? usage.input_tokens : undefined;
       return {
         ok: true,
         elapsedMs: elapsed(),

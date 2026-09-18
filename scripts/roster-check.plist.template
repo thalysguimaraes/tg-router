@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  launchd job that runs the roster check every 48 hours.
+
+  Replace __BUN__, __REPO__ and __LOGS__, then install:
+
+    sed -e "s#__BUN__#$(command -v bun)#" \
+        -e "s#__REPO__#$PWD#" \
+        -e "s#__LOGS__#$HOME/.omp/agent/personal-router#" \
+        scripts/roster-check.plist.template \
+        > ~/Library/LaunchAgents/tg-router.roster-check.plist
+    launchctl load ~/Library/LaunchAgents/tg-router.roster-check.plist
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>tg-router.roster-check</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__BUN__</string>
+        <string>run</string>
+        <string>__REPO__/scripts/roster-check.ts</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>__REPO__</string>
+    <key>StartInterval</key>
+    <integer>172800</integer>
+    <key>RunAtLoad</key>
+    <false/>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>LowPriorityIO</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>__LOGS__/roster-check.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>__LOGS__/roster-check.err.log</string>
+</dict>
+</plist>

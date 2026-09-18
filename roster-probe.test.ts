@@ -12,8 +12,10 @@ describe('roster probe', () => {
     const result = await probeModel({
       ...base,
       fetchImpl: (async (_url: string, init: RequestInit) => {
-        const body = JSON.parse(String(init.body)) as { tools?: unknown[]; messages: Array<{ content: string }> };
+        const body = JSON.parse(String(init.body)) as { tools?: unknown[]; messages: Array<{ role: string; content: string }> };
         const prompt = body.messages[0]!.content;
+        // The second tool turn carries the synthetic result; a grounded answer must cite it.
+        if (body.messages.some(m => m.role === 'tool')) return ok(message('It is 17.4C and clear in Lisbon.'));
         if (body.tools) return ok(toolCall('get_weather', '{"city":"Lisbon"}'));
         if (/READY/.test(prompt)) return ok(message('READY'));
         if (/bat and ball/.test(prompt)) return ok(message('0.05'));
@@ -23,6 +25,28 @@ describe('roster probe', () => {
     expect(result.checks.every(c => c.pass)).toBe(true);
     expect(result.routable).toBe(true);
     expect(result.suggests.goValidated).toBe(true);
+    expect(result.qualification.toolRoundTrip).toBe(true);
+    expect(result.qualification.validatedContextTokens).toBe(32_000);
+    expect(result.qualification.fixtureVersion).toBe('probe-2');
+  });
+
+  test('a model that emits a tool call but ignores the tool result fails tool support', async () => {
+    // Emitting a call proves the request shape only. Every turn after the
+    // first depends on the model consuming the RESULT.
+    const result = await probeModel({
+      ...base,
+      fetchImpl: (async (_url: string, init: RequestInit) => {
+        const body = JSON.parse(String(init.body)) as { tools?: unknown[]; messages: Array<{ role: string; content: string }> };
+        if (body.messages.some(m => m.role === 'tool')) return ok(message('I am unable to check the weather right now.'));
+        if (body.tools) return ok(toolCall('get_weather', '{"city":"Lisbon"}'));
+        return ok(message('READY'));
+      }) as unknown as typeof fetch,
+    });
+    const tools = result.checks.find(c => c.check === 'tools')!;
+    expect(tools.pass).toBe(false);
+    expect(tools.detail).toContain('tool result not used');
+    expect(result.suggests.goValidated).toBe(false);
+    expect(result.qualification.toolRoundTrip).toBe(false);
   });
 
   test('an unsupported model id aborts the probe instead of hammering the account', async () => {
@@ -97,8 +121,9 @@ describe('effort hint is informational, never a routing gate', () => {
     const result = await probeModel({
       baseUrl: 'https://gw.test/v1', apiKey: 'k', wireModel: 'ocg/glm-5.3-flash',
       fetchImpl: (async (_u: string, init: RequestInit) => {
-        const body = JSON.parse(String(init.body)) as { tools?: unknown[]; reasoning_effort?: string; messages: Array<{ content: string }> };
+        const body = JSON.parse(String(init.body)) as { tools?: unknown[]; reasoning_effort?: string; messages: Array<{ role: string; content: string }> };
         if (body.reasoning_effort) return new Response('{"error":{"message":"invalid request body: json: unknown field \\"thinking\\""}}', { status: 400 });
+        if (body.messages.some(m => m.role === 'tool')) return ok2('It is 17.4C in Lisbon.');
         if (body.tools) return new Response(JSON.stringify({ choices: [{ index: 0, finish_reason: 'tool_calls', message: { role: 'assistant', content: '', tool_calls: [{ type: 'function', function: { name: 'get_weather', arguments: '{"city":"Lisbon"}' } }] } }] }), { status: 200 });
         const prompt = body.messages[0]!.content;
         if (/READY/.test(prompt)) return ok2('READY');
