@@ -20,8 +20,9 @@ import { buildRoutingContext, assessmentCacheKey, JEV_SCHEMA_VERSION, JEV_QUESTI
 import { AssessmentCache, cacheKeyFor } from './assessment-cache';
 import { createJevClient, JEVS_CLASSIFIER_MODEL, JEV_INPUT_USD_PER_MTOK } from './jev-client';
 import { resolveClassification, type RouteTier, type SemanticAssessment, type SemanticMode } from './policy';
+import { showRoster } from './roster-ui';
 
-const VERSION='1.2.0';
+const VERSION='1.3.0';
 const REFS=['openai-codex/gpt-6-astra','openai-codex/gpt-5.6-sol','openai-codex/gpt-5.6-luna','anthropic/claude-fable-5-1','anthropic/claude-sonnet-5','anthropic/claude-opus-5','opencode-go/deepseek-v4.1-flash','opencode-go/glm-5.3-flash'];
 const BACKUPS=['openrouter/openai/gpt-5.6-sol','openrouter/anthropic/claude-opus-5','openrouter/openai/gpt-6-astra'];
 const STEER_INTERVAL_MS=600_000;
@@ -418,7 +419,7 @@ export default function personalRouter(pi:any) {
     nineRouter.dispose();guard.dispose();releaseUndispatched();ledger?.close();ledger=undefined;});
 
   pi.registerCommand('route',{
-    description:'Routing: status | auto | off | pin provider/model | key [status|clear] | why | feedback fail/success | handoff | high-value',
+    description:'Routing: status | auto | off | pin provider/model | roster | key [status|clear] | why | feedback fail/success | handoff | high-value',
     handler:async(args:string,ctx:any)=>{
       ctxCurrent=ctx;
       const normalized=args.trim();
@@ -442,6 +443,37 @@ export default function personalRouter(pi:any) {
         usageRefreshAt=0;
         try{gatewayUsage=await refreshNineRouterUsage(root,{timeoutMs:15000,force:true});log('ninerouter-usage-refreshed',usageSummary(gatewayUsage));notify(JSON.stringify(usageSummary(gatewayUsage),null,2));}
         catch(error:any){log('ninerouter-usage-refresh-error',{errorType:error?.name??'Error'});notify('Telemetria 9Router indisponível.','warning');}
+        return;
+      }
+      else if(cmd==='roster'){
+        // Review catalog findings and vet candidates by actually running them.
+        // Only models the gateway serves are probeable; models.dev lists more
+        // than the transport can reach, and probing an unsupported id makes the
+        // upstream 401 the whole account for a cooldown.
+        const servable=new Set<string>();
+        const wireById=new Map<string,string>();
+        if(nineRouter.enabled){
+          for(const m of nineRouter.models){
+            const wire=`${m.provider}/${m.id}`;
+            const bare=String(m.id).split('/').pop()!;
+            servable.add(bare);
+            if(!wireById.has(bare))wireById.set(bare,String(m.id));
+          }
+        }
+        let gatewayCreds:{baseUrl:string;apiKey:string}|undefined;
+        try{
+          const key=readFileSync(join(root,'9router-key'),'utf8').trim();
+          const baseUrl=settings().gateway?.baseUrl;
+          if(key&&typeof baseUrl==='string')gatewayCreds={baseUrl,apiKey:key};
+        }catch{}
+        await showRoster({
+          ui:{select:(t,o)=>ctx.ui.select(t,o),confirm:(t,m)=>ctx.ui.confirm(t,m),notify:(m,l)=>notify(m,l??'info')},
+          root,
+          gateway:gatewayCreds,
+          servable,
+          wireRefFor:(id)=>wireById.get(id),
+          log,
+        });
         return;
       }
       else if(cmd==='key'){

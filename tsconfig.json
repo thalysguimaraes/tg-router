@@ -32,7 +32,10 @@
     "accounts.test.ts",
     "fanout.test.ts",
     "roster-monitor.ts",
-    "roster-monitor.test.ts"
+    "roster-monitor.test.ts",
+    "roster-probe.ts",
+    "roster-ui.ts",
+    "roster-probe.test.ts"
   ],
   "exclude": [
     "ninerouter.ts",

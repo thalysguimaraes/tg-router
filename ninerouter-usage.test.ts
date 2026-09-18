@@ -1,6 +1,11 @@
 import { describe, expect, test } from 'bun:test';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import type { NineRouterAccountUsage, NineRouterQuotaWindow, NineRouterProviderUsage, NineRouterUsageCache } from './ninerouter-usage';
-import { gatewayQuota } from './ninerouter-usage';
+import { gatewayQuota, refreshNineRouterUsage } from './ninerouter-usage';
+
+type FetchLike = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
 
 const HOUR = 3600_000;
 const DAY = 24 * HOUR;
@@ -188,5 +193,71 @@ describe('gatewayQuota', () => {
     const result = gatewayQuota('anthropic/claude-fable-5-1', cache(OBSERVED, { claude: { accounts: [a, b] } }), OBSERVED + 6 * 60_000);
     expect(result.state).toBe('depleted');
     expect(result.accounts).toBeUndefined(); // stale branch: no per-account summaries claimed
+  });
+});
+
+describe('refreshNineRouterUsage secret timeout isolation', () => {
+  /**
+   * A keychain hit returns in ~16ms, but a miss falls through to `op read`,
+   * which costs 2.7-4.4s. While the secret read shared the HTTP timeout, the
+   * background refresh (2500ms) aborted during its own credential fetch and
+   * cached errors.auth, leaving gateway telemetry permanently unavailable.
+   *
+   * The reader below models a pending `op read` without any wall-clock delay:
+   * it resolves only when the test releases it, or rejects when its signal
+   * aborts, exactly as readSecretFromProcess does when it kills the child.
+   */
+  function gatedSecretRead() {
+    let release = () => {};
+    const read = (_reference: string, signal?: AbortSignal) => new Promise<string>((resolve, reject) => {
+      release = () => resolve('gateway-password');
+      if (signal?.aborted) { reject(new Error('unavailable')); return; }
+      signal?.addEventListener('abort', () => reject(new Error('unavailable')), { once: true });
+    });
+    return { read, release: () => release() };
+  }
+
+  const respond: FetchLike = async (url) => {
+    const target = String(url);
+    if (target.endsWith('/api/auth/login')) return new Response(null, { status: 200, headers: { 'set-cookie': 'session=abc; Path=/' } });
+    if (target.includes('/api/usage/stats')) {
+      return Response.json({ totalRequests: 7, totalPromptTokens: 2, totalCompletionTokens: 3, totalCachedTokens: 4, totalCost: 5 });
+    }
+    if (target.endsWith('/api/providers')) return Response.json([]);
+    return Response.json({});
+  };
+
+  test('secret read outliving the HTTP budget still produces a healthy snapshot', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'nr-usage-'));
+    const secret = gatedSecretRead();
+    try {
+      // timeoutMs is 100ms here: if the secret read were still charged to the
+      // HTTP budget (the old behaviour) its signal would abort before release
+      // and this snapshot would carry errors.auth instead of totals.
+      const pending = refreshNineRouterUsage(root, { timeoutMs: 100, force: true, fetch: respond, opRead: secret.read });
+      // A real AbortSignal.timeout(100) is already armed, so this genuinely has
+      // to outlast it; deterministic clock control cannot drive an abort that
+      // the production code creates internally.
+      await Bun.sleep(250);
+      secret.release();
+      const cache = await pending;
+      expect(cache.errors).toBeUndefined();
+      expect(cache.total?.requests).toBe(7);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('secretTimeoutMs is the budget that aborts a hung secret read', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'nr-usage-'));
+    const secret = gatedSecretRead();
+    try {
+      // Never released: only the secret budget can end this read.
+      const cache = await refreshNineRouterUsage(root, { timeoutMs: 2_500, secretTimeoutMs: 100, force: true, fetch: respond, opRead: secret.read });
+      expect(cache.errors?.auth).toBe('unavailable');
+      expect(cache.total?.requests).toBeUndefined();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });

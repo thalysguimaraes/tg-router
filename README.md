@@ -70,6 +70,7 @@ child, an explicit handoff, or a provider failure. Never mid tool-loop.
 | `/route feedback fail\|success` | record a quality outcome; two failures escalate the tier |
 | `/route handoff` | mark work state safe to leave the current model/family |
 | `/route high-value` | allow spending soft reserves; disables headroom swaps |
+| `/route roster` | review catalog findings, probe candidates, vet them |
 | `/route usage` / `refresh` / `reconcile` | 9Router telemetry and paid-ledger reconciliation |
 
 ## Install
@@ -86,7 +87,7 @@ state (ledger, quota cache, decision log, session corpus) lives in
 ## Verify
 
 ```sh
-bun test            # 75 tests; policy, quota, ledger, classifier contract, load safety
+bun test            # 84 tests; policy, quota, ledger, classifier contract, load safety
 bun run typecheck   # strict, owned modules
 ```
 
@@ -102,6 +103,8 @@ bun run typecheck   # strict, owned modules
 | `assessment-cache.ts` | TTL + single-flight cache of assessments |
 | `budget.ts` | atomic cash ledger with purpose sub-caps |
 | `roster-monitor.ts` | catalog comparison; emits proposals, never edits |
+| `roster-probe.ts` | capability probe; five real calls, stops before harming a provider |
+| `roster-ui.ts` | `/route roster` review screen: findings, probe, vet |
 | `ninerouter-usage.ts` | 9Router telemetry, per-account windows, exhaustion tombstones |
 | `accounts.ts` | account priority steering |
 | `quota.ts` / `meridian.ts` | native and Meridian quota adapters |
@@ -131,6 +134,38 @@ OpenRouter's pricing API, not scraped HTML) and prints proposals:
 bun run roster-check          # new findings since last run
 bun run roster-check --all    # everything current
 ```
+
+### Vetting a candidate
+
+Reading a catalog row does not tell you whether a model survives a tool loop,
+so `/route roster` inside omp turns a finding into evidence. It lists findings,
+probes a candidate on demand with five real gateway calls, prints per-check
+results, and only then offers to write the `goValidated` entry that makes a Go
+model routable for tool work.
+
+| Check | Gate it earns |
+|---|---|
+| `instruction` | follows an exact-output instruction |
+| `tools` | emits a well-formed tool call — `validated.tools` |
+| `reasoning` | solves a trick arithmetic prompt — `validated.reasoning` |
+| `longContext` | finds a needle at ~42k tokens; proves declared context is usable |
+| `effortHint` | informational: whether the upstream accepts `reasoning_effort` |
+
+Two rules the probe learned the hard way, both now regression-tested:
+
+- **It stops on the first account-level error.** Probing a model the gateway
+  does not serve makes the upstream reject the whole account, and 9Router then
+  401s every model on it for a cooldown. Candidates are filtered to what the
+  9Router catalog actually serves, and any auth or rejected-body response ends
+  the run instead of degrading a live provider.
+- **It never measures its own request shape.** `reasoning_effort` is sent only
+  in the informational check, because a Go upstream 400s on it; and every check
+  allows 512 completion tokens, because reasoning models emit
+  `reasoning_content` first and a tight budget truncates the real answer to
+  empty. A truncated response reports `inconclusive`, not a failure.
+
+Catalog presence is never qualification. Tier qualification stays a reviewed
+decision in `policy.ts`; the probe only unlocks the transport-level gate.
 
 `scripts/com.thalys.tg-router.roster-check.plist` runs it every 48h via
 launchd; findings and price history live in `~/.omp/agent/personal-router/`.

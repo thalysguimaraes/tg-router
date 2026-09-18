@@ -97,11 +97,17 @@ function lookups(ref: string): { modelsDev?: { provider: string; id: string }; o
   if (provider === 'anthropic') return { modelsDev: { provider: 'anthropic', id }, openrouter: `anthropic/${id.replace(/-(\d)-(\d)$/, '-$1.$2')}` };
   return {};
 }
-
 export function analyzeRoster(input: {
   roster: readonly string[];
   modelsDev: CatalogModel[];
   openrouter: CatalogModel[];
+  /**
+   * Model ids the transport can actually reach, from the 9Router catalog.
+   * A model present in a vendor catalog but absent here is unroutable: probing
+   * it made the gateway return 401 for the whole account with a cooldown, so
+   * candidates MUST be filtered by this when it is supplied.
+   */
+  servable?: ReadonlySet<string>;
   /** Last known paid prices, to detect repricing. Absent => first run, no reprice findings. */
   previousPrices?: Record<string, number>;
   now?: number;
@@ -138,6 +144,9 @@ export function analyzeRoster(input: {
   const rosterIds = new Set(input.roster.map(ref => ref.split('/', 2)[1]));
   for (const m of input.modelsDev) {
     if (!PROVIDERS_WE_SUBSCRIBE.has(m.provider) || rosterIds.has(m.id)) continue;
+    // Unroutable models are not candidates. models.dev lists everything the
+    // vendor publishes; the gateway serves a subset.
+    if (input.servable && !input.servable.has(m.id)) continue;
     if ((m.context ?? 0) < CANDIDATE_MIN_CONTEXT) continue;
     const free = m.inputPerMtok === 0 && m.outputPerMtok === 0;
     const ageDays = m.releaseDate ? (now - Date.parse(m.releaseDate)) / 86_400_000 : Number.POSITIVE_INFINITY;
