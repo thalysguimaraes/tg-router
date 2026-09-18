@@ -436,3 +436,80 @@ describe('downgrade guards calibrated against observed jev-1.13 output', () => {
     expect(result.source).toBe('rules');
   });
 });
+
+describe('semantic downgrades stay disabled (calibration 2026-09-18)', () => {
+  // Calibration against 160 real turns showed Jev does not separate
+  // cheap-sufficient from premium-warranted work: 41% of premium-warranted
+  // turns were judged `bounded`. The user surface must therefore never reach
+  // `calibrated`, and `assisted` must never lower a tier.
+  test('the classifier mode offered to the user cannot lower a tier', async () => {
+    const { resolveClassification } = await import('./policy');
+    // A very confident cheap verdict, exactly the shape that fooled the gates.
+    const assessment = {
+      usable: true,
+      tier: { selected: 'bounded', probabilities: { bounded: 0.94, execution: 0.02, complex: 0.02, premium: 0.02 }, confidence: 0.94 },
+      phase: { selected: 'implementation' },
+      highImpactProbability: 0.03,
+      underspecifiedProbability: 0.05,
+      truncated: false,
+    } as const;
+    const result = resolveClassification({
+      assessment: assessment as never,
+      rulesClassification: { tier: 'complex', phase: 'investigation' },
+      mode: 'assisted',
+    });
+    expect(result.tier).toBe('complex');
+    expect(result.source).not.toBe('semantic-downgrade');
+  });
+
+  test('assisted mode still raises a floor and clarifies a phase', async () => {
+    const { resolveClassification } = await import('./policy');
+    const raised = resolveClassification({
+      assessment: {
+        usable: true,
+        tier: { selected: 'premium', probabilities: { premium: 0.93, complex: 0.07 }, confidence: 0.91 },
+        phase: { selected: 'review' },
+      } as never,
+      rulesClassification: { tier: 'bounded', phase: 'implementation' },
+      mode: 'assisted',
+    });
+    expect(raised.tier).toBe('premium');
+    expect(raised.source).toBe('semantic-assisted');
+  });
+});
+
+describe('rounded probability distributions are accepted', () => {
+  // Observed live 2026-09-18: jev-1.13 rounds to two decimals, so a complete
+  // 6-option distribution summed to exactly 0.99. A flat 0.01 tolerance
+  // rejected it at the boundary and discarded a usable assessment.
+  const answers = (capabilityProbabilities: Record<string, number>) => ({
+    phase: { type: 'choice', choice: 'implementation', confidence: 0.76, probabilities: { lightweight: 0.02, implementation: 0.7, review: 0.03, investigation: 0.1, planning: 0.1, unknown: 0.05 } },
+    capability: { type: 'choice', choice: 'execution', confidence: 0.77, probabilities: capabilityProbabilities },
+    bounded: { type: 'noul', noul: 0.77 },
+    highImpact: { type: 'noul', noul: 0.17 },
+    underspecified: { type: 'noul', noul: 0.65 },
+    reasoningDepth: { type: 'score', score: 2.51, confidence: 0.58, probabilities: { '0': 0.03, '1': 0.12, '2': 0.3, '3': 0.42, '4': 0.13 } },
+    jobFamily: { type: 'choice', choice: 'implementation', confidence: 0.99, probabilities: { clerical: 0.0, implementation: 0.99, review: 0.0, architecture: 0.0, investigation: 0.01, visual: 0.0, other: 0.0 } },
+  });
+  const run = async (capabilityProbabilities: Record<string, number>) => {
+    const { createJevClient } = await import('./jev-client');
+    const client = createJevClient({
+      deadlineMs: 500, apiKey: 'k', inputUsdPerMillion: 0.042, admit: () => ({ ok: true }),
+      fetchImpl: (async () => Response.json({ model: 'jev-1.13.0', answers: answers(capabilityProbabilities), usage: { input_tokens: 1302 } })) as unknown as typeof fetch,
+    });
+    const state = buildRoutingContext({ taskGoal: 'g', currentUserRequest: 'yep', boundary: 'user', hasImages: false, toolsRequired: true, confirmedQualityFailures: 0 });
+    return client.assess(state, 'hmac');
+  };
+
+  test('a 6-option distribution summing to 0.99 is usable', async () => {
+    const result = await run({ mechanical: 0.02, bounded: 0.18, execution: 0.6, complex: 0.15, premium: 0.03, unknown: 0.01 });
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.assessment.tier.selected).toBe('execution');
+  });
+
+  test('a distribution that is genuinely not a distribution is still rejected', async () => {
+    const result = await run({ mechanical: 0.02, bounded: 0.18, execution: 0.6, complex: 0.15, premium: 0.03, unknown: 0.5 });
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toBe('invalid-schema');
+  });
+});

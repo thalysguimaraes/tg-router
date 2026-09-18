@@ -55,13 +55,20 @@ export default function personalRouter(pi:any) {
    * The user sees two states: auto and pin. Inside auto, Jev assists whenever a
    * key is present; otherwise rules run alone and the status line says so.
    * `assisted` is the only mode the user ever gets: it can clarify phase and
-   * raise the floor, never lower it. `shadow` and `calibrated` are rollout /
-   * research modes reachable only via `semanticRouter.mode` in settings.json;
-   * they are not commands and are not shown as options.
+   * raise the floor, never lower it.
+   *
+   * `shadow` is a research mode. `calibrated` enables semantic DOWNGRADES,
+   * which calibration on 2026-09-18 showed are not supported by evidence (see
+   * SEMANTIC_GATES in policy.ts), so it additionally requires
+   * `semanticRouter.acknowledgeUncalibratedDowngrades: true`. Without that
+   * flag the mode is ignored and we stay on `assisted`; a stray config value
+   * must not quietly start under-routing.
    */
   const semanticSettings=()=> {
-    const override=settings().semanticRouter?.mode;
-    const developerMode=(['off','shadow','calibrated'] as const).includes(override)?override as SemanticMode:undefined;
+    const cfg=settings().semanticRouter;
+    const override=cfg?.mode;
+    let developerMode=(['off','shadow','calibrated'] as const).includes(override)?override as SemanticMode:undefined;
+    if(developerMode==='calibrated'&&cfg?.acknowledgeUncalibratedDowngrades!==true)developerMode=undefined;
     return { mode:developerMode??('assisted' as SemanticMode), overridden:developerMode!==undefined };
   };
   // The TypeSafe key lives in omp's own credential store, the same place every
@@ -203,7 +210,7 @@ export default function personalRouter(pi:any) {
   }
   pi.on('session_start',(_e:any,ctx:any)=>init(ctx));
   pi.on('session_switch',(_e:any,ctx:any)=>init(ctx));
-  pi.on('session_compact',()=>{state.phase=undefined;state.handoffReady=true;save();});
+  pi.on('session_compact',()=>{state.phase=undefined;state.taskGoal=undefined;state.handoffReady=true;save();});
 
   pi.on('before_agent_start',async(event:any,ctx:any)=>{
     ctxCurrent=ctx; blocked=false;
@@ -276,6 +283,13 @@ export default function personalRouter(pi:any) {
       semanticMode=state.disabled||state.pin?'off':keyPresent?semantic.mode:'off';
       let semanticAssessment:SemanticAssessment|undefined;
       let semanticTrace:any;
+      // A short follow-up ("yep", "you seem stuck") carries no task of its own.
+      // Sending it as the goal made Jev answer `unknown` with high confidence —
+      // correctly, since nothing in the state said what the work was. Keep the
+      // first substantive prompt of the phase as the goal so later turns are
+      // assessed against it. Cleared by /route handoff and session_compact.
+      const substantive=String(event.prompt??'').trim().split(/\s+/).filter(Boolean).length>=8;
+      if(!state.taskGoal&&substantive)state.taskGoal=String(event.prompt).slice(0,2000);
       if(semanticMode!=='off'&&!state.pin){
         const routingContext=buildRoutingContext({
           taskGoal:state.taskGoal?String(state.taskGoal):String(event.prompt??'').slice(0,2000),
@@ -424,7 +438,7 @@ export default function personalRouter(pi:any) {
       ctxCurrent=ctx;
       const normalized=args.trim();
       const [cmd,...rest]=(normalized?normalized:'status').split(/\s+/);
-      if(cmd==='auto'){state.pin=undefined;state.tier=undefined;state.phase=undefined;state.disabled=false;state.providerFailed=false;const assisted=!!(await typesafeKey());notify(assisted?'Auto: regras + Jev.':'Auto: só regras. /route key liga o Jev.');}
+      if(cmd==='auto'){state.pin=undefined;state.tier=undefined;state.phase=undefined;state.taskGoal=undefined;state.disabled=false;state.providerFailed=false;const assisted=!!(await typesafeKey());notify(assisted?'Auto: regras + Jev.':'Auto: só regras. /route key liga o Jev.');}
       else if(cmd==='off'){state.disabled=true;notify('Routing manual nesta sessão. /route auto reativa.');}
       else if(cmd==='pin'){
         const resolved=ctx.models.resolve(rest[0]??'');
@@ -435,7 +449,7 @@ export default function personalRouter(pi:any) {
         state.pin={model:ref(target),effort:pi.getThinkingLevel()};state.disabled=false;lastActual=ref(target);notify(`Modelo fixado: ${lastActual}`);
       }else if(cmd==='feedback'){
         state.failedQualityChecks=rest[0]==='fail'?(state.failedQualityChecks??0)+1:0;notify(`Falhas de aceite registradas: ${state.failedQualityChecks}.`);
-      }else if(cmd==='handoff'){state.handoffReady=true;state.phase=undefined;notify('Estado de trabalho preparado; próxima solicitação pode mudar de modelo/família.');}
+      }else if(cmd==='handoff'){state.handoffReady=true;state.phase=undefined;state.taskGoal=undefined;notify('Estado de trabalho preparado; próxima solicitação pode mudar de modelo/família.');}
       else if(cmd==='high-value'){state.highValue=!state.highValue;notify(`Uso de reserva para tarefa de alto valor: ${state.highValue?'ativo':'inativo'}.`);}
       else if(cmd==='usage'){notify(JSON.stringify({gateway:nineRouter.enabled,gatewayUsage:usageSummary(readGatewayUsage())},null,2));return;}
       else if(cmd==='refresh'){

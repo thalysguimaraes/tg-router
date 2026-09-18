@@ -87,7 +87,7 @@ state (ledger, quota cache, decision log, session corpus) lives in
 ## Verify
 
 ```sh
-bun test            # 84 tests; policy, quota, ledger, classifier contract, load safety
+bun test            # 90 tests; policy, quota, ledger, classifier contract, load safety
 bun run typecheck   # strict, owned modules
 ```
 
@@ -171,9 +171,36 @@ decision in `policy.ts`; the probe only unlocks the transport-level gate.
 launchd; findings and price history live in `~/.omp/agent/personal-router/`.
 It never edits policy. Catalog presence is not qualification.
 
+## Calibration result: no semantic downgrades
+
+`bun run calibrate` scores two labelled classes from `session-corpus.jsonl`
+against the live model: turns where a cheap worker was demonstrably enough, and
+turns on a premium model where the deterministic rules independently agreed.
+
+Run on 2026-09-18 over 160 turns, **Jev does not separate them**. 41% of
+premium-warranted turns were judged `bounded`; 63% of cheap-sufficient turns
+were judged `execution` or higher. No confidence or probability-mass threshold
+admits meaningful cheap work — fully open it still admitted 5 of 80.
+
+The cause is visible in the prompts and is not a model defect: real turns are
+conversational continuations whose difficulty lives in the accumulated session,
+not the sentence ("align the text of the right block to the right"). Jev reads
+the text correctly; the text understates the work.
+
+So downgrades stay off. `calibrated` mode is unreachable from the user surface
+and, even in settings, requires
+`semanticRouter.acknowledgeUncalibratedDowngrades: true`. Jev's demonstrated
+value is phase clarification and resolving short follow-ups against a
+persistent task goal — both of which only raise or clarify.
+
+The 69%-of-turns-are-`complex` problem is the deterministic classifier's, and
+is fixable there with the same corpus.
+
 ## Not yet
 
 - Money is not yet a window in the allocator: paid routes are a lower cost
   class, but their remaining daily cap does not contribute headroom.
-- Jev's tier is used as a floor raise only. Using its full distribution to
-  pick within a class is unexplored.
+- Jev's tier is used as a floor raise only.
+- The rules classifier sends 69% of turns to `complex` through its no-keyword
+  uncertainty default. This is the main source of over-routing and the next
+  thing to fix, using the 2,839-turn corpus as evidence.

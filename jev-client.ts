@@ -54,7 +54,7 @@ export type JevResult =
   | { ok: true; assessment: TaskAssessment; elapsedMs: number }
   | {
       ok: false;
-      reason: 'no-key' | 'no-rate-card' | 'budget' | 'timeout' | 'transport'
+      reason: 'no-key' | 'no-rate-card' | 'budget' | 'timeout' | 'cancelled' | 'transport'
         | 'rate-limited' | 'overloaded' | 'auth' | 'invalid-request' | 'invalid-schema';
       detail?: string;
       elapsedMs: number;
@@ -67,6 +67,19 @@ const TIERS = ['mechanical', 'bounded', 'execution', 'complex', 'premium', 'unkn
 const FAMILIES = ['clerical', 'implementation', 'review', 'architecture', 'investigation', 'visual', 'other'] as const;
 
 const isRecord = isObjectGuard;
+
+/**
+ * Jev rounds probabilities to two decimals, so a complete distribution
+ * legitimately sums to anything in [0.94, 1.06] for a 6-option question
+ * (observed live: capability summed to exactly 0.99, which a 0.01 tolerance
+ * rejected at the boundary and silently discarded a good assessment).
+ * Tolerance scales with the option count: half a rounding step each, plus
+ * float slack.
+ */
+function distributionSums(values: number[]): boolean {
+  const sum = values.reduce((total, value) => total + value, 0);
+  return Math.abs(sum - 1) <= 0.005 * values.length + 1e-9;
+}
 
 function finiteProbability(value: unknown): value is number {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 1;
@@ -92,9 +105,8 @@ function validateChoice(
   }
   const selected = answer.choice;
   const distribution: Record<string, number> = {};
-  let sum = 0;
-  allowed.forEach((key, index) => { distribution[key] = values[index]!; sum += values[index]!; });
-  if (Math.abs(sum - 1) > 0.01) return undefined;
+  allowed.forEach((key, index) => { distribution[key] = values[index]!; });
+  if (!distributionSums(values)) return undefined;
   // The selected option must actually be the argmax; otherwise the answer is incoherent.
   if (values.some(value => value > distribution[selected]! + 1e-6)) return undefined;
   const confidence = finiteProbability(answer.confidence) ? answer.confidence : undefined;
@@ -121,9 +133,8 @@ function validateScore(answer: unknown, maxLevel: number): { score: number; prob
     values.push(value);
   }
   const distribution: Record<string, number> = {};
-  let sum = 0;
-  levels.forEach((key, index) => { distribution[key] = values[index]!; sum += values[index]!; });
-  if (Math.abs(sum - 1) > 0.01) return undefined;
+  levels.forEach((key, index) => { distribution[key] = values[index]!; });
+  if (!distributionSums(values)) return undefined;
   const mean = levels.reduce((total, key) => total + Number(key) * distribution[key]!, 0);
   // Docs define score as the probability-weighted mean; a mismatch means a shape we do not understand.
   if (Math.abs(mean - answer.score) > 0.05) return undefined;
@@ -173,8 +184,13 @@ export function createJevClient(options: JevClientOptions) {
         });
       } catch (error) {
         const name = error instanceof Error ? error.name : 'Unknown';
-        const timedOut = name === 'TimeoutError' || name === 'AbortError';
-        return { ok: false, reason: timedOut ? 'timeout' : 'transport', detail: name, elapsedMs: elapsed() };
+        // A TimeoutError is our own deadline. An AbortError well inside the
+        // deadline is someone else cancelling us — in practice omp ending the
+        // turn — and reporting that as a timeout sent us chasing a deadline
+        // that was never exceeded. Keep them distinct.
+        const spent = elapsed();
+        const timedOut = name === 'TimeoutError' || (name === 'AbortError' && spent >= options.deadlineMs * 0.9);
+        return { ok: false, reason: timedOut ? 'timeout' : 'cancelled', detail: `${name} after ${spent}ms of ${options.deadlineMs}ms`, elapsedMs: spent };
       }
 
       if (!response.ok) {

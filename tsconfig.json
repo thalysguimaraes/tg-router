@@ -35,7 +35,8 @@
     "roster-monitor.test.ts",
     "roster-probe.ts",
     "roster-ui.ts",
-    "roster-probe.test.ts"
+    "roster-probe.test.ts",
+    "scripts/calibrate.ts"
   ],
   "exclude": [
     "ninerouter.ts",

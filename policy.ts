@@ -131,18 +131,35 @@ export interface SemanticAssessment {
 export type SemanticMode = "off" | "shadow" | "assisted" | "calibrated";
 
 /**
- * Starting gates (SPEC §9.2). Calibration may tighten them, never loosen past
- * these floors without recorded evidence.
+ * Gates for semantic tier changes.
  *
- * UNCALIBRATED, and `downgradeMaxHigherTierMass` is currently binding: measured
- * against api.typesafe.ai on 2026-09-17, a clearly mechanical task
- * ("rename the local variable tmp to buffer in parseHeader()") returned
- * mechanical at confidence 0.93 while still leaving ~0.07 probability mass on
- * adjacent higher tiers. That exceeds the 0.01 ceiling, so `calibrated` mode
- * downgrades approximately never in practice. This fails safe (it can only
- * over-route, never under-route) and is deliberately left unchanged: picking
- * the real ceiling requires the labeled holdout in SPEC §17.2, not a single
- * observation. `assisted` mode is unaffected and works today.
+ * CALIBRATED 2026-09-18 against 160 real turns from session-corpus.jsonl,
+ * scored live by jev-1.13 (`bun run calibrate`, raw scores in
+ * personal-router/calibration.json). The result was negative and is recorded
+ * here so it is not re-litigated:
+ *
+ *   Two labelled classes were compared — turns where a cheap worker model was
+ *   demonstrably sufficient, and turns on a premium model where the
+ *   deterministic rules independently agreed premium was warranted. Jev does
+ *   not separate them. 41% of premium-warranted turns were judged `bounded`,
+ *   while 63% of cheap-sufficient turns were judged `execution` or higher.
+ *   Both classes concentrate in the same cell (`rules=complex jev=bounded`
+ *   held 13 cheap and 33 premium turns). No threshold on confidence or
+ *   higher-tier mass admits meaningful cheap work: fully open
+ *   (mass <= 1.0, confidence >= 0.5) still admitted only 5 of 80.
+ *
+ *   The cause is visible in the prompts, and it is not a model defect. Real
+ *   turns are conversational continuations whose difficulty lives in the
+ *   accumulated session, not the sentence ("o board 4 não precisa de pills",
+ *   "align the text of the right block to the right"). Jev reads the text
+ *   literally and correctly, and the text understates the work.
+ *
+ * Consequently `calibrated` mode stays unreachable from the user surface and
+ * semantic DOWNGRADES are not enabled. Jev's demonstrated value is phase
+ * clarification and resolving short follow-ups against a persistent task
+ * goal, both of which only ever raise or clarify. The over-routing problem
+ * (69% of turns classify `complex` via the no-keyword default) belongs to the
+ * deterministic classifier and is fixable there with the same corpus.
  */
 export const SEMANTIC_GATES = {
   overrideTopProbability: 0.80,
