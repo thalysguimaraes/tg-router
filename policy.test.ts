@@ -138,3 +138,44 @@ test("unknown subagent roles yield no floor", () => {
   expect(childFloorFor("default")).toBeUndefined();
   expect(childFloorFor(undefined)).toBeUndefined();
 });
+
+// Evidence-based classification rules derived from the outcome-labelled
+// session corpus (scripts/relabel.ts). Replay invariant on the corpus:
+// 0/144 turns where a cheap model struggled are pushed down by these rules.
+const classifyOnly = (prompt: string) => decideRoute({
+  prompt, now: NOW, contextTokens: 5_000, boundary: "user",
+  models: [model("astra", snapshot(0.8, 100)), workerModel],
+});
+
+test("session and repository operations are bounded worker tasks, not complex", () => {
+  for (const prompt of [
+    "nice. now deploy it to vercel",
+    "good to go. reconcile git and close the worktree",
+    "faça o merge (PRs aprovados)",
+    "ok, you can commit this part",
+    "is git reconciled? we're closing the session",
+  ]) {
+    const d = classifyOnly(prompt);
+    expect(d.tier).toBe("bounded");
+    expect(d.model).toBe(workerModel.ref);
+  }
+});
+
+test("a delegation brief that merely mentions a worktree is not a session op", () => {
+  // These carried 53 tool calls and errored on a cheap model in the corpus.
+  const d = classifyOnly("Você é a lane E do Marcha v1.1 (LANE=E). Leia, nesta ordem, /tmp/marcha-v11/COMMON.md e siga-os integralmente. Trabalhe só nesta worktree/branch.");
+  expect(d.tier).not.toBe("bounded");
+});
+
+test("a pasted stack trace with no other signal routes to complex investigation", () => {
+  // 14% of cheap-struggled turns carried pasted code vs 1% of cheap-clean.
+  const d = classifyOnly("## Error Message\n    at Button (components/ui/button.tsx:48:5)\n    at BotSettings (components/bot-settings.tsx:166:11)\n> 48 |     <ButtonPrimitive");
+  expect(d.tier).toBe("complex");
+  expect(d.phase).toBe("investigation");
+});
+
+test("a risky session op still keeps its risk floor", () => {
+  // `deploy` is a session op, but `production` is a risk keyword and wins.
+  const d = classifyOnly("deploy this to production now");
+  expect(d.tier).toBe("complex");
+});

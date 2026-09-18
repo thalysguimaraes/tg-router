@@ -346,7 +346,27 @@ function classify(input: RouteInput): Classification {
   const review = /\b(review|revis\w*|rever|auditar|audit)\b/.test(text);
   const coding = /\b(implement\w*|implemente|corrig\w*|corrija|fix|refator\w*|refactor\w*|codig\w*|code|test\w*|patch|bug|adicione|add|edite|edit|alter\w*|change|atualiz\w*|update)\b/.test(text);
   const mechanical = /\b(resum\w*|summari[sz]\w*|format\w*|reformat\w*|renome\w*|rename|list|liste|listar|listing|extra\w*|extract|localiz\w*|find file|which file|onde fica|traduz\w*|translate|changelog|typo|ortograf\w*)\b/.test(text);
-  const explicitTask = planning || investigation || risky || difficult || visualJudgment || review || coding || mechanical;
+  // Session and repository operations: deploy, commit, push, reconcile, close
+  // the worktree, move the issue. Measured over 2,839 real turns
+  // (scripts/relabel.ts, outcome labels): of the no-keyword prompts that fell
+  // to the `complex` default, these carried the highest share of turns a
+  // cheap model finished cleanly (20% vs a 13% base rate) and a BELOW-base
+  // share of turns where a cheap model struggled (5% vs 8%). They need tool
+  // discipline, not reasoning depth; a worker handles them at least as well.
+  //
+  // Verbs only. Nouns like "worktree" or "branch" also appear as constraints
+  // inside large delegation briefs ("work only in this worktree/branch"),
+  // which the replay showed being pushed down; those are the opposite of a
+  // small op and are excluded explicitly below.
+  const delegationBrief = /\b(voce e a lane|you are the .{0,40}(?:owner|lane|worker)|leia, nesta ordem|read, in this order|siga-os integralmente|follow (?:them|it) (?:integrally|in full))\b/.test(text);
+  const sessionOps = !delegationBrief && /\b(deploy\w*|commit\w*|push|pull|merge|rebase|stash|reconcil\w*|clos(?:e|ing) (?:the )?(?:session|worktree)|finish(?:ing)? (?:the )?session|clean(?:up)? (?:the )?worktree|move (?:the )?issue|check linear|git status|is git|reload|restart|reinicia\w*|sobe|suba|smoke)\b/.test(text);
+  // A pasted stack trace or code block with no other signal is a debugging
+  // request. Measured: 14% of the turns where a cheap model STRUGGLED carried
+  // pasted code, against 1% of the turns it finished cleanly. This is the
+  // strongest under-routing signal in the corpus and must not fall to a
+  // worker. Uses the raw prompt: normalization strips nothing relevant here.
+  const pastedCode = /```|\n\s+at [\w.$<>]+ \(|Error(?:Type|Message)?:|Traceback \(most recent call last\)|^\s*(?:\d+ \|)/m.test(input.prompt);
+  const explicitTask = planning || investigation || risky || difficult || visualJudgment || review || coding || mechanical || sessionOps || pastedCode;
   const shortFollowup = !explicitTask && text.split(/\s+/).filter(Boolean).length <= 10;
   if (prior && (continuing || shortFollowup)) return { ...prior, uncertain: false, continuation: true };
 
@@ -365,7 +385,15 @@ function classify(input: RouteInput): Classification {
     // Ordinary implementation is an approved bounded worker task. A task
     // does not need a child-only acceptance contract to use GLM/DeepSeek.
     result = { tier: "bounded", phase: "implementation", uncertain: false, continuation: false };
+  } else if (sessionOps) {
+    result = { tier: "bounded", phase: "implementation", uncertain: false, continuation: false };
+  } else if (pastedCode) {
+    result = { tier: "complex", phase: "investigation", uncertain: false, continuation: false };
   } else {
+    // No signal at all. Previously this always reset to complex/investigation,
+    // which put 69% of real turns in the premium class. With an established
+    // phase the prior is the better guess; without one, complex remains the
+    // safe floor because we know nothing. Semantic assistance can still raise.
     result = { tier: prior?.tier ?? "complex", phase: prior?.phase ?? "investigation", uncertain: true, continuation: false };
   }
   // A child floor is inherited from the parent's assignment, not chosen by a
