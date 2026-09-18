@@ -1,0 +1,21714 @@
+// @bun
+// work/omp-personal-router/ninerouter.ts
+import { lstatSync, readFileSync, statSync } from "fs";
+import { join } from "path";
+import { errorDetails } from './diagnostics';
+
+// work/omp-personal-router/node_modules/@oh-my-pi/pi-catalog/src/effort.ts
+var THINKING_EFFORTS = [
+  "minimal" /* Minimal */,
+  "low" /* Low */,
+  "medium" /* Medium */,
+  "high" /* High */,
+  "xhigh" /* XHigh */,
+  "max" /* Max */
+];
+
+// work/omp-personal-router/node_modules/@oh-my-pi/pi-catalog/src/hosts.ts
+var KNOWN_HOSTS = {
+  openai: { providers: ["openai"], urlMarkers: ["api.openai.com"] },
+  azureOpenAI: {
+    providers: ["azure"],
+    urlMarkers: [".openai.azure.com", "azure.com/openai", "models.inference.ai.azure.com"]
+  },
+  openrouter: { providers: ["openrouter"], urlMarkers: ["openrouter.ai"] },
+  vercelAIGateway: { providers: ["vercel-ai-gateway"], urlMarkers: ["ai-gateway.vercel.sh"] },
+  githubCopilot: { providers: ["github-copilot"], urlMarkers: ["githubcopilot.com", "copilot-api."] },
+  anthropic: { providers: ["anthropic"], urlMarkers: ["api.anthropic.com"] },
+  deepseekDirect: { providers: ["deepseek"], urlMarkers: ["api.deepseek.com"] },
+  deepseekFamily: { providers: ["deepseek"], urlMarkers: ["deepseek.com"] },
+  cerebras: { providers: ["cerebras"], urlMarkers: ["cerebras.ai"] },
+  zai: { providers: ["zai"], urlMarkers: ["api.z.ai"] },
+  zhipu: { providers: ["zhipu-coding-plan"], urlMarkers: ["open.bigmodel.cn"] },
+  kilo: { providers: ["kilo"], urlMarkers: ["api.kilo.ai"] },
+  alibabaDashscope: {
+    providers: ["alibaba-coding-plan", "alibaba-token-plan"],
+    urlMarkers: ["dashscope", "token-plan."]
+  },
+  umans: { providers: ["umans"], urlMarkers: ["api.code.umans.ai"] },
+  xiaomi: { providers: ["xiaomi"], providerPrefixes: ["xiaomi-token-plan-"], urlMarkers: ["xiaomimimo.com"] },
+  xai: { providers: ["xai", "xai-oauth"], urlMarkers: ["api.x.ai"] },
+  mistral: { providers: ["mistral"], urlMarkers: ["mistral.ai"] },
+  together: { providers: ["together"], urlMarkers: ["api.together.xyz"] },
+  baseten: { providers: ["baseten"], urlMarkers: ["baseten.co"] },
+  fireworks: { urlMarkers: ["fireworks.ai"] },
+  groq: { providers: ["groq"], urlMarkers: ["api.groq.com"] },
+  minimax: {
+    providers: ["minimax", "minimax-code", "minimax-code-cn"],
+    urlMarkers: ["api.minimax.io", "api.minimaxi.com"]
+  },
+  qwenPortal: { providers: ["qwen-portal"], urlMarkers: ["portal.qwen.ai"] },
+  nvidia: { providers: ["nvidia"], urlMarkers: ["integrate.api.nvidia.com"] },
+  venice: { providers: ["venice"], urlMarkers: ["api.venice.ai"] },
+  moonshotNative: { providers: ["moonshot", "kimi-code"], urlMarkers: ["api.moonshot.ai", "api.kimi.com"] },
+  googleAistudio: { providers: [], urlMarkers: ["generativelanguage.googleapis.com"] },
+  opencode: { providers: ["opencode-go", "opencode-zen"], urlMarkers: ["opencode.ai"] },
+  zenmux: { providers: ["zenmux"], urlMarkers: ["zenmux.ai"] },
+  chutes: { urlMarkers: ["chutes.ai"] }
+};
+var MAX_URL_HOST_MATCHES = 512;
+var urlHostMatches = new Map;
+function getUrlHostMatches(baseUrl) {
+  let matches = urlHostMatches.get(baseUrl);
+  if (matches !== undefined)
+    return matches;
+  if (urlHostMatches.size === MAX_URL_HOST_MATCHES)
+    urlHostMatches.clear();
+  matches = new Map;
+  urlHostMatches.set(baseUrl, matches);
+  return matches;
+}
+function hostMatchesUrl(baseUrl, host) {
+  if (!baseUrl)
+    return false;
+  const matches = getUrlHostMatches(baseUrl);
+  const cached = matches.get(host);
+  if (cached !== undefined)
+    return cached;
+  const spec = KNOWN_HOSTS[host];
+  for (const marker of spec.urlMarkers) {
+    if (includesAsciiCaseInsensitive(baseUrl, marker)) {
+      matches.set(host, true);
+      return true;
+    }
+  }
+  matches.set(host, false);
+  return false;
+}
+function modelMatchesHost(model, host) {
+  const spec = KNOWN_HOSTS[host];
+  if (spec.providers) {
+    for (const provider of spec.providers) {
+      if (model.provider === provider)
+        return true;
+    }
+  }
+  if (spec.providerPrefixes) {
+    for (const prefix of spec.providerPrefixes) {
+      if (model.provider.startsWith(prefix))
+        return true;
+    }
+  }
+  return hostMatchesUrl(model.baseUrl, host);
+}
+function includesAsciiCaseInsensitive(value, lowerNeedle) {
+  const needleLength = lowerNeedle.length;
+  const end = value.length - needleLength;
+  for (let start = 0;start <= end; start++) {
+    let offset = 0;
+    for (;offset < needleLength; offset++) {
+      if ((value.charCodeAt(start + offset) | 32) !== lowerNeedle.charCodeAt(offset))
+        break;
+    }
+    if (offset === needleLength)
+      return true;
+  }
+  return false;
+}
+
+// work/omp-personal-router/node_modules/@oh-my-pi/pi-catalog/src/compat/anthropic.ts
+var OFFICIAL_ANTHROPIC_URL = "https://api.anthropic.com";
+function isOfficialAnthropicApiUrl(baseUrl) {
+  if (!baseUrl)
+    return true;
+  const lower = baseUrl.toLowerCase();
+  return lower === OFFICIAL_ANTHROPIC_URL || lower.startsWith(`${OFFICIAL_ANTHROPIC_URL}/`);
+}
+var CLOUDFLARE_ANTHROPIC_GATEWAY_URL_MARKER = /gateway\.ai\.cloudflare\.com\/.+\/anthropic(?:\/|$)/i;
+var VERTEX_ANTHROPIC_URL_MARKER = /aiplatform\.googleapis\.com\/.+\/publishers\/anthropic\//i;
+var BEDROCK_ANTHROPIC_URL_MARKER = /(?:^|\/\/|\.)bedrock-runtime\.[a-z0-9-]+\.amazonaws\.com/i;
+var AZURE_ANTHROPIC_URL_MARKER = /(?:^|\/\/|\.)[a-z0-9-]+\.(?:inference|services)\.ai\.azure\.com/i;
+function isAzureAnthropicRoute(baseUrl) {
+  return baseUrl !== undefined && AZURE_ANTHROPIC_URL_MARKER.test(baseUrl);
+}
+function isAnthropicSigningProxyUrl(baseUrl) {
+  return hostMatchesUrl(baseUrl, "githubCopilot") || hostMatchesUrl(baseUrl, "zenmux") || baseUrl !== undefined && (CLOUDFLARE_ANTHROPIC_GATEWAY_URL_MARKER.test(baseUrl) || VERTEX_ANTHROPIC_URL_MARKER.test(baseUrl) || BEDROCK_ANTHROPIC_URL_MARKER.test(baseUrl)) || isAzureAnthropicRoute(baseUrl);
+}
+
+// work/omp-personal-router/node_modules/@oh-my-pi/pi-catalog/src/compat/apply.ts
+function applyCompatOverrides(compat, overrides) {
+  if (!overrides)
+    return;
+  for (const key in overrides) {
+    const value = overrides[key];
+    if (value !== undefined && key in compat) {
+      compat[key] = value;
+    }
+  }
+}
+
+// work/omp-personal-router/node_modules/@oh-my-pi/pi-catalog/src/compat/axes.ts
+var OAI = ["openai", "openai-responses"];
+var EFFORTS = ["minimal", "low", "medium", "high", "xhigh", "max"];
+var EFFORT_TIERS = [...EFFORTS, "off"];
+var DELEGATION_BIASES = ["eager", "restrained", "gated"];
+var THINKING_MODES = [
+  "effort",
+  "budget",
+  "google-level",
+  "anthropic-adaptive",
+  "anthropic-budget-effort"
+];
+function wire(key, records, shape = "scalar", values) {
+  return { key, set: "wire", shape, records, values };
+}
+var AXES = {
+  "allows-synthetic-reasoning-content-for-tool-calls": wire("allowsSyntheticReasoningContentForToolCalls", OAI),
+  "always-send-max-tokens": wire("alwaysSendMaxTokens", OAI),
+  "cache-control-format": wire("cacheControlFormat", OAI, "scalar", ["anthropic"]),
+  "clamp-output-to-model-max": wire("clampOutputToModelMax", OAI),
+  "disable-reasoning-on-forced-tool-choice": wire("disableReasoningOnForcedToolChoice", OAI),
+  "disable-reasoning-on-tool-choice": wire("disableReasoningOnToolChoice", OAI),
+  "drop-thinking-when-reasoning-effort": wire("dropThinkingWhenReasoningEffort", ["openai"]),
+  "empty-length-finish-is-context-error": wire("emptyLengthFinishIsContextError", OAI),
+  "extra-body": { ...wire("extraBody", ["openai"], "object"), verbatimKeys: true },
+  "filter-reasoning-history": wire("filterReasoningHistory", OAI),
+  "include-encrypted-reasoning": wire("includeEncryptedReasoning", OAI),
+  "kimi-api-format": wire("kimiApiFormat", ["openai"], "scalar", ["openai", "anthropic"]),
+  "max-tokens-field": wire("maxTokensField", ["openai"], "scalar", ["max_completion_tokens", "max_tokens"]),
+  "native-kimi-k3-reasoning": wire("nativeKimiK3Reasoning", ["openai"]),
+  "omit-reasoning-effort": wire("omitReasoningEffort", OAI),
+  "prompt-cache-breakpoint-ttl": wire("promptCacheBreakpointTtl", OAI, "scalar", ["30m"]),
+  "prompt-cache-session-header": wire("promptCacheSessionHeader", OAI, "scalar", ["x-grok-conv-id"]),
+  "qwen-preserve-thinking": wire("qwenPreserveThinking", ["openai"]),
+  "reject-root-object-union": wire("rejectRootObjectUnion", OAI),
+  "retry-without-strict-on-grammar-error": wire("retryWithoutStrictOnGrammarError", OAI),
+  "reasoning-content-field": wire("reasoningContentField", OAI, "scalar", [
+    "reasoning_content",
+    "reasoning",
+    "reasoning_text"
+  ]),
+  "reasoning-deltas-may-be-cumulative": wire("reasoningDeltasMayBeCumulative", OAI),
+  "reasoning-disable-mode": wire("reasoningDisableMode", OAI, "scalar", [
+    "omit",
+    "lowest-effort",
+    "none-effort",
+    "openrouter-enabled-false",
+    "cline-enabled-false",
+    "venice-disable-thinking",
+    "zai-thinking-disabled",
+    "qwen-enable-thinking-false",
+    "qwen-template-false",
+    "chat-template-thinking-false"
+  ]),
+  "reasoning-effort-map": wire("reasoningEffortMap", OAI, "object"),
+  "replay-reasoning-content": wire("replayReasoningContent", ["openai"]),
+  "requires-assistant-after-tool-result": wire("requiresAssistantAfterToolResult", ["openai"]),
+  "requires-assistant-content-for-tool-calls": wire("requiresAssistantContentForToolCalls", OAI),
+  "requires-mistral-tool-ids": wire("requiresMistralToolIds", ["openai"]),
+  "requires-reasoning-content-for-all-assistant-turns": wire("requiresReasoningContentForAllAssistantTurns", OAI),
+  "requires-reasoning-content-for-tool-calls": wire("requiresReasoningContentForToolCalls", OAI),
+  "requires-thinking-as-text": wire("requiresThinkingAsText", ["openai"]),
+  "requires-tool-result-name": wire("requiresToolResultName", ["openai"]),
+  "strict-responses-pairing": wire("strictResponsesPairing", ["openai-responses"]),
+  "requires-reasoning-off-juice-instruction": wire("requiresReasoningOffJuiceInstruction", ["openai-responses"]),
+  "supports-all-turns-reasoning-context": wire("supportsAllTurnsReasoningContext", ["openai-responses"]),
+  "supports-configuration-update": wire("supportsConfigurationUpdate", ["openai-responses"]),
+  "strip-deepseek-special-tokens": wire("stripDeepseekSpecialTokens", OAI),
+  "stream-markup-healing-pattern": wire("streamMarkupHealingPattern", OAI, "scalar", [
+    "kimi",
+    "dsml",
+    "qwen",
+    "thinking",
+    "harmony"
+  ]),
+  "supports-developer-role": wire("supportsDeveloperRole", OAI),
+  "supports-image-detail-original": wire("supportsImageDetailOriginal", ["openai-responses"]),
+  "supports-long-prompt-cache-retention": wire("supportsLongPromptCacheRetention", [...OAI, "bedrock"]),
+  "supports-multiple-system-messages": wire("supportsMultipleSystemMessages", ["openai"]),
+  "supports-named-tool-choice": wire("supportsNamedToolChoice", OAI),
+  "supports-obfuscation-opt-out": wire("supportsObfuscationOptOut", ["openai-responses"]),
+  "harmony-leak-mitigation": wire("harmonyLeakMitigation", ["openai-responses"]),
+  "supports-penalty-and-stop-params": wire("supportsPenaltyAndStopParams", OAI),
+  "supports-prompt-cache-breakpoints": wire("supportsPromptCacheBreakpoints", OAI),
+  "supports-prompt-cache-key": wire("supportsPromptCacheKey", ["openai"]),
+  "supports-reasoning-effort": wire("supportsReasoningEffort", OAI),
+  "supports-reasoning-params": wire("supportsReasoningParams", OAI),
+  "supports-reasoning-summary": wire("supportsReasoningSummary", ["openai-responses"]),
+  "supports-store": wire("supportsStore", ["openai"]),
+  "supports-strict-mode": wire("supportsStrictMode", OAI),
+  "supports-tool-choice": wire("supportsToolChoice", OAI),
+  "supports-usage-in-streaming": wire("supportsUsageInStreaming", ["openai"]),
+  "template-reasoning-effort": wire("qwenTemplateReasoningEffort", ["openai"]),
+  "thinking-format": wire("thinkingFormat", OAI, "scalar", [
+    "openai",
+    "openrouter",
+    "zai",
+    "kimi",
+    "qwen",
+    "qwen-chat-template",
+    "chat-template"
+  ]),
+  "thinking-keep": wire("thinkingKeep", ["openai"]),
+  "tool-schema-flavor": wire("toolSchemaFlavor", OAI, "scalar", ["moonshot-mfjs", "grammar", "none"]),
+  "tool-strict-mode": wire("toolStrictMode", ["openai"], "scalar", ["all_strict", "none", "mixed"]),
+  "uses-openai-tool-call-id-limit": wire("usesOpenAIToolCallIdLimit", OAI),
+  "when-thinking": wire("whenThinking", ["openai"], "object"),
+  "wire-model-id-mode": wire("wireModelIdMode", OAI, "scalar", [
+    "raw",
+    "cline-pass",
+    "firepass",
+    "fireworks",
+    "openrouter"
+  ]),
+  "zai-reasoning-effort-dialect": wire("zaiReasoningEffortDialect", ["openai"]),
+  "allow-anthropic-header-overrides": wire("allowAnthropicHeaderOverrides", ["anthropic"]),
+  "disable-adaptive-thinking": wire("disableAdaptiveThinking", ["anthropic"]),
+  "disable-strict-tools": wire("disableStrictTools", ["anthropic"]),
+  "escape-builtin-tool-names": wire("escapeBuiltinToolNames", ["anthropic"]),
+  "first-party-provider": wire("firstPartyProvider", ["anthropic"]),
+  "inject-claude-code-instruction": wire("injectClaudeCodeInstruction", ["anthropic"]),
+  "official-endpoint": wire("officialEndpoint", ["anthropic", "openai-responses"]),
+  "replay-unsigned-thinking": wire("replayUnsignedThinking", ["anthropic"]),
+  "requires-thinking-enabled": wire("requiresThinkingEnabled", ["anthropic"]),
+  "requires-tool-result-id": wire("requiresToolResultId", ["anthropic"]),
+  "signing-endpoint": wire("signingEndpoint", ["anthropic"]),
+  "supports-context-management": wire("supportsContextManagement", ["anthropic"]),
+  "supports-output-effort": wire("supportsOutputEffort", ["anthropic"]),
+  "supports-eager-tool-input-streaming": wire("supportsEagerToolInputStreaming", ["anthropic"]),
+  "supports-long-cache-retention": wire("supportsLongCacheRetention", ["anthropic"]),
+  "supports-mid-conversation-system": wire("supportsMidConversationSystem", ["anthropic"]),
+  "supports-mid-conversation-tool-changes": wire("supportsMidConversationToolChanges", ["anthropic"]),
+  "supports-per-message-effort": wire("supportsPerMessageEffort", ["anthropic"]),
+  "supports-server-compaction": wire("supportsServerCompaction", ["anthropic"]),
+  "supports-thinking-binding-controls": wire("supportsThinkingBindingControls", ["anthropic"]),
+  "supports-turn-scoped-system": wire("supportsTurnScopedSystem", ["anthropic"]),
+  "prompt-cache-maximum-checkpoints": wire("promptCacheMaximumCheckpoints", ["bedrock"]),
+  "prompt-cache-minimum-tokens": wire("promptCacheMinimumTokens", ["bedrock"]),
+  "prompt-cache-mode": wire("promptCacheMode", ["bedrock"], "scalar", ["none", "automatic", "explicit"]),
+  "model-router": wire("modelRouter", ["devin"]),
+  "supports-parallel-tool-calls": wire("supportsParallelToolCalls", ["devin"]),
+  "trust-explicit-thinking-only": wire("trustExplicitThinkingOnly", ["devin"]),
+  "antigravity-claude-tool-mode": wire("antigravityClaudeToolMode", ["google"]),
+  "antigravity-usage-label": wire("antigravityUsageLabel", ["google"]),
+  "cca-legacy-parameters-schema": wire("ccaLegacyParametersSchema", ["google"]),
+  "claude-thinking-beta-header": wire("claudeThinkingBetaHeader", ["google"]),
+  "drop-unsigned-thinking": wire("dropUnsignedThinking", ["google"]),
+  "flash-stream-leak-workaround": wire("flashStreamLeakWorkaround", ["google"]),
+  "multimodal-function-response": wire("multimodalFunctionResponse", ["google"]),
+  "requires-skip-thought-signature": wire("requiresSkipThoughtSignature", ["google"]),
+  "requires-skip-thought-signature-on-first-function-call": wire("requiresSkipThoughtSignatureOnFirstFunctionCall", [
+    "google"
+  ]),
+  "supports-function-part-id": wire("supportsFunctionPartId", ["google"]),
+  "stream-first-event-timeout-ms": wire("streamFirstEventTimeoutMs", [...OAI, "google"]),
+  "stream-idle-timeout-ms": wire("streamIdleTimeoutMs", [...OAI, "anthropic", "bedrock", "google"]),
+  "strip-image-input": wire("stripImageInput", [...OAI, "anthropic", "google"]),
+  "supports-forced-tool-choice": wire("supportsForcedToolChoice", [...OAI, "anthropic"]),
+  "supports-sampling-params": wire("supportsSamplingParams", [...OAI, "anthropic"]),
+  "thinking-loop-guard": wire("thinkingLoopGuard", [...OAI, "anthropic", "google"], "scalar", [
+    "gemini",
+    "deepseek",
+    "xai"
+  ]),
+  "thinking-default-level": { key: "defaultLevel", set: "thinking", shape: "scalar", values: EFFORTS },
+  "thinking-effort-budgets": { key: "effortBudgets", set: "thinking", shape: "object" },
+  "thinking-effort-map": { key: "effortMap", set: "thinking", shape: "object" },
+  "thinking-efforts": { key: "efforts", set: "thinking", shape: "array", values: EFFORTS },
+  "thinking-mode": {
+    key: "mode",
+    set: "thinking",
+    shape: "scalar",
+    values: THINKING_MODES
+  },
+  "thinking-requires-effort": { key: "requiresEffort", set: "thinking", shape: "scalar" },
+  "thinking-prefix-binding": { key: "prefixBinding", set: "thinking", shape: "scalar" },
+  "thinking-suppress-when-off": { key: "suppressWhenOff", set: "thinking", shape: "scalar" },
+  "thinking-supports-display": { key: "supportsDisplay", set: "thinking", shape: "scalar" },
+  "thinking-upgrade-neutral": { key: "upgradeNeutral", set: "thinking", shape: "scalar" },
+  "apply-patch-tool-type": {
+    key: "applyPatchToolType",
+    set: "catalog",
+    shape: "scalar",
+    values: ["freeform", "function"]
+  },
+  "clamp-context-override": { key: "clampContextOverride", set: "catalog", shape: "scalar" },
+  "context-promotion-target": { key: "contextPromotionTarget", set: "catalog", shape: "scalar" },
+  "context-window-floor": { key: "contextWindowFloor", set: "catalog", shape: "scalar" },
+  "cost-patch": { key: "costPatch", set: "catalog", shape: "object" },
+  "delegation-bias": { key: "delegationBias", set: "catalog", shape: "scalar", values: DELEGATION_BIASES },
+  "edit-prompt-variant": { key: "editPromptVariant", set: "catalog", shape: "scalar", values: ["full", "compact"] },
+  "edit-revision": { key: "editRevision", set: "catalog", shape: "scalar" },
+  "input-modalities": { key: "inputModalities", set: "catalog", shape: "array", values: ["text", "image"] },
+  "limits-patch": { key: "limitsPatch", set: "catalog", shape: "object" },
+  "long-context-cost": { key: "longContext", set: "catalog", shape: "object" },
+  "long-usage-limit-fallback": { key: "longUsageLimitFallback", set: "catalog", shape: "scalar" },
+  "max-context-window": { key: "maxContextWindow", set: "catalog", shape: "scalar" },
+  "requires-cursor-tool-schema-projection": {
+    key: "requiresCursorToolSchemaProjection",
+    set: "catalog",
+    shape: "scalar"
+  },
+  "requires-tool-result-image-hoisting": {
+    key: "requiresToolResultImageHoisting",
+    set: "catalog",
+    shape: "scalar"
+  },
+  priority: { key: "priority", set: "catalog", shape: "scalar" },
+  "service-tier-cost": { key: "serviceTierCost", set: "catalog", shape: "object" },
+  "time-based-cost": { key: "timeBased", set: "catalog", shape: "object" }
+};
+var API_COMPAT_RECORDS = {
+  "openai-completions": ["openai"],
+  openrouter: ["openai", "openai-responses"],
+  "openai-responses": ["openai-responses"],
+  "azure-openai-responses": ["openai-responses"],
+  "openai-codex-responses": ["openai-responses"],
+  "anthropic-messages": ["anthropic"],
+  "bedrock-converse-stream": ["bedrock"],
+  "devin-agent": ["devin"],
+  "google-generative-ai": ["google"],
+  "google-vertex": ["google"],
+  "google-gemini-cli": ["google"]
+};
+
+// work/omp-personal-router/node_modules/@oh-my-pi/pi-catalog/src/compat/revision.ts
+function parseComponent(value) {
+  if (!value)
+    return;
+  let out = 0;
+  for (let i = 0;i < value.length; i++) {
+    const code = value.charCodeAt(i);
+    if (code < 48 || code > 57)
+      return;
+    out = out * 10 + (code - 48);
+    if (out > 255)
+      return;
+  }
+  return out;
+}
+function parseRevision(value) {
+  const out = [0, 0, 0];
+  let count = 0;
+  for (const part of value.split(/[.-]/)) {
+    if (count === 3)
+      return;
+    const component = parseComponent(part);
+    if (component === undefined)
+      return;
+    out[count] = component;
+    count++;
+  }
+  return count > 0 ? out : undefined;
+}
+function parseRevisionPrefix(value) {
+  const out = [0, 0, 0];
+  let count = 0;
+  let index = 0;
+  while (count < 3) {
+    const start = index;
+    while (index < value.length && value.charCodeAt(index) >= 48 && value.charCodeAt(index) <= 57) {
+      index++;
+    }
+    const trailing = index < value.length ? value.charCodeAt(index) : 0;
+    const isSizeToken = trailing >= 97 && trailing <= 122 || trailing >= 65 && trailing <= 90;
+    const component = isSizeToken ? undefined : parseComponent(value.slice(start, index));
+    if (component === undefined) {
+      return count > 0 ? out : undefined;
+    }
+    out[count] = component;
+    count++;
+    const separator = value[index];
+    if (separator === undefined)
+      break;
+    const next = value.charCodeAt(index + 1);
+    if (separator !== "." && separator !== "-" || !(next >= 48 && next <= 57))
+      break;
+    index++;
+  }
+  return out;
+}
+function compareRevision(a, b) {
+  return a[0] - b[0] || a[1] - b[1] || a[2] - b[2];
+}
+function formatRevision(revision) {
+  return `${revision[0]}.${revision[1]}.${revision[2]}`;
+}
+function revisionSatisfies(revision, terms) {
+  for (const term of terms) {
+    const cmp = compareRevision(revision, term.revision);
+    switch (term.op) {
+      case ">=":
+        if (cmp < 0)
+          return false;
+        break;
+      case ">":
+        if (cmp <= 0)
+          return false;
+        break;
+      case "<=":
+        if (cmp > 0)
+          return false;
+        break;
+      case "<":
+        if (cmp >= 0)
+          return false;
+        break;
+      case "=":
+        if (cmp !== 0)
+          return false;
+        break;
+    }
+  }
+  return true;
+}
+// work/omp-personal-router/node_modules/@oh-my-pi/pi-catalog/src/compat/rules.json
+var rules_default = {
+  version: 1,
+  files: [
+    "auth/_order.kdl",
+    "auth/abliteration.kdl",
+    "auth/aiand.kdl",
+    "auth/aimlapi.kdl",
+    "auth/alibaba-coding-plan.kdl",
+    "auth/alibaba-token-plan.kdl",
+    "auth/amazon-bedrock.kdl",
+    "auth/anthropic.kdl",
+    "auth/azure.kdl",
+    "auth/baseten.kdl",
+    "auth/bedrock-mantle.kdl",
+    "auth/cerebras.kdl",
+    "auth/charm-hyper.kdl",
+    "auth/cline-pass.kdl",
+    "auth/cloudflare-ai-gateway.kdl",
+    "auth/commandcode.kdl",
+    "auth/coreweave.kdl",
+    "auth/cursor.kdl",
+    "auth/deepinfra.kdl",
+    "auth/deepseek.kdl",
+    "auth/devin.kdl",
+    "auth/exa.kdl",
+    "auth/firepass.kdl",
+    "auth/fireworks.kdl",
+    "auth/github-copilot.kdl",
+    "auth/gitlab-duo-agent.kdl",
+    "auth/gitlab-duo.kdl",
+    "auth/gmi-cloud.kdl",
+    "auth/google-antigravity.kdl",
+    "auth/google-gemini-cli.kdl",
+    "auth/google-vertex.kdl",
+    "auth/google.kdl",
+    "auth/groq.kdl",
+    "auth/huggingface.kdl",
+    "auth/kagi.kdl",
+    "auth/kilo.kdl",
+    "auth/kimi-code.kdl",
+    "auth/litellm.kdl",
+    "auth/llama.cpp.kdl",
+    "auth/lm-studio.kdl",
+    "auth/meta.kdl",
+    "auth/minimax-code-cn.kdl",
+    "auth/minimax-code.kdl",
+    "auth/minimax.kdl",
+    "auth/mistral.kdl",
+    "auth/moonshot.kdl",
+    "auth/muse-code.kdl",
+    "auth/nanogpt.kdl",
+    "auth/novita.kdl",
+    "auth/nvidia.kdl",
+    "auth/ollama-cloud.kdl",
+    "auth/ollama.kdl",
+    "auth/openai-codex-device.kdl",
+    "auth/openai-codex.kdl",
+    "auth/openai.kdl",
+    "auth/opencode-go.kdl",
+    "auth/opencode-zen.kdl",
+    "auth/openrouter.kdl",
+    "auth/parallel.kdl",
+    "auth/perplexity.kdl",
+    "auth/qianfan.kdl",
+    "auth/qwen-portal.kdl",
+    "auth/sakana.kdl",
+    "auth/siliconflow-cn.kdl",
+    "auth/siliconflow.kdl",
+    "auth/synthetic.kdl",
+    "auth/tavily.kdl",
+    "auth/together.kdl",
+    "auth/umans.kdl",
+    "auth/venice.kdl",
+    "auth/vercel-ai-gateway.kdl",
+    "auth/vllm.kdl",
+    "auth/wafer-serverless.kdl",
+    "auth/xai-oauth.kdl",
+    "auth/xai.kdl",
+    "auth/xiaomi-token-plan-ams.kdl",
+    "auth/xiaomi-token-plan-cn.kdl",
+    "auth/xiaomi-token-plan-sgp.kdl",
+    "auth/xiaomi.kdl",
+    "auth/yolo-auto.kdl",
+    "auth/zai-coding-plan.kdl",
+    "auth/zai.kdl",
+    "auth/zenmux.kdl",
+    "auth/zhipu-coding-plan.kdl",
+    "classes/amazon.kdl",
+    "classes/anthropic.kdl",
+    "classes/baidu.kdl",
+    "classes/bytedance.kdl",
+    "classes/cohere.kdl",
+    "classes/deepseek.kdl",
+    "classes/gemini.kdl",
+    "classes/gemma.kdl",
+    "classes/glm.kdl",
+    "classes/gpt-oss.kdl",
+    "classes/kimi.kdl",
+    "classes/meta.kdl",
+    "classes/mimo.kdl",
+    "classes/minimax.kdl",
+    "classes/mistral.kdl",
+    "classes/openai.kdl",
+    "classes/qwen.kdl",
+    "classes/stepfun.kdl",
+    "classes/xai.kdl",
+    "providers/abliteration.kdl",
+    "providers/aiand.kdl",
+    "providers/aimlapi.kdl",
+    "providers/alibaba-coding-plan.kdl",
+    "providers/alibaba-token-plan.kdl",
+    "providers/amazon-bedrock.kdl",
+    "providers/anthropic.kdl",
+    "providers/azure.kdl",
+    "providers/baseten.kdl",
+    "providers/bedrock-mantle.kdl",
+    "providers/cerebras.kdl",
+    "providers/charm-hyper.kdl",
+    "providers/cline-pass.kdl",
+    "providers/cloudflare-ai-gateway.kdl",
+    "providers/commandcode.kdl",
+    "providers/coreweave.kdl",
+    "providers/cursor.kdl",
+    "providers/deepseek.kdl",
+    "providers/firepass.kdl",
+    "providers/fireworks.kdl",
+    "providers/github-copilot.kdl",
+    "providers/gitlab-duo.kdl",
+    "providers/gmi-cloud.kdl",
+    "providers/google-antigravity.kdl",
+    "providers/google-gemini-cli.kdl",
+    "providers/google-vertex.kdl",
+    "providers/google.kdl",
+    "providers/groq.kdl",
+    "providers/huggingface.kdl",
+    "providers/kilo.kdl",
+    "providers/kimi-code.kdl",
+    "providers/llama.cpp.kdl",
+    "providers/lm-studio.kdl",
+    "providers/meta.kdl",
+    "providers/minimax-code-cn.kdl",
+    "providers/minimax-code.kdl",
+    "providers/minimax.kdl",
+    "providers/mistral.kdl",
+    "providers/moonshot.kdl",
+    "providers/muse-code.kdl",
+    "providers/nanogpt.kdl",
+    "providers/novita.kdl",
+    "providers/nvidia.kdl",
+    "providers/ollama-cloud.kdl",
+    "providers/ollama.kdl",
+    "providers/openai-codex.kdl",
+    "providers/openai.kdl",
+    "providers/opencode-go.kdl",
+    "providers/opencode-zen.kdl",
+    "providers/openrouter.kdl",
+    "providers/qianfan.kdl",
+    "providers/sakana.kdl",
+    "providers/synthetic.kdl",
+    "providers/together.kdl",
+    "providers/umans.kdl",
+    "providers/venice.kdl",
+    "providers/vercel-ai-gateway.kdl",
+    "providers/vllm.kdl",
+    "providers/wafer-serverless.kdl",
+    "providers/xai-oauth.kdl",
+    "providers/xai.kdl",
+    "providers/xiaomi-token-plan-ams.kdl",
+    "providers/xiaomi-token-plan-cn.kdl",
+    "providers/xiaomi-token-plan-sgp.kdl",
+    "providers/xiaomi.kdl",
+    "providers/yolo-auto.kdl",
+    "providers/zai.kdl",
+    "providers/zenmux.kdl",
+    "providers/zhipu-coding-plan.kdl",
+    "runtime/behavior.kdl",
+    "taxonomy/_collapse.kdl",
+    "taxonomy/_discovery.kdl",
+    "taxonomy/ai21.kdl",
+    "taxonomy/amazon.kdl",
+    "taxonomy/anthropic.kdl",
+    "taxonomy/baidu.kdl",
+    "taxonomy/bytedance.kdl",
+    "taxonomy/cohere.kdl",
+    "taxonomy/deepseek.kdl",
+    "taxonomy/gemini.kdl",
+    "taxonomy/gemma.kdl",
+    "taxonomy/glm.kdl",
+    "taxonomy/gpt-oss.kdl",
+    "taxonomy/kimi.kdl",
+    "taxonomy/meta.kdl",
+    "taxonomy/mimo.kdl",
+    "taxonomy/minimax.kdl",
+    "taxonomy/mistral.kdl",
+    "taxonomy/openai.kdl",
+    "taxonomy/qwen.kdl",
+    "taxonomy/stepfun.kdl",
+    "taxonomy/unknown.kdl",
+    "taxonomy/xai.kdl"
+  ],
+  taxonomy: {
+    classes: [
+      {
+        id: "ai21",
+        matchers: [
+          {
+            kind: "bounded",
+            token: "jamba"
+          },
+          {
+            kind: "namespace",
+            token: "ai21"
+          }
+        ],
+        families: [
+          {
+            id: "jamba",
+            glob: "*jamba*",
+            priority: 0
+          }
+        ],
+        revisionPrefixes: [],
+        skipBare: [],
+        overrides: []
+      },
+      {
+        id: "amazon",
+        matchers: [
+          {
+            kind: "bounded",
+            token: "nova"
+          },
+          {
+            kind: "bounded",
+            token: "titan"
+          },
+          {
+            kind: "namespace",
+            token: "amazon",
+            bounded: true
+          }
+        ],
+        families: [
+          {
+            id: "nova",
+            glob: "*nova*",
+            priority: 0
+          },
+          {
+            id: "titan",
+            glob: "*titan*",
+            priority: 0
+          }
+        ],
+        revisionPrefixes: [],
+        skipBare: [],
+        overrides: []
+      },
+      {
+        id: "anthropic",
+        matchers: [
+          {
+            kind: "namespace",
+            token: "anthropic",
+            bounded: true
+          },
+          {
+            kind: "bounded",
+            token: "anthropic"
+          },
+          {
+            kind: "bounded",
+            token: "claude"
+          }
+        ],
+        families: [
+          {
+            id: "opus",
+            glob: "*opus*",
+            priority: 0
+          },
+          {
+            id: "sonnet",
+            glob: "*sonnet*",
+            priority: 0
+          },
+          {
+            id: "haiku",
+            glob: "*haiku*",
+            priority: 0
+          },
+          {
+            id: "fable",
+            glob: "*fable*",
+            priority: 0
+          },
+          {
+            id: "mythos",
+            glob: "*mythos*",
+            priority: 0
+          }
+        ],
+        revisionPrefixes: [
+          {
+            prefix: "claude-",
+            anywhere: true
+          }
+        ],
+        skipBare: [],
+        overrides: [
+          {
+            id: "nanogpt-gemma-claude-opus-distill-family",
+            model: "Gemma-4-31B-Claude-4.6-Opus-Reasoning-Distilled",
+            rationale: "The reviewed distillation lineage follows its Claude Opus teacher rather than the student architecture",
+            provenance: "fixtures/llm-oracle/catalog/models.normalized.json",
+            provider: "nanogpt",
+            logical: "Gemma-4-31B-Claude-4.6-Opus-Reasoning-Distilled",
+            class: "anthropic",
+            family: "opus"
+          },
+          {
+            id: "nanogpt-qwen-claude-opus-distill-family",
+            model: "Qwen3.5-27B-Claude-4.6-Opus-Reasoning-Distilled-Derestricted",
+            rationale: "The reviewed distillation lineage follows its Claude Opus teacher rather than the student architecture",
+            provenance: "fixtures/llm-oracle/catalog/models.normalized.json",
+            provider: "nanogpt",
+            logical: "Qwen3.5-27B-Claude-4.6-Opus-Reasoning-Distilled-Derestricted",
+            class: "anthropic",
+            family: "opus"
+          },
+          {
+            id: "nanogpt-qwen-claude-opus-distill-lite-family",
+            model: "Qwen3.5-27B-Claude-4.6-Opus-Reasoning-Distilled-Derestricted-Lite",
+            rationale: "The reviewed lite distillation lineage follows its Claude Opus teacher rather than the student architecture",
+            provenance: "fixtures/llm-oracle/catalog/models.normalized.json",
+            provider: "nanogpt",
+            logical: "Qwen3.5-27B-Claude-4.6-Opus-Reasoning-Distilled-Derestricted-Lite",
+            class: "anthropic",
+            family: "opus"
+          }
+        ]
+      },
+      {
+        id: "baidu",
+        matchers: [
+          {
+            kind: "bounded",
+            token: "ernie"
+          }
+        ],
+        families: [
+          {
+            id: "ernie",
+            glob: "*ernie*",
+            priority: 0
+          }
+        ],
+        revisionPrefixes: [],
+        skipBare: [],
+        overrides: []
+      },
+      {
+        id: "bytedance",
+        matchers: [
+          {
+            kind: "bounded",
+            token: "doubao"
+          }
+        ],
+        families: [
+          {
+            id: "doubao",
+            glob: "*doubao*",
+            priority: 0
+          }
+        ],
+        revisionPrefixes: [],
+        skipBare: [],
+        overrides: []
+      },
+      {
+        id: "cohere",
+        matchers: [
+          {
+            kind: "bounded",
+            token: "command"
+          },
+          {
+            kind: "namespace",
+            token: "cohere"
+          }
+        ],
+        families: [
+          {
+            id: "command",
+            glob: "*command*",
+            priority: 0
+          }
+        ],
+        revisionPrefixes: [],
+        skipBare: [],
+        overrides: []
+      },
+      {
+        id: "deepseek",
+        matchers: [
+          {
+            kind: "namespace",
+            token: "deepseek",
+            bounded: true
+          },
+          {
+            kind: "bounded",
+            token: "deepseek"
+          }
+        ],
+        families: [
+          {
+            id: "r1",
+            glob: "*deepseek-r1*",
+            priority: 0
+          },
+          {
+            id: "reasoner",
+            glob: "*deepseek-reasoner*",
+            priority: 0
+          },
+          {
+            id: "flash",
+            glob: "*deepseek*v4*flash*",
+            priority: 0
+          },
+          {
+            id: "pro",
+            glob: "*deepseek*v4*pro*",
+            priority: 0
+          },
+          {
+            id: "v4",
+            glob: "*deepseek-v4*",
+            priority: 0
+          },
+          {
+            id: "v3",
+            glob: "*deepseek-v3*",
+            priority: 0
+          }
+        ],
+        revisionPrefixes: [],
+        skipBare: [],
+        overrides: [
+          {
+            id: "vercel-deepseek-v3-2-thinking-product",
+            model: "deepseek-v3.2-thinking",
+            rationale: "Oracle exposes this independently priced product rather than an effort route",
+            provenance: "fixtures/llm-oracle/catalog/models.normalized.json",
+            provider: "vercel-ai-gateway",
+            logical: "deepseek/deepseek-v3.2-thinking",
+            class: "deepseek"
+          },
+          {
+            id: "opencode-zen-big-pickle-family",
+            model: "big-pickle",
+            rationale: "OpenCode Zen's big-pickle is a DeepSeek reasoning alias whose upstream 400s require exact reasoning_content replay",
+            provenance: "models.json census",
+            provider: "opencode-zen",
+            class: "deepseek"
+          },
+          {
+            id: "umans-deepseek-v4-flash-family",
+            model: "umans-deepseek-v4-flash-0731",
+            rationale: "The opaque Umans product identifier is backed by the reviewed DeepSeek V4 Flash family",
+            provenance: "fixtures/llm-oracle/catalog-policy/compat-profiles.json:compat-04",
+            provider: "umans",
+            logical: "umans-deepseek-v4-flash-0731",
+            class: "deepseek"
+          },
+          {
+            id: "umans-deepseek-v4-flash-lab-family",
+            model: "umans-deepseek-v4-flash-0731-lab",
+            rationale: "The opaque Umans lab product identifier is backed by the reviewed DeepSeek V4 Flash family",
+            provenance: "fixtures/llm-oracle/catalog-policy/compat-profiles.json:compat-04",
+            provider: "umans",
+            logical: "umans-deepseek-v4-flash-0731-lab",
+            class: "deepseek"
+          },
+          {
+            id: "venice-e2ee-deepseek-family",
+            model: "e2ee-deepseek-v4-flash",
+            rationale: "The opaque Venice E2EE deployment is backed by the reviewed DeepSeek family",
+            provenance: "fixtures/llm-oracle/catalog/models.normalized.json",
+            provider: "venice",
+            logical: "e2ee-deepseek-v4-flash",
+            class: "deepseek"
+          }
+        ]
+      },
+      {
+        id: "gemini",
+        matchers: [
+          {
+            kind: "bounded",
+            token: "gemini"
+          }
+        ],
+        families: [
+          {
+            id: "lite",
+            glob: "*flash-lite*",
+            priority: 10
+          },
+          {
+            id: "flash",
+            glob: "*flash*",
+            priority: 0
+          },
+          {
+            id: "pro",
+            glob: "*pro*",
+            priority: 0
+          }
+        ],
+        revisionPrefixes: [
+          {
+            prefix: "gemini-"
+          }
+        ],
+        skipBare: [],
+        overrides: []
+      },
+      {
+        id: "gemma",
+        matchers: [
+          {
+            kind: "bounded",
+            token: "gemma"
+          }
+        ],
+        families: [],
+        revisionPrefixes: [],
+        skipBare: [],
+        overrides: []
+      },
+      {
+        id: "glm",
+        matchers: [
+          {
+            kind: "bounded",
+            token: "glm"
+          },
+          {
+            kind: "bounded",
+            token: "zai-glm"
+          }
+        ],
+        families: [
+          {
+            id: "flash",
+            glob: "*flash*",
+            priority: 0
+          },
+          {
+            id: "air",
+            glob: "*air*",
+            priority: 0
+          },
+          {
+            id: "turbo",
+            glob: "*turbo*",
+            priority: 0
+          },
+          {
+            id: "vision",
+            glob: "*glm-5v*",
+            priority: 20
+          }
+        ],
+        revisionPrefixes: [
+          {
+            prefix: "glm-",
+            anywhere: true
+          }
+        ],
+        skipBare: [],
+        overrides: [
+          {
+            id: "umans-glm-5-3-flash-lab-family",
+            model: "umans-glm-5.3-flash-lab",
+            rationale: "The opaque Umans lab deployment is backed by the reviewed GLM 5.3 Flash family",
+            provenance: "models.json census",
+            provider: "umans",
+            class: "glm"
+          },
+          {
+            id: "abliteration-glm-5-3-family",
+            model: "abliterated-model-large-v2",
+            rationale: "Abliteration's Large V2 is an abliterated GLM 5.3 deployment",
+            provenance: "docs.abliteration.ai/models (2026-09)",
+            provider: "abliteration",
+            class: "glm",
+            revision: "5.3.0"
+          },
+          {
+            id: "abliteration-glm-5-2-family",
+            model: "abliterated-model-large",
+            rationale: "Abliteration's Large is an abliterated GLM 5.2 deployment",
+            provenance: "docs.abliteration.ai/models (2026-09)",
+            provider: "abliteration",
+            class: "glm",
+            revision: "5.2.0"
+          },
+          {
+            id: "abliteration-glm-base-family",
+            model: "abliterated-model",
+            rationale: "Abliteration's base deployment is GLM-derived; the docs do not pin the revision",
+            provenance: "docs.abliteration.ai/models (2026-09)",
+            provider: "abliteration",
+            class: "glm"
+          }
+        ]
+      },
+      {
+        id: "gpt-oss",
+        matchers: [
+          {
+            kind: "namespace",
+            token: "gpt-oss",
+            bounded: true
+          },
+          {
+            kind: "bounded",
+            token: "gpt-oss"
+          }
+        ],
+        families: [
+          {
+            id: "120b",
+            glob: "*gpt-oss-120b*",
+            priority: 0
+          },
+          {
+            id: "20b",
+            glob: "*gpt-oss-20b*",
+            priority: 0
+          }
+        ],
+        revisionPrefixes: [],
+        skipBare: [],
+        overrides: [
+          {
+            id: "venice-e2ee-gpt-oss-120b-family",
+            model: "e2ee-gpt-oss-120b-p",
+            rationale: "The opaque Venice E2EE deployment is backed by the reviewed GPT OSS family",
+            provenance: "fixtures/llm-oracle/catalog/models.normalized.json",
+            provider: "venice",
+            logical: "e2ee-gpt-oss-120b-p",
+            class: "gpt-oss"
+          },
+          {
+            id: "venice-e2ee-gpt-oss-20b-family",
+            model: "e2ee-gpt-oss-20b-p",
+            rationale: "The opaque Venice E2EE deployment is backed by the reviewed GPT OSS family",
+            provenance: "fixtures/llm-oracle/catalog/models.normalized.json",
+            provider: "venice",
+            logical: "e2ee-gpt-oss-20b-p",
+            class: "gpt-oss"
+          },
+          {
+            id: "venice-openai-gpt-oss-family",
+            model: "openai-gpt-oss-120b",
+            rationale: "The reviewed Venice deployment belongs to the GPT OSS family",
+            provenance: "fixtures/llm-oracle/catalog/models.normalized.json",
+            provider: "venice",
+            logical: "openai-gpt-oss-120b",
+            class: "gpt-oss"
+          }
+        ]
+      },
+      {
+        id: "kimi",
+        matchers: [
+          {
+            kind: "namespace",
+            token: "moonshotai"
+          },
+          {
+            kind: "bounded",
+            token: "kimi"
+          }
+        ],
+        families: [
+          {
+            id: "k2",
+            glob: "*kimi-k2*",
+            priority: 0
+          },
+          {
+            id: "k2.5",
+            glob: "*kimi-k2.5*",
+            priority: 10
+          },
+          {
+            id: "k2.6",
+            glob: "*kimi-k2.6*",
+            priority: 10
+          },
+          {
+            id: "k2.6",
+            glob: "*kimi-k2p6*",
+            priority: 10
+          },
+          {
+            id: "k2.7-code",
+            glob: "*kimi-k2.7-code*",
+            priority: 10
+          },
+          {
+            id: "k2.7-code",
+            glob: "*kimi-k2-7-code*",
+            priority: 10
+          },
+          {
+            id: "k2.7-code",
+            glob: "*kimi-k2p7*code*",
+            priority: 10
+          },
+          {
+            id: "k2-thinking",
+            glob: "*kimi-k2-thinking*",
+            priority: 20
+          },
+          {
+            id: "k3",
+            glob: "*kimi-k3*",
+            priority: 0
+          }
+        ],
+        revisionPrefixes: [],
+        skipBare: [],
+        overrides: [
+          {
+            id: "kilo-kimi-k2-thinking-product",
+            model: "kimi-k2-thinking",
+            rationale: "Oracle exposes this independently priced product rather than an effort route",
+            provenance: "fixtures/llm-oracle/catalog/models.normalized.json",
+            provider: "kilo",
+            logical: "moonshotai/kimi-k2-thinking",
+            class: "kimi"
+          },
+          {
+            id: "openrouter-kimi-k2-thinking-product",
+            model: "kimi-k2-thinking",
+            rationale: "Oracle exposes this independently priced product rather than an effort route",
+            provenance: "fixtures/llm-oracle/catalog/models.normalized.json",
+            provider: "openrouter",
+            logical: "moonshotai/kimi-k2-thinking",
+            class: "kimi"
+          },
+          {
+            id: "vercel-kimi-k2-thinking-product",
+            model: "kimi-k2-thinking",
+            rationale: "Oracle exposes this independently priced product rather than an effort route",
+            provenance: "fixtures/llm-oracle/catalog/models.normalized.json",
+            provider: "vercel-ai-gateway",
+            logical: "moonshotai/kimi-k2-thinking",
+            class: "kimi"
+          }
+        ]
+      },
+      {
+        id: "meta",
+        matchers: [
+          {
+            kind: "bounded",
+            token: "muse-spark"
+          },
+          {
+            kind: "bounded",
+            token: "llama"
+          },
+          {
+            kind: "namespace",
+            token: "meta-llama"
+          }
+        ],
+        families: [
+          {
+            id: "llama",
+            glob: "*llama*",
+            priority: 0
+          },
+          {
+            id: "muse-spark",
+            glob: "*muse-spark*",
+            priority: 0
+          }
+        ],
+        revisionPrefixes: [
+          {
+            prefix: "muse-spark-"
+          }
+        ],
+        skipBare: [],
+        overrides: []
+      },
+      {
+        id: "mimo",
+        matchers: [
+          {
+            kind: "bounded",
+            token: "mimo"
+          }
+        ],
+        families: [
+          {
+            id: "v2",
+            glob: "*mimo-v2*",
+            priority: 0
+          }
+        ],
+        revisionPrefixes: [],
+        skipBare: [],
+        overrides: [
+          {
+            id: "venice-xiaomi-mimo-family",
+            model: "xiaomi-mimo-v2-5",
+            rationale: "The reviewed Venice deployment belongs to the Xiaomi MiMo family",
+            provenance: "fixtures/llm-oracle/catalog/models.normalized.json",
+            provider: "venice",
+            logical: "xiaomi-mimo-v2-5",
+            class: "mimo"
+          }
+        ]
+      },
+      {
+        id: "minimax",
+        matchers: [
+          {
+            kind: "namespace",
+            token: "minimax"
+          },
+          {
+            kind: "bounded",
+            token: "minimax"
+          },
+          {
+            kind: "bounded",
+            token: "hailuo"
+          }
+        ],
+        families: [
+          {
+            id: "m1",
+            glob: "*minimax-m1*",
+            priority: 0
+          },
+          {
+            id: "m2",
+            glob: "*minimax-m2*",
+            priority: 0
+          },
+          {
+            id: "m3",
+            glob: "*minimax-m3*",
+            priority: 0
+          }
+        ],
+        revisionPrefixes: [],
+        skipBare: [],
+        overrides: []
+      },
+      {
+        id: "mistral",
+        matchers: [
+          {
+            kind: "bounded",
+            token: "mistral"
+          },
+          {
+            kind: "bounded",
+            token: "mixtral"
+          }
+        ],
+        families: [
+          {
+            id: "mistral",
+            glob: "*mistral*",
+            priority: 0
+          },
+          {
+            id: "mixtral",
+            glob: "*mixtral*",
+            priority: 0
+          }
+        ],
+        revisionPrefixes: [],
+        skipBare: [],
+        overrides: []
+      },
+      {
+        id: "openai",
+        matchers: [
+          {
+            kind: "namespace",
+            token: "openai"
+          },
+          {
+            kind: "namespace",
+            token: "openai",
+            bounded: true
+          },
+          {
+            kind: "prefix",
+            token: "gpt-"
+          },
+          {
+            kind: "prefix",
+            token: "chatgpt-"
+          },
+          {
+            kind: "prefix",
+            token: "codex-"
+          },
+          {
+            kind: "exact",
+            token: "o1"
+          },
+          {
+            kind: "prefix",
+            token: "o1-"
+          },
+          {
+            kind: "prefix",
+            token: "o1."
+          },
+          {
+            kind: "exact",
+            token: "o3"
+          },
+          {
+            kind: "prefix",
+            token: "o3-"
+          },
+          {
+            kind: "prefix",
+            token: "o3."
+          },
+          {
+            kind: "exact",
+            token: "o4"
+          },
+          {
+            kind: "prefix",
+            token: "o4-"
+          },
+          {
+            kind: "prefix",
+            token: "o4."
+          }
+        ],
+        families: [
+          {
+            id: "gpt",
+            glob: "gpt-*",
+            priority: 0
+          },
+          {
+            id: "chatgpt",
+            glob: "chatgpt-*",
+            priority: 0
+          },
+          {
+            id: "o-series",
+            glob: "o1",
+            priority: 0
+          },
+          {
+            id: "o-series",
+            glob: "o1-*",
+            priority: 0
+          },
+          {
+            id: "o-series",
+            glob: "o1.*",
+            priority: 0
+          },
+          {
+            id: "o-series",
+            glob: "o3",
+            priority: 0
+          },
+          {
+            id: "o-series",
+            glob: "o3-*",
+            priority: 0
+          },
+          {
+            id: "o-series",
+            glob: "o3.*",
+            priority: 0
+          },
+          {
+            id: "o-series",
+            glob: "o4",
+            priority: 0
+          },
+          {
+            id: "o-series",
+            glob: "o4-*",
+            priority: 0
+          },
+          {
+            id: "o-series",
+            glob: "o4.*",
+            priority: 0
+          },
+          {
+            id: "codex",
+            glob: "*codex*",
+            priority: 10
+          },
+          {
+            id: "codex-spark",
+            glob: "*codex-spark*",
+            priority: 20
+          }
+        ],
+        revisionPrefixes: [
+          {
+            prefix: "chatgpt-"
+          },
+          {
+            prefix: "gpt-",
+            anywhere: true
+          },
+          {
+            prefix: "o"
+          }
+        ],
+        skipBare: [
+          "o1",
+          "o3",
+          "o4"
+        ],
+        overrides: [
+          {
+            id: "openai-daybreak-blue-2026-08",
+            model: "daybreak-blue-latest",
+            rationale: "OpenAI rolling alias pins only the documented generation; its opaque product name supplies no family evidence",
+            provenance: "catalog-oracle:identity/daybreak-aliases",
+            logical: "daybreak-blue-latest",
+            class: "unknown",
+            revision: "5.6.0",
+            expiresAtMs: 1799712000000
+          },
+          {
+            id: "openai-daybreak-red-2026-08",
+            model: "daybreak-red-latest",
+            rationale: "OpenAI rolling alias pins only the documented generation; its opaque product name supplies no family evidence",
+            provenance: "catalog-oracle:identity/daybreak-aliases",
+            logical: "daybreak-red-latest",
+            class: "unknown",
+            revision: "5.6.0",
+            expiresAtMs: 1799712000000
+          },
+          {
+            id: "openai-gpt-daybreak-blue-2026-08",
+            model: "gpt-daybreak-blue-latest",
+            rationale: "OpenAI rolling alias pinned to the generation declared by the source snapshot",
+            provenance: "catalog-oracle:identity/daybreak-aliases",
+            logical: "gpt-daybreak-blue-latest",
+            class: "openai",
+            revision: "5.6.0",
+            expiresAtMs: 1799712000000
+          },
+          {
+            id: "openai-gpt-daybreak-red-2026-08",
+            model: "gpt-daybreak-red-latest",
+            rationale: "OpenAI rolling alias pinned to the generation declared by the source snapshot",
+            provenance: "catalog-oracle:identity/daybreak-aliases",
+            logical: "gpt-daybreak-red-latest",
+            class: "openai",
+            revision: "5.6.0",
+            expiresAtMs: 1799712000000
+          }
+        ]
+      },
+      {
+        id: "qwen",
+        matchers: [
+          {
+            kind: "bounded",
+            token: "qwen"
+          },
+          {
+            kind: "bounded",
+            token: "deepseek-r1-distill-qwen"
+          },
+          {
+            kind: "glob",
+            token: "*distill-qwen*"
+          }
+        ],
+        families: [
+          {
+            id: "qwq",
+            glob: "*qwq*",
+            priority: 0
+          },
+          {
+            id: "coder",
+            glob: "*qwen3-coder*",
+            priority: 0
+          },
+          {
+            id: "next",
+            glob: "*qwen3-next*",
+            priority: 0
+          },
+          {
+            id: "omni",
+            glob: "*qwen3-omni*",
+            priority: 0
+          },
+          {
+            id: "vl",
+            glob: "*qwen3-vl*",
+            priority: 0
+          },
+          {
+            id: "qwenlong",
+            glob: "*qwenlong*",
+            priority: 0
+          }
+        ],
+        revisionPrefixes: [
+          {
+            prefix: "qwen"
+          }
+        ],
+        skipBare: [],
+        overrides: [
+          {
+            id: "kilo-qwq-32b-family",
+            model: "qwq-32b",
+            rationale: "The reviewed Kilo QwQ deployment belongs to the Qwen family despite its opaque product spelling",
+            provenance: "fixtures/llm-oracle/catalog/models.normalized.json",
+            provider: "kilo",
+            logical: "qwen/qwq-32b",
+            class: "qwen"
+          },
+          {
+            id: "nanogpt-eva-qwen-2-5-family",
+            model: "EVA-Qwen2.5-32B-v0.2",
+            rationale: "The reviewed EVA deployment is a Qwen 2.5 derivative despite its opaque product namespace",
+            provenance: "fixtures/llm-oracle/catalog/models.normalized.json",
+            provider: "nanogpt",
+            logical: "EVA-UNIT-01/EVA-Qwen2.5-32B-v0.2",
+            class: "qwen"
+          },
+          {
+            id: "nanogpt-eva-qwen-2-5-72b-family",
+            model: "EVA-Qwen2.5-72B-v0.2",
+            rationale: "The reviewed EVA 72B deployment is a Qwen 2.5 derivative despite its opaque product namespace",
+            provenance: "fixtures/llm-oracle/catalog/models.normalized.json",
+            provider: "nanogpt",
+            logical: "EVA-UNIT-01/EVA-Qwen2.5-72B-v0.2",
+            class: "qwen"
+          },
+          {
+            id: "nanogpt-qwenlong-l1-family",
+            model: "QwenLong-L1-32B",
+            rationale: "The reviewed Tongyi Zhiwen QwenLong deployment belongs to the Qwen family",
+            provenance: "fixtures/llm-oracle/catalog/models.normalized.json",
+            provider: "nanogpt",
+            logical: "Tongyi-Zhiwen/QwenLong-L1-32B",
+            class: "qwen"
+          },
+          {
+            id: "nanogpt-dolphin-qwen-family",
+            model: "dolphin-2.9.2-qwen2-72b",
+            rationale: "The reviewed Dolphin deployment is a Qwen derivative",
+            provenance: "fixtures/llm-oracle/catalog/models.normalized.json",
+            provider: "nanogpt",
+            logical: "cognitivecomputations/dolphin-2.9.2-qwen2-72b",
+            class: "qwen"
+          },
+          {
+            id: "nanogpt-cogito-qwen-family",
+            model: "cogito-v1-preview-qwen-32B",
+            rationale: "The reviewed Cogito deployment is a Qwen derivative",
+            provenance: "fixtures/llm-oracle/catalog/models.normalized.json",
+            provider: "nanogpt",
+            logical: "deepcogito/cogito-v1-preview-qwen-32B",
+            class: "qwen"
+          },
+          {
+            id: "nanogpt-qwq-preview-family",
+            model: "qwq-32b-preview",
+            rationale: "The reviewed QwQ preview belongs to the Qwen family",
+            provenance: "fixtures/llm-oracle/catalog/models.normalized.json",
+            provider: "nanogpt",
+            logical: "qwen/qwq-32b-preview",
+            class: "qwen"
+          },
+          {
+            id: "nanogpt-grayline-qwen-family",
+            model: "GrayLine-Qwen3-8B",
+            rationale: "The reviewed GrayLine deployment is a Qwen derivative",
+            provenance: "fixtures/llm-oracle/catalog/models.normalized.json",
+            provider: "nanogpt",
+            logical: "soob3123/GrayLine-Qwen3-8B",
+            class: "qwen"
+          },
+          {
+            id: "novita-r1-qwen-family",
+            model: "deepseek-r1-0528-qwen3-8b",
+            rationale: "The reviewed distillation lineage follows the Qwen student architecture",
+            provenance: "fixtures/llm-oracle/catalog/models.normalized.json",
+            provider: "novita",
+            logical: "deepseek/deepseek-r1-0528-qwen3-8b",
+            class: "qwen"
+          },
+          {
+            id: "openrouter-qwq-family",
+            model: "qwq-32b",
+            rationale: "The reviewed QwQ deployment belongs to the Qwen family",
+            provenance: "fixtures/llm-oracle/catalog/models.normalized.json",
+            provider: "openrouter",
+            logical: "qwen/qwq-32b",
+            class: "qwen"
+          },
+          {
+            id: "umans-qwen-3-6-family",
+            model: "umans-qwen3.6-35b-a3b",
+            rationale: "The opaque Umans deployment is backed by the reviewed Qwen 3.6 family",
+            provenance: "fixtures/llm-oracle/catalog/models.normalized.json",
+            provider: "umans",
+            logical: "umans-qwen3.6-35b-a3b",
+            class: "qwen"
+          },
+          {
+            id: "venice-e2ee-qwen-2-5-family",
+            model: "e2ee-qwen-2-5-7b-p",
+            rationale: "The opaque Venice E2EE deployment is backed by the reviewed Qwen family",
+            provenance: "fixtures/llm-oracle/catalog/models.normalized.json",
+            provider: "venice",
+            logical: "e2ee-qwen-2-5-7b-p",
+            class: "qwen"
+          },
+          {
+            id: "venice-e2ee-qwen-3-30b-family",
+            model: "e2ee-qwen3-30b-a3b-p",
+            rationale: "The opaque Venice E2EE deployment is backed by the reviewed Qwen family",
+            provenance: "fixtures/llm-oracle/catalog/models.normalized.json",
+            provider: "venice",
+            logical: "e2ee-qwen3-30b-a3b-p",
+            class: "qwen"
+          },
+          {
+            id: "venice-e2ee-qwen-3-5-family",
+            model: "e2ee-qwen3-5-122b-a10b",
+            rationale: "The opaque Venice E2EE deployment is backed by the reviewed Qwen family",
+            provenance: "fixtures/llm-oracle/catalog/models.normalized.json",
+            provider: "venice",
+            logical: "e2ee-qwen3-5-122b-a10b",
+            class: "qwen"
+          },
+          {
+            id: "venice-e2ee-qwen-3-6-27b-family",
+            model: "e2ee-qwen3-6-27b",
+            rationale: "The opaque Venice E2EE deployment is backed by the reviewed Qwen family",
+            provenance: "fixtures/llm-oracle/catalog/models.normalized.json",
+            provider: "venice",
+            logical: "e2ee-qwen3-6-27b",
+            class: "qwen"
+          },
+          {
+            id: "venice-e2ee-qwen-3-6-35b-family",
+            model: "e2ee-qwen3-6-35b-a3b",
+            rationale: "The opaque Venice E2EE deployment is backed by the reviewed Qwen family",
+            provenance: "fixtures/llm-oracle/catalog/models.normalized.json",
+            provider: "venice",
+            logical: "e2ee-qwen3-6-35b-a3b",
+            class: "qwen"
+          },
+          {
+            id: "venice-e2ee-qwen-3-6-uncensored-family",
+            model: "e2ee-qwen3-6-35b-a3b-uncensored-p",
+            rationale: "The opaque Venice E2EE deployment is backed by the reviewed Qwen family",
+            provenance: "fixtures/llm-oracle/catalog/models.normalized.json",
+            provider: "venice",
+            logical: "e2ee-qwen3-6-35b-a3b-uncensored-p",
+            class: "qwen"
+          },
+          {
+            id: "venice-e2ee-qwen-vl-family",
+            model: "e2ee-qwen3-vl-30b-a3b-p",
+            rationale: "The opaque Venice E2EE deployment is backed by the reviewed Qwen family",
+            provenance: "fixtures/llm-oracle/catalog/models.normalized.json",
+            provider: "venice",
+            logical: "e2ee-qwen3-vl-30b-a3b-p",
+            class: "qwen"
+          }
+        ]
+      },
+      {
+        id: "stepfun",
+        matchers: [
+          {
+            kind: "bounded",
+            token: "step"
+          }
+        ],
+        families: [
+          {
+            id: "step",
+            glob: "*step*",
+            priority: 0
+          }
+        ],
+        revisionPrefixes: [],
+        skipBare: [],
+        overrides: []
+      },
+      {
+        id: "unknown",
+        matchers: [],
+        families: [],
+        revisionPrefixes: [],
+        skipBare: [],
+        overrides: []
+      },
+      {
+        id: "xai",
+        matchers: [
+          {
+            kind: "prefix",
+            token: "cursor-grok-"
+          },
+          {
+            kind: "bounded",
+            token: "grok"
+          },
+          {
+            kind: "namespace",
+            token: "x-ai"
+          },
+          {
+            kind: "namespace",
+            token: "xai"
+          }
+        ],
+        families: [
+          {
+            id: "grok",
+            glob: "*grok*",
+            priority: 0
+          }
+        ],
+        revisionPrefixes: [
+          {
+            prefix: "cursor-grok-"
+          },
+          {
+            prefix: "grok-"
+          }
+        ],
+        skipBare: [],
+        overrides: []
+      }
+    ],
+    collapse: {
+      suffixes: [
+        {
+          suffix: "-thinking",
+          thinking: true
+        },
+        {
+          suffix: "-extra-high",
+          effort: "xhigh"
+        },
+        {
+          suffix: "-none",
+          effort: "off"
+        },
+        {
+          suffix: "-minimal",
+          effort: "minimal"
+        },
+        {
+          suffix: "-medium",
+          effort: "medium"
+        },
+        {
+          suffix: "-xhigh",
+          effort: "xhigh"
+        },
+        {
+          suffix: "-high",
+          effort: "high"
+        },
+        {
+          suffix: "-low",
+          effort: "low"
+        },
+        {
+          suffix: "-max",
+          effort: "max",
+          exceptBarePrefix: "qwen"
+        }
+      ],
+      pairTokens: [
+        "thinking",
+        "reasoning",
+        "reasoner"
+      ],
+      lanes: [
+        {
+          suffix: "-fast",
+          providers: [
+            "cursor"
+          ]
+        }
+      ],
+      routingVariants: [
+        {
+          suffix: "-wm",
+          providers: [
+            "openai-codex",
+            "openai-codex-device"
+          ]
+        }
+      ],
+      effortFamilies: [
+        {
+          provider: "cursor",
+          logical: "gpt-5.6-luna",
+          aliases: []
+        },
+        {
+          provider: "cursor",
+          logical: "gpt-5.6-sol",
+          aliases: []
+        },
+        {
+          provider: "cursor",
+          logical: "gpt-5.6-terra",
+          aliases: []
+        }
+      ],
+      variantFamilies: [
+        {
+          provider: "google-antigravity",
+          id: "gemini-{rev}-flash",
+          name: "Gemini {rev} Flash",
+          members: [
+            "gemini-{rev}-flash-low",
+            "gemini-{rev}-flash-medium",
+            "gemini-{rev}-flash-high",
+            "gemini-{rev}-flash-tiered"
+          ],
+          routing: {
+            minimal: "gemini-{rev}-flash-low",
+            low: "gemini-{rev}-flash-low",
+            medium: "gemini-{rev}-flash-medium",
+            high: "gemini-{rev}-flash-high"
+          },
+          revision: ">=3.6",
+          mode: "google-level",
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ],
+          requiresEffort: true
+        },
+        {
+          provider: "google-antigravity",
+          id: "gemini-3.5-flash",
+          name: "Gemini 3.5 Flash",
+          members: [
+            "gemini-3.5-flash-extra-low",
+            "gemini-3.5-flash-low",
+            "gemini-3-flash-agent"
+          ],
+          routing: {
+            off: "gemini-3.5-flash-extra-low",
+            minimal: "gemini-3.5-flash-extra-low",
+            low: "gemini-3.5-flash-extra-low",
+            medium: "gemini-3.5-flash-low",
+            high: "gemini-3-flash-agent"
+          },
+          mode: "budget",
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ],
+          effortBudgets: {
+            minimal: 1000,
+            low: 1000,
+            medium: 4000,
+            high: 1e4
+          },
+          extraAliases: [
+            "gemini-3-flash"
+          ],
+          suppressWhenOff: true
+        },
+        {
+          provider: "google-antigravity",
+          id: "gemini-3.1-pro",
+          name: "Gemini 3.1 Pro",
+          members: [
+            "gemini-3.1-pro-low",
+            "gemini-pro-agent",
+            "gemini-3.1-pro-high"
+          ],
+          routing: {
+            off: "gemini-3.1-pro-low",
+            low: "gemini-3.1-pro-low",
+            high: "gemini-pro-agent"
+          },
+          mode: "budget",
+          efforts: [
+            "low",
+            "high"
+          ],
+          effortBudgets: {
+            low: 1001,
+            high: 10001
+          },
+          retiredMembers: [
+            "gemini-3.1-pro-high"
+          ],
+          suppressWhenOff: true
+        },
+        {
+          provider: "google-antigravity",
+          id: "gemini-3-pro",
+          name: "Gemini 3 Pro",
+          members: [
+            "gemini-3-pro-low",
+            "gemini-3-pro-high"
+          ],
+          routing: {
+            off: "gemini-3-pro-low",
+            low: "gemini-3-pro-low",
+            high: "gemini-3-pro-high"
+          },
+          mode: "google-level",
+          efforts: [
+            "low",
+            "high"
+          ],
+          suppressWhenOff: true
+        },
+        {
+          provider: "google-antigravity",
+          id: "gpt-oss-120b",
+          name: "GPT-OSS 120B",
+          members: [
+            "gpt-oss-120b-medium"
+          ],
+          routing: {},
+          mode: "budget",
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ]
+        },
+        {
+          provider: "google-antigravity",
+          id: "claude-sonnet-4-6",
+          name: "Claude Sonnet 4.6",
+          members: [
+            "claude-sonnet-4-6",
+            "claude-sonnet-4-6-thinking"
+          ],
+          routing: {},
+          mode: "budget",
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ],
+          retiredMembers: [
+            "claude-sonnet-4-6-thinking"
+          ]
+        },
+        {
+          provider: "google-antigravity",
+          id: "claude-opus-4-6",
+          name: "Claude Opus 4.6",
+          members: [
+            "claude-opus-4-6-thinking",
+            "claude-opus-4-6"
+          ],
+          routing: {},
+          mode: "budget",
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ],
+          retiredMembers: [
+            "claude-opus-4-6"
+          ]
+        },
+        {
+          provider: "google-antigravity",
+          id: "claude-sonnet-4-5",
+          name: "Claude Sonnet 4.5",
+          members: [
+            "claude-sonnet-4-5",
+            "claude-sonnet-4-5-thinking"
+          ],
+          routing: {
+            off: "claude-sonnet-4-5",
+            minimal: "claude-sonnet-4-5-thinking",
+            low: "claude-sonnet-4-5-thinking",
+            medium: "claude-sonnet-4-5-thinking",
+            high: "claude-sonnet-4-5-thinking"
+          },
+          mode: "budget",
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ],
+          preserveAbsentEffortRoutes: true
+        },
+        {
+          provider: "google-antigravity",
+          id: "claude-opus-4-5",
+          name: "Claude Opus 4.5",
+          members: [
+            "claude-opus-4-5",
+            "claude-opus-4-5-thinking"
+          ],
+          routing: {
+            off: "claude-opus-4-5",
+            minimal: "claude-opus-4-5-thinking",
+            low: "claude-opus-4-5-thinking",
+            medium: "claude-opus-4-5-thinking",
+            high: "claude-opus-4-5-thinking"
+          },
+          mode: "budget",
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ],
+          preserveAbsentEffortRoutes: true
+        },
+        {
+          provider: "google-antigravity",
+          id: "gemini-2.5-flash",
+          name: "Gemini 2.5 Flash",
+          members: [
+            "gemini-2.5-flash",
+            "gemini-2.5-flash-thinking"
+          ],
+          routing: {
+            off: "gemini-2.5-flash",
+            minimal: "gemini-2.5-flash-thinking",
+            low: "gemini-2.5-flash-thinking",
+            medium: "gemini-2.5-flash-thinking",
+            high: "gemini-2.5-flash-thinking"
+          },
+          mode: "budget",
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ],
+          preserveAbsentEffortRoutes: true
+        },
+        {
+          provider: "google-gemini-cli",
+          id: "gemini-{rev}-flash",
+          name: "Gemini {rev} Flash",
+          members: [
+            "gemini-{rev}-flash-low",
+            "gemini-{rev}-flash-medium",
+            "gemini-{rev}-flash-high",
+            "gemini-{rev}-flash-tiered"
+          ],
+          routing: {
+            minimal: "gemini-{rev}-flash-low",
+            low: "gemini-{rev}-flash-low",
+            medium: "gemini-{rev}-flash-medium",
+            high: "gemini-{rev}-flash-high"
+          },
+          revision: ">=3.6",
+          mode: "google-level",
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ],
+          requiresEffort: true
+        },
+        {
+          provider: "google-gemini-cli",
+          id: "gemini-3.5-flash",
+          name: "Gemini 3.5 Flash",
+          members: [
+            "gemini-3.5-flash-extra-low",
+            "gemini-3.5-flash-low",
+            "gemini-3-flash-agent"
+          ],
+          routing: {
+            off: "gemini-3.5-flash-extra-low",
+            minimal: "gemini-3-flash-agent",
+            low: "gemini-3.5-flash-extra-low",
+            medium: "gemini-3.5-flash-extra-low",
+            high: "gemini-3.5-flash-low"
+          },
+          mode: "google-level",
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ],
+          extraAliases: [
+            "gemini-3-flash"
+          ],
+          suppressWhenOff: true
+        },
+        {
+          provider: "google-gemini-cli",
+          id: "gemini-3.1-pro",
+          name: "Gemini 3.1 Pro",
+          members: [
+            "gemini-3.1-pro-low",
+            "gemini-pro-agent",
+            "gemini-3.1-pro-high"
+          ],
+          routing: {
+            off: "gemini-3.1-pro-low",
+            low: "gemini-3.1-pro-low",
+            high: "gemini-pro-agent"
+          },
+          mode: "google-level",
+          efforts: [
+            "low",
+            "high"
+          ],
+          retiredMembers: [
+            "gemini-3.1-pro-high"
+          ],
+          suppressWhenOff: true
+        },
+        {
+          provider: "google-gemini-cli",
+          id: "gemini-3-pro",
+          name: "Gemini 3 Pro",
+          members: [
+            "gemini-3-pro-low",
+            "gemini-3-pro-high"
+          ],
+          routing: {
+            off: "gemini-3-pro-low",
+            low: "gemini-3-pro-low",
+            high: "gemini-3-pro-high"
+          },
+          mode: "google-level",
+          efforts: [
+            "low",
+            "high"
+          ],
+          suppressWhenOff: true
+        },
+        {
+          provider: "google-gemini-cli",
+          id: "gpt-oss-120b",
+          name: "GPT-OSS 120B",
+          members: [
+            "gpt-oss-120b-medium"
+          ],
+          routing: {},
+          mode: "budget",
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ]
+        },
+        {
+          provider: "google-gemini-cli",
+          id: "claude-sonnet-4-6",
+          name: "Claude Sonnet 4.6",
+          members: [
+            "claude-sonnet-4-6",
+            "claude-sonnet-4-6-thinking"
+          ],
+          routing: {},
+          mode: "budget",
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ],
+          retiredMembers: [
+            "claude-sonnet-4-6-thinking"
+          ]
+        },
+        {
+          provider: "google-gemini-cli",
+          id: "claude-opus-4-6",
+          name: "Claude Opus 4.6",
+          members: [
+            "claude-opus-4-6-thinking",
+            "claude-opus-4-6"
+          ],
+          routing: {},
+          mode: "budget",
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ],
+          retiredMembers: [
+            "claude-opus-4-6"
+          ]
+        },
+        {
+          provider: "google-gemini-cli",
+          id: "claude-sonnet-4-5",
+          name: "Claude Sonnet 4.5",
+          members: [
+            "claude-sonnet-4-5",
+            "claude-sonnet-4-5-thinking"
+          ],
+          routing: {
+            off: "claude-sonnet-4-5",
+            minimal: "claude-sonnet-4-5-thinking",
+            low: "claude-sonnet-4-5-thinking",
+            medium: "claude-sonnet-4-5-thinking",
+            high: "claude-sonnet-4-5-thinking"
+          },
+          mode: "budget",
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ],
+          preserveAbsentEffortRoutes: true
+        },
+        {
+          provider: "google-gemini-cli",
+          id: "claude-opus-4-5",
+          name: "Claude Opus 4.5",
+          members: [
+            "claude-opus-4-5",
+            "claude-opus-4-5-thinking"
+          ],
+          routing: {
+            off: "claude-opus-4-5",
+            minimal: "claude-opus-4-5-thinking",
+            low: "claude-opus-4-5-thinking",
+            medium: "claude-opus-4-5-thinking",
+            high: "claude-opus-4-5-thinking"
+          },
+          mode: "budget",
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ],
+          preserveAbsentEffortRoutes: true
+        },
+        {
+          provider: "google-gemini-cli",
+          id: "gemini-2.5-flash",
+          name: "Gemini 2.5 Flash",
+          members: [
+            "gemini-2.5-flash",
+            "gemini-2.5-flash-thinking"
+          ],
+          routing: {
+            off: "gemini-2.5-flash",
+            minimal: "gemini-2.5-flash-thinking",
+            low: "gemini-2.5-flash-thinking",
+            medium: "gemini-2.5-flash-thinking",
+            high: "gemini-2.5-flash-thinking"
+          },
+          mode: "budget",
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ],
+          preserveAbsentEffortRoutes: true
+        },
+        {
+          provider: "devin",
+          id: "claude-opus-5",
+          name: "Claude Opus 5",
+          members: [
+            "claude-opus-5-low",
+            "claude-opus-5-medium",
+            "claude-opus-5-high",
+            "claude-opus-5-xhigh",
+            "claude-opus-5-max"
+          ],
+          routing: {
+            low: "claude-opus-5-low",
+            medium: "claude-opus-5-medium",
+            high: "claude-opus-5-high",
+            xhigh: "claude-opus-5-xhigh",
+            max: "claude-opus-5-max"
+          },
+          mode: "effort",
+          efforts: [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          requiresEffort: true
+        },
+        {
+          provider: "devin",
+          id: "claude-opus-5-fast",
+          name: "Claude Opus 5 Fast",
+          members: [
+            "claude-opus-5-low-fast",
+            "claude-opus-5-medium-fast",
+            "claude-opus-5-high-fast",
+            "claude-opus-5-xhigh-fast",
+            "claude-opus-5-max-fast"
+          ],
+          routing: {
+            low: "claude-opus-5-low-fast",
+            medium: "claude-opus-5-medium-fast",
+            high: "claude-opus-5-high-fast",
+            xhigh: "claude-opus-5-xhigh-fast",
+            max: "claude-opus-5-max-fast"
+          },
+          mode: "effort",
+          efforts: [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          requiresEffort: true
+        },
+        {
+          provider: "devin",
+          id: "claude-fable-5",
+          name: "Claude Fable 5",
+          members: [
+            "claude-5-fable-low",
+            "claude-5-fable-medium",
+            "claude-5-fable-high",
+            "claude-5-fable-xhigh",
+            "claude-5-fable-max"
+          ],
+          routing: {
+            low: "claude-5-fable-low",
+            medium: "claude-5-fable-medium",
+            high: "claude-5-fable-high",
+            xhigh: "claude-5-fable-xhigh",
+            max: "claude-5-fable-max"
+          },
+          mode: "effort",
+          efforts: [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          requiresEffort: true
+        },
+        {
+          provider: "devin",
+          id: "claude-sonnet-5",
+          name: "Claude Sonnet 5",
+          members: [
+            "claude-sonnet-5-low",
+            "claude-sonnet-5-medium",
+            "claude-sonnet-5-high",
+            "claude-sonnet-5-xhigh",
+            "claude-sonnet-5-max"
+          ],
+          routing: {
+            low: "claude-sonnet-5-low",
+            medium: "claude-sonnet-5-medium",
+            high: "claude-sonnet-5-high",
+            xhigh: "claude-sonnet-5-xhigh",
+            max: "claude-sonnet-5-max"
+          },
+          mode: "effort",
+          efforts: [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          requiresEffort: true
+        },
+        {
+          provider: "devin",
+          id: "claude-opus-4-7",
+          name: "Claude Opus 4.7",
+          members: [
+            "claude-opus-4-7-low",
+            "claude-opus-4-7-medium",
+            "claude-opus-4-7-high",
+            "claude-opus-4-7-xhigh",
+            "claude-opus-4-7-max"
+          ],
+          routing: {
+            low: "claude-opus-4-7-low",
+            medium: "claude-opus-4-7-medium",
+            high: "claude-opus-4-7-high",
+            xhigh: "claude-opus-4-7-xhigh",
+            max: "claude-opus-4-7-max"
+          },
+          mode: "effort",
+          efforts: [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          requiresEffort: true
+        },
+        {
+          provider: "devin",
+          id: "claude-opus-4-7-fast",
+          name: "Claude Opus 4.7 Fast",
+          members: [
+            "claude-opus-4-7-low-fast",
+            "claude-opus-4-7-medium-fast",
+            "claude-opus-4-7-high-fast",
+            "claude-opus-4-7-xhigh-fast",
+            "claude-opus-4-7-max-fast"
+          ],
+          routing: {
+            low: "claude-opus-4-7-low-fast",
+            medium: "claude-opus-4-7-medium-fast",
+            high: "claude-opus-4-7-high-fast",
+            xhigh: "claude-opus-4-7-xhigh-fast",
+            max: "claude-opus-4-7-max-fast"
+          },
+          mode: "effort",
+          efforts: [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          requiresEffort: true
+        },
+        {
+          provider: "devin",
+          id: "claude-opus-4-8",
+          name: "Claude Opus 4.8",
+          members: [
+            "claude-opus-4-8-low",
+            "claude-opus-4-8-medium",
+            "claude-opus-4-8-high",
+            "claude-opus-4-8-xhigh",
+            "claude-opus-4-8-max"
+          ],
+          routing: {
+            low: "claude-opus-4-8-low",
+            medium: "claude-opus-4-8-medium",
+            high: "claude-opus-4-8-high",
+            xhigh: "claude-opus-4-8-xhigh",
+            max: "claude-opus-4-8-max"
+          },
+          mode: "effort",
+          efforts: [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          requiresEffort: true
+        },
+        {
+          provider: "devin",
+          id: "claude-opus-4-8-fast",
+          name: "Claude Opus 4.8 Fast",
+          members: [
+            "claude-opus-4-8-low-fast",
+            "claude-opus-4-8-medium-fast",
+            "claude-opus-4-8-high-fast",
+            "claude-opus-4-8-xhigh-fast",
+            "claude-opus-4-8-max-fast"
+          ],
+          routing: {
+            low: "claude-opus-4-8-low-fast",
+            medium: "claude-opus-4-8-medium-fast",
+            high: "claude-opus-4-8-high-fast",
+            xhigh: "claude-opus-4-8-xhigh-fast",
+            max: "claude-opus-4-8-max-fast"
+          },
+          mode: "effort",
+          efforts: [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          requiresEffort: true
+        },
+        {
+          provider: "devin",
+          id: "gpt-5-2",
+          name: "GPT-5.2",
+          members: [
+            "MODEL_GPT_5_2_NONE",
+            "MODEL_GPT_5_2_LOW",
+            "MODEL_GPT_5_2_MEDIUM",
+            "MODEL_GPT_5_2_HIGH",
+            "MODEL_GPT_5_2_XHIGH"
+          ],
+          routing: {
+            off: "MODEL_GPT_5_2_NONE",
+            low: "MODEL_GPT_5_2_LOW",
+            medium: "MODEL_GPT_5_2_MEDIUM",
+            high: "MODEL_GPT_5_2_HIGH",
+            xhigh: "MODEL_GPT_5_2_XHIGH"
+          },
+          mode: "effort",
+          efforts: [
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        },
+        {
+          provider: "devin",
+          id: "gpt-5-3-codex",
+          name: "GPT-5.3 Codex",
+          members: [
+            "gpt-5-3-codex-low",
+            "gpt-5-3-codex-medium",
+            "gpt-5-3-codex-high",
+            "gpt-5-3-codex-xhigh"
+          ],
+          routing: {
+            low: "gpt-5-3-codex-low",
+            medium: "gpt-5-3-codex-medium",
+            high: "gpt-5-3-codex-high",
+            xhigh: "gpt-5-3-codex-xhigh"
+          },
+          mode: "effort",
+          efforts: [
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ],
+          requiresEffort: true
+        },
+        {
+          provider: "devin",
+          id: "gpt-5-3-codex-fast",
+          name: "GPT-5.3 Codex Fast",
+          members: [
+            "gpt-5-3-codex-low-priority",
+            "gpt-5-3-codex-medium-priority",
+            "gpt-5-3-codex-high-priority",
+            "gpt-5-3-codex-xhigh-priority"
+          ],
+          routing: {
+            low: "gpt-5-3-codex-low-priority",
+            medium: "gpt-5-3-codex-medium-priority",
+            high: "gpt-5-3-codex-high-priority",
+            xhigh: "gpt-5-3-codex-xhigh-priority"
+          },
+          mode: "effort",
+          efforts: [
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ],
+          requiresEffort: true
+        },
+        {
+          provider: "devin",
+          id: "gpt-5-4",
+          name: "GPT-5.4",
+          members: [
+            "gpt-5-4-none",
+            "gpt-5-4-low",
+            "gpt-5-4-medium",
+            "gpt-5-4-high",
+            "gpt-5-4-xhigh"
+          ],
+          routing: {
+            off: "gpt-5-4-none",
+            low: "gpt-5-4-low",
+            medium: "gpt-5-4-medium",
+            high: "gpt-5-4-high",
+            xhigh: "gpt-5-4-xhigh"
+          },
+          mode: "effort",
+          efforts: [
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        },
+        {
+          provider: "devin",
+          id: "gpt-5-4-fast",
+          name: "GPT-5.4 Fast",
+          members: [
+            "gpt-5-4-none-priority",
+            "gpt-5-4-low-priority",
+            "gpt-5-4-medium-priority",
+            "gpt-5-4-high-priority",
+            "gpt-5-4-xhigh-priority"
+          ],
+          routing: {
+            off: "gpt-5-4-none-priority",
+            low: "gpt-5-4-low-priority",
+            medium: "gpt-5-4-medium-priority",
+            high: "gpt-5-4-high-priority",
+            xhigh: "gpt-5-4-xhigh-priority"
+          },
+          mode: "effort",
+          efforts: [
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        },
+        {
+          provider: "devin",
+          id: "gpt-5-4-mini",
+          name: "GPT-5.4 Mini",
+          members: [
+            "gpt-5-4-mini-low",
+            "gpt-5-4-mini-medium",
+            "gpt-5-4-mini-high",
+            "gpt-5-4-mini-xhigh"
+          ],
+          routing: {
+            low: "gpt-5-4-mini-low",
+            medium: "gpt-5-4-mini-medium",
+            high: "gpt-5-4-mini-high",
+            xhigh: "gpt-5-4-mini-xhigh"
+          },
+          mode: "effort",
+          efforts: [
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ],
+          requiresEffort: true
+        },
+        {
+          provider: "devin",
+          id: "gpt-5-5",
+          name: "GPT-5.5",
+          members: [
+            "gpt-5-5-none",
+            "gpt-5-5-low",
+            "gpt-5-5-medium",
+            "gpt-5-5-high",
+            "gpt-5-5-xhigh"
+          ],
+          routing: {
+            off: "gpt-5-5-none",
+            low: "gpt-5-5-low",
+            medium: "gpt-5-5-medium",
+            high: "gpt-5-5-high",
+            xhigh: "gpt-5-5-xhigh"
+          },
+          mode: "effort",
+          efforts: [
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        },
+        {
+          provider: "devin",
+          id: "gpt-5-5-fast",
+          name: "GPT-5.5 Fast",
+          members: [
+            "gpt-5-5-none-priority",
+            "gpt-5-5-low-priority",
+            "gpt-5-5-medium-priority",
+            "gpt-5-5-high-priority",
+            "gpt-5-5-xhigh-priority"
+          ],
+          routing: {
+            off: "gpt-5-5-none-priority",
+            low: "gpt-5-5-low-priority",
+            medium: "gpt-5-5-medium-priority",
+            high: "gpt-5-5-high-priority",
+            xhigh: "gpt-5-5-xhigh-priority"
+          },
+          mode: "effort",
+          efforts: [
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        },
+        {
+          provider: "devin",
+          id: "gpt-5-6-luna",
+          name: "GPT-5.6 Luna",
+          members: [
+            "gpt-5-6-luna-none",
+            "gpt-5-6-luna-low",
+            "gpt-5-6-luna-medium",
+            "gpt-5-6-luna-high",
+            "gpt-5-6-luna-xhigh",
+            "gpt-5-6-luna-max"
+          ],
+          routing: {
+            off: "gpt-5-6-luna-none",
+            low: "gpt-5-6-luna-low",
+            medium: "gpt-5-6-luna-medium",
+            high: "gpt-5-6-luna-high",
+            xhigh: "gpt-5-6-luna-xhigh",
+            max: "gpt-5-6-luna-max"
+          },
+          mode: "effort",
+          efforts: [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        },
+        {
+          provider: "devin",
+          id: "gpt-5-6-luna-fast",
+          name: "GPT-5.6 Luna Fast",
+          members: [
+            "gpt-5-6-luna-none-priority",
+            "gpt-5-6-luna-low-priority",
+            "gpt-5-6-luna-medium-priority",
+            "gpt-5-6-luna-high-priority",
+            "gpt-5-6-luna-xhigh-priority",
+            "gpt-5-6-luna-max-priority"
+          ],
+          routing: {
+            off: "gpt-5-6-luna-none-priority",
+            low: "gpt-5-6-luna-low-priority",
+            medium: "gpt-5-6-luna-medium-priority",
+            high: "gpt-5-6-luna-high-priority",
+            xhigh: "gpt-5-6-luna-xhigh-priority",
+            max: "gpt-5-6-luna-max-priority"
+          },
+          mode: "effort",
+          efforts: [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        },
+        {
+          provider: "devin",
+          id: "gpt-5-6-sol",
+          name: "GPT-5.6 Sol",
+          members: [
+            "gpt-5-6-sol-none",
+            "gpt-5-6-sol-low",
+            "gpt-5-6-sol-medium",
+            "gpt-5-6-sol-high",
+            "gpt-5-6-sol-xhigh",
+            "gpt-5-6-sol-max"
+          ],
+          routing: {
+            off: "gpt-5-6-sol-none",
+            low: "gpt-5-6-sol-low",
+            medium: "gpt-5-6-sol-medium",
+            high: "gpt-5-6-sol-high",
+            xhigh: "gpt-5-6-sol-xhigh",
+            max: "gpt-5-6-sol-max"
+          },
+          mode: "effort",
+          efforts: [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        },
+        {
+          provider: "devin",
+          id: "gpt-5-6-sol-fast",
+          name: "GPT-5.6 Sol Fast",
+          members: [
+            "gpt-5-6-sol-none-priority",
+            "gpt-5-6-sol-low-priority",
+            "gpt-5-6-sol-medium-priority",
+            "gpt-5-6-sol-high-priority",
+            "gpt-5-6-sol-xhigh-priority",
+            "gpt-5-6-sol-max-priority"
+          ],
+          routing: {
+            off: "gpt-5-6-sol-none-priority",
+            low: "gpt-5-6-sol-low-priority",
+            medium: "gpt-5-6-sol-medium-priority",
+            high: "gpt-5-6-sol-high-priority",
+            xhigh: "gpt-5-6-sol-xhigh-priority",
+            max: "gpt-5-6-sol-max-priority"
+          },
+          mode: "effort",
+          efforts: [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        },
+        {
+          provider: "devin",
+          id: "gpt-5-6-terra",
+          name: "GPT-5.6 Terra",
+          members: [
+            "gpt-5-6-terra-none",
+            "gpt-5-6-terra-low",
+            "gpt-5-6-terra-medium",
+            "gpt-5-6-terra-high",
+            "gpt-5-6-terra-xhigh",
+            "gpt-5-6-terra-max"
+          ],
+          routing: {
+            off: "gpt-5-6-terra-none",
+            low: "gpt-5-6-terra-low",
+            medium: "gpt-5-6-terra-medium",
+            high: "gpt-5-6-terra-high",
+            xhigh: "gpt-5-6-terra-xhigh",
+            max: "gpt-5-6-terra-max"
+          },
+          mode: "effort",
+          efforts: [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        },
+        {
+          provider: "devin",
+          id: "gpt-5-6-terra-fast",
+          name: "GPT-5.6 Terra Fast",
+          members: [
+            "gpt-5-6-terra-none-priority",
+            "gpt-5-6-terra-low-priority",
+            "gpt-5-6-terra-medium-priority",
+            "gpt-5-6-terra-high-priority",
+            "gpt-5-6-terra-xhigh-priority",
+            "gpt-5-6-terra-max-priority"
+          ],
+          routing: {
+            off: "gpt-5-6-terra-none-priority",
+            low: "gpt-5-6-terra-low-priority",
+            medium: "gpt-5-6-terra-medium-priority",
+            high: "gpt-5-6-terra-high-priority",
+            xhigh: "gpt-5-6-terra-xhigh-priority",
+            max: "gpt-5-6-terra-max-priority"
+          },
+          mode: "effort",
+          efforts: [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        },
+        {
+          provider: "devin",
+          id: "kimi-k3",
+          name: "Kimi K3",
+          members: [
+            "kimi-k3-low",
+            "kimi-k3-high",
+            "kimi-k3-max"
+          ],
+          routing: {
+            low: "kimi-k3-low",
+            high: "kimi-k3-high",
+            max: "kimi-k3-max"
+          },
+          mode: "effort",
+          efforts: [
+            "low",
+            "high",
+            "max"
+          ],
+          requiresEffort: true
+        },
+        {
+          provider: "devin",
+          id: "swe-1-7",
+          name: "SWE-1.7",
+          members: [
+            "swe-1-7-medium",
+            "swe-1-7"
+          ],
+          routing: {
+            medium: "swe-1-7-medium",
+            max: "swe-1-7"
+          },
+          mode: "effort",
+          efforts: [
+            "medium",
+            "max"
+          ],
+          requiresEffort: true
+        },
+        {
+          provider: "devin",
+          id: "grok-4-5",
+          name: "Grok 4.5",
+          members: [
+            "grok-4-5-low",
+            "grok-4-5-medium",
+            "grok-4-5-high"
+          ],
+          routing: {
+            low: "grok-4-5-low",
+            medium: "grok-4-5-medium",
+            high: "grok-4-5-high"
+          },
+          mode: "effort",
+          efforts: [
+            "low",
+            "medium",
+            "high"
+          ],
+          requiresEffort: true
+        },
+        {
+          provider: "devin",
+          id: "inkling",
+          name: "Inkling",
+          members: [
+            "inkling-none",
+            "inkling-low",
+            "inkling-medium",
+            "inkling-high",
+            "inkling-xhigh",
+            "inkling-max"
+          ],
+          routing: {
+            off: "inkling-none",
+            low: "inkling-low",
+            medium: "inkling-medium",
+            high: "inkling-high",
+            xhigh: "inkling-xhigh",
+            max: "inkling-max"
+          },
+          mode: "effort",
+          efforts: [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        },
+        {
+          provider: "devin",
+          id: "gemini-3-1-pro",
+          name: "Gemini 3.1 Pro",
+          members: [
+            "gemini-3-1-pro-low",
+            "gemini-3-1-pro-high"
+          ],
+          routing: {
+            low: "gemini-3-1-pro-low",
+            high: "gemini-3-1-pro-high"
+          },
+          mode: "effort",
+          efforts: [
+            "low",
+            "high"
+          ],
+          requiresEffort: true
+        },
+        {
+          provider: "devin",
+          id: "gemini-3-5-flash",
+          name: "Gemini 3.5 Flash",
+          members: [
+            "gemini-3-5-flash-minimal",
+            "gemini-3-5-flash-low",
+            "gemini-3-5-flash-medium",
+            "gemini-3-5-flash-high"
+          ],
+          routing: {
+            minimal: "gemini-3-5-flash-minimal",
+            low: "gemini-3-5-flash-low",
+            medium: "gemini-3-5-flash-medium",
+            high: "gemini-3-5-flash-high"
+          },
+          mode: "effort",
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ],
+          requiresEffort: true
+        },
+        {
+          provider: "devin",
+          id: "gemini-3-6-flash",
+          name: "Gemini 3.6 Flash",
+          members: [
+            "gemini-3-6-flash-minimal",
+            "gemini-3-6-flash-low",
+            "gemini-3-6-flash-medium",
+            "gemini-3-6-flash-high"
+          ],
+          routing: {
+            minimal: "gemini-3-6-flash-minimal",
+            low: "gemini-3-6-flash-low",
+            medium: "gemini-3-6-flash-medium",
+            high: "gemini-3-6-flash-high"
+          },
+          mode: "effort",
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ],
+          requiresEffort: true
+        },
+        {
+          provider: "devin",
+          id: "gemini-3-flash",
+          name: "Gemini 3 Flash",
+          members: [
+            "MODEL_GOOGLE_GEMINI_3_0_FLASH_MINIMAL",
+            "MODEL_GOOGLE_GEMINI_3_0_FLASH_LOW",
+            "MODEL_GOOGLE_GEMINI_3_0_FLASH_MEDIUM",
+            "MODEL_GOOGLE_GEMINI_3_0_FLASH_HIGH"
+          ],
+          routing: {
+            minimal: "MODEL_GOOGLE_GEMINI_3_0_FLASH_MINIMAL",
+            low: "MODEL_GOOGLE_GEMINI_3_0_FLASH_LOW",
+            medium: "MODEL_GOOGLE_GEMINI_3_0_FLASH_MEDIUM",
+            high: "MODEL_GOOGLE_GEMINI_3_0_FLASH_HIGH"
+          },
+          mode: "effort",
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ],
+          requiresEffort: true
+        },
+        {
+          provider: "devin",
+          id: "glm-5-2",
+          name: "GLM-5.2",
+          members: [
+            "glm-5-2",
+            "glm-5-2-none",
+            "glm-5-2-max"
+          ],
+          routing: {
+            high: "glm-5-2",
+            xhigh: "glm-5-2"
+          },
+          mode: "effort",
+          efforts: [
+            "high",
+            "xhigh"
+          ],
+          requiresEffort: true
+        },
+        {
+          provider: "devin",
+          id: "glm-5-2-1m",
+          name: "GLM-5.2 1M",
+          members: [
+            "glm-5-2-none-1m",
+            "glm-5-2-1m",
+            "glm-5-2-max-1m"
+          ],
+          routing: {
+            off: "glm-5-2-none-1m",
+            high: "glm-5-2-1m",
+            xhigh: "glm-5-2-max-1m"
+          },
+          mode: "effort",
+          efforts: [
+            "high",
+            "xhigh"
+          ]
+        },
+        {
+          provider: "devin",
+          id: "gemini-3-7-flash",
+          name: "Gemini 3.7 Flash",
+          members: [
+            "gemini-3-7-flash-medium",
+            "gemini-3-7-flash-minimal",
+            "gemini-3-7-flash-low",
+            "gemini-3-7-flash-high"
+          ],
+          routing: {
+            minimal: "gemini-3-7-flash-minimal",
+            low: "gemini-3-7-flash-low",
+            medium: "gemini-3-7-flash-medium",
+            high: "gemini-3-7-flash-high"
+          },
+          mode: "effort",
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ],
+          defaultLevel: "medium",
+          requiresEffort: true,
+          defaultMember: "gemini-3-7-flash-medium"
+        },
+        {
+          provider: "devin",
+          id: "swe-1-7-lightning",
+          name: "SWE-1.7 Lightning",
+          members: [
+            "swe-1-7-lightning-medium",
+            "swe-1-7-lightning"
+          ],
+          routing: {
+            medium: "swe-1-7-lightning-medium",
+            max: "swe-1-7-lightning"
+          },
+          mode: "effort",
+          efforts: [
+            "medium",
+            "max"
+          ],
+          defaultLevel: "medium",
+          requiresEffort: true,
+          defaultMember: "swe-1-7-lightning-medium"
+        },
+        {
+          provider: "devin",
+          id: "grok-4-6",
+          name: "Grok 4.6",
+          members: [
+            "grok-4-6-medium",
+            "grok-4-6-low",
+            "grok-4-6-high",
+            "grok-4-6-xhigh"
+          ],
+          routing: {
+            low: "grok-4-6-low",
+            medium: "grok-4-6-medium",
+            high: "grok-4-6-high",
+            xhigh: "grok-4-6-xhigh"
+          },
+          mode: "effort",
+          efforts: [
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ],
+          defaultLevel: "medium",
+          requiresEffort: true,
+          defaultMember: "grok-4-6-medium"
+        },
+        {
+          provider: "devin",
+          id: "deepseek-v4-flash",
+          name: "DeepSeek V4 Flash",
+          members: [
+            "deepseek-v4-flash-high",
+            "deepseek-v4-flash-low",
+            "deepseek-v4-flash-max"
+          ],
+          routing: {
+            low: "deepseek-v4-flash-low",
+            high: "deepseek-v4-flash-high",
+            max: "deepseek-v4-flash-max"
+          },
+          mode: "effort",
+          efforts: [
+            "low",
+            "high",
+            "max"
+          ],
+          defaultLevel: "high",
+          requiresEffort: true,
+          defaultMember: "deepseek-v4-flash-high"
+        },
+        {
+          provider: "devin",
+          id: "deepseek-v4-pro",
+          name: "DeepSeek V4 Pro",
+          members: [
+            "deepseek-v4-pro-high",
+            "deepseek-v4-pro-low",
+            "deepseek-v4-pro-max"
+          ],
+          routing: {
+            low: "deepseek-v4-pro-low",
+            high: "deepseek-v4-pro-high",
+            max: "deepseek-v4-pro-max"
+          },
+          mode: "effort",
+          efforts: [
+            "low",
+            "high",
+            "max"
+          ],
+          defaultLevel: "high",
+          requiresEffort: true,
+          defaultMember: "deepseek-v4-pro-high"
+        },
+        {
+          provider: "devin",
+          id: "nemotron-3-ultra",
+          name: "Nemotron 3 Ultra",
+          members: [
+            "nemotron-3-ultra-high",
+            "nemotron-3-ultra-none",
+            "nemotron-3-ultra-medium"
+          ],
+          routing: {
+            off: "nemotron-3-ultra-none",
+            medium: "nemotron-3-ultra-medium",
+            high: "nemotron-3-ultra-high"
+          },
+          mode: "effort",
+          efforts: [
+            "medium",
+            "high"
+          ],
+          defaultLevel: "high",
+          defaultMember: "nemotron-3-ultra-high"
+        },
+        {
+          provider: "devin",
+          id: "claude-haiku-4-5",
+          name: "Claude Haiku 4.5",
+          members: [
+            "MODEL_PRIVATE_11"
+          ],
+          routing: {},
+          noThinking: true
+        },
+        {
+          provider: "cursor",
+          id: "cursor-grok-4.5",
+          name: "Grok 4.5",
+          members: [
+            "cursor-grok-4.5-low",
+            "cursor-grok-4.5-medium",
+            "cursor-grok-4.5-high"
+          ],
+          routing: {
+            low: "cursor-grok-4.5-low",
+            medium: "cursor-grok-4.5-medium",
+            high: "cursor-grok-4.5-high"
+          },
+          mode: "effort",
+          efforts: [
+            "low",
+            "medium",
+            "high"
+          ],
+          requiresEffort: true,
+          defaultMember: "cursor-grok-4.5-medium"
+        },
+        {
+          provider: "cursor",
+          id: "cursor-grok-4.5-fast",
+          name: "Grok 4.5 Fast",
+          members: [
+            "cursor-grok-4.5-low-fast",
+            "cursor-grok-4.5-medium-fast",
+            "cursor-grok-4.5-high-fast"
+          ],
+          routing: {
+            low: "cursor-grok-4.5-low-fast",
+            medium: "cursor-grok-4.5-medium-fast",
+            high: "cursor-grok-4.5-high-fast"
+          },
+          mode: "effort",
+          efforts: [
+            "low",
+            "medium",
+            "high"
+          ],
+          requiresEffort: true,
+          defaultMember: "cursor-grok-4.5-medium-fast"
+        },
+        {
+          provider: "cursor",
+          id: "cursor-grok-4.6",
+          name: "Grok 4.6",
+          members: [
+            "cursor-grok-4.6-low",
+            "cursor-grok-4.6-medium",
+            "cursor-grok-4.6-high",
+            "cursor-grok-4.6-xhigh"
+          ],
+          routing: {
+            low: "cursor-grok-4.6-low",
+            medium: "cursor-grok-4.6-medium",
+            high: "cursor-grok-4.6-high",
+            xhigh: "cursor-grok-4.6-xhigh"
+          },
+          mode: "effort",
+          efforts: [
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ],
+          requiresEffort: true,
+          defaultMember: "cursor-grok-4.6-medium"
+        },
+        {
+          provider: "cursor",
+          id: "cursor-grok-4.6-fast",
+          name: "Grok 4.6 Fast",
+          members: [
+            "cursor-grok-4.6-low-fast",
+            "cursor-grok-4.6-medium-fast",
+            "cursor-grok-4.6-high-fast",
+            "cursor-grok-4.6-xhigh-fast"
+          ],
+          routing: {
+            low: "cursor-grok-4.6-low-fast",
+            medium: "cursor-grok-4.6-medium-fast",
+            high: "cursor-grok-4.6-high-fast",
+            xhigh: "cursor-grok-4.6-xhigh-fast"
+          },
+          mode: "effort",
+          efforts: [
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ],
+          requiresEffort: true,
+          defaultMember: "cursor-grok-4.6-medium-fast"
+        },
+        {
+          provider: "cursor",
+          id: "gpt-5.6-luna",
+          name: "GPT-5.6 Luna",
+          members: [
+            "gpt-5.6-luna-none",
+            "gpt-5.6-luna-low",
+            "gpt-5.6-luna-medium",
+            "gpt-5.6-luna-high",
+            "gpt-5.6-luna-xhigh",
+            "gpt-5.6-luna-max"
+          ],
+          routing: {
+            off: "gpt-5.6-luna-none",
+            low: "gpt-5.6-luna-low",
+            medium: "gpt-5.6-luna-medium",
+            high: "gpt-5.6-luna-high",
+            xhigh: "gpt-5.6-luna-xhigh",
+            max: "gpt-5.6-luna-max"
+          },
+          mode: "effort",
+          efforts: [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        },
+        {
+          provider: "cursor",
+          id: "gpt-5.6-luna-fast",
+          name: "GPT-5.6 Luna Fast",
+          members: [
+            "gpt-5.6-luna-none-fast",
+            "gpt-5.6-luna-low-fast",
+            "gpt-5.6-luna-medium-fast",
+            "gpt-5.6-luna-high-fast",
+            "gpt-5.6-luna-xhigh-fast",
+            "gpt-5.6-luna-max-fast"
+          ],
+          routing: {
+            off: "gpt-5.6-luna-none-fast",
+            low: "gpt-5.6-luna-low-fast",
+            medium: "gpt-5.6-luna-medium-fast",
+            high: "gpt-5.6-luna-high-fast",
+            xhigh: "gpt-5.6-luna-xhigh-fast",
+            max: "gpt-5.6-luna-max-fast"
+          },
+          mode: "effort",
+          efforts: [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        },
+        {
+          provider: "cursor",
+          id: "gpt-5.6-sol",
+          name: "GPT-5.6 Sol",
+          members: [
+            "gpt-5.6-sol-none",
+            "gpt-5.6-sol-low",
+            "gpt-5.6-sol-medium",
+            "gpt-5.6-sol-high",
+            "gpt-5.6-sol-xhigh",
+            "gpt-5.6-sol-max"
+          ],
+          routing: {
+            off: "gpt-5.6-sol-none",
+            low: "gpt-5.6-sol-low",
+            medium: "gpt-5.6-sol-medium",
+            high: "gpt-5.6-sol-high",
+            xhigh: "gpt-5.6-sol-xhigh",
+            max: "gpt-5.6-sol-max"
+          },
+          mode: "effort",
+          efforts: [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        },
+        {
+          provider: "cursor",
+          id: "gpt-5.6-sol-fast",
+          name: "GPT-5.6 Sol Fast",
+          members: [
+            "gpt-5.6-sol-none-fast",
+            "gpt-5.6-sol-low-fast",
+            "gpt-5.6-sol-medium-fast",
+            "gpt-5.6-sol-high-fast",
+            "gpt-5.6-sol-xhigh-fast",
+            "gpt-5.6-sol-max-fast"
+          ],
+          routing: {
+            off: "gpt-5.6-sol-none-fast",
+            low: "gpt-5.6-sol-low-fast",
+            medium: "gpt-5.6-sol-medium-fast",
+            high: "gpt-5.6-sol-high-fast",
+            xhigh: "gpt-5.6-sol-xhigh-fast",
+            max: "gpt-5.6-sol-max-fast"
+          },
+          mode: "effort",
+          efforts: [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        },
+        {
+          provider: "cursor",
+          id: "gpt-5.6-terra",
+          name: "GPT-5.6 Terra",
+          members: [
+            "gpt-5.6-terra-none",
+            "gpt-5.6-terra-low",
+            "gpt-5.6-terra-medium",
+            "gpt-5.6-terra-high",
+            "gpt-5.6-terra-xhigh",
+            "gpt-5.6-terra-max"
+          ],
+          routing: {
+            off: "gpt-5.6-terra-none",
+            low: "gpt-5.6-terra-low",
+            medium: "gpt-5.6-terra-medium",
+            high: "gpt-5.6-terra-high",
+            xhigh: "gpt-5.6-terra-xhigh",
+            max: "gpt-5.6-terra-max"
+          },
+          mode: "effort",
+          efforts: [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        },
+        {
+          provider: "cursor",
+          id: "gpt-5.6-terra-fast",
+          name: "GPT-5.6 Terra Fast",
+          members: [
+            "gpt-5.6-terra-none-fast",
+            "gpt-5.6-terra-low-fast",
+            "gpt-5.6-terra-medium-fast",
+            "gpt-5.6-terra-high-fast",
+            "gpt-5.6-terra-xhigh-fast",
+            "gpt-5.6-terra-max-fast"
+          ],
+          routing: {
+            off: "gpt-5.6-terra-none-fast",
+            low: "gpt-5.6-terra-low-fast",
+            medium: "gpt-5.6-terra-medium-fast",
+            high: "gpt-5.6-terra-high-fast",
+            xhigh: "gpt-5.6-terra-xhigh-fast",
+            max: "gpt-5.6-terra-max-fast"
+          },
+          mode: "effort",
+          efforts: [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      ],
+      providerAliases: {
+        devin: {
+          claude: "claude-sonnet-5",
+          codex: "gpt-5-3-codex",
+          gemini: "gemini-3-7-flash",
+          gpt: "gpt-5-6-terra",
+          haiku: "claude-haiku-4-5",
+          opus: "claude-opus-5",
+          sonnet: "claude-sonnet-5",
+          swe: "swe-1-7-lightning",
+          "claude-haiku-4.5": "claude-haiku-4-5",
+          "gemini-3.7-flash": "gemini-3-7-flash",
+          "glm-5.2": "glm-5-2",
+          "gpt-5.6-luna": "gpt-5-6-luna",
+          "gpt-5.6-sol": "gpt-5-6-sol",
+          "gpt-5.6-terra": "gpt-5-6-terra",
+          "grok-4.6": "grok-4-6",
+          "swe-1.7": "swe-1-7",
+          "swe-1.7-lightning": "swe-1-7-lightning"
+        }
+      }
+    },
+    discovery: {
+      canonicalRecovery: [
+        "gmi-cloud",
+        "opencode-go",
+        "yolo-auto"
+      ],
+      responsesHintGroups: [
+        [
+          "opencode-go",
+          "opencode-zen"
+        ]
+      ],
+      responsesRouteModels: {
+        "opencode-go": [
+          "deepseek-v4-flash",
+          "muse-spark-1.2",
+          "muse-spark-1.3"
+        ]
+      },
+      billingVariantSuffixes: [
+        "-free",
+        "-contributor"
+      ],
+      trailingMarkers: [
+        "customtools",
+        "cloud",
+        "exacto",
+        "nitro",
+        "original",
+        "optimized",
+        "nvfp4",
+        "fp8",
+        "fp4",
+        "bf16",
+        "int8",
+        "int4",
+        "thinking",
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "free"
+      ],
+      referenceOnlyTrailingMarkers: [
+        "search"
+      ],
+      proReasoningAliases: {
+        openai: [
+          "gpt-5.6-luna",
+          "gpt-5.6-sol",
+          "gpt-5.6-terra"
+        ]
+      },
+      proReasoningSweep: [
+        "openai",
+        "openai-codex"
+      ],
+      canonicalFamilyTokens: [
+        "claude",
+        "gemini",
+        "gpt",
+        "grok",
+        "glm",
+        "qwen",
+        "minimax",
+        "kimi",
+        "deepseek",
+        "llama",
+        "gemma",
+        "nova",
+        "mistral",
+        "ministral",
+        "pixtral",
+        "codestral",
+        "devstral",
+        "magistral",
+        "ernie",
+        "doubao",
+        "seed",
+        "aion",
+        "olmo",
+        "molmo",
+        "nemotron",
+        "palmyra",
+        "command",
+        "codex",
+        "coder"
+      ],
+      wrapperPrefixes: [
+        "duo-chat-"
+      ],
+      syntheticPrefixes: [
+        "hf:"
+      ]
+    }
+  },
+  cascade: {
+    rules: [
+      {
+        source: "classes/amazon.kdl:9",
+        class: "amazon",
+        providers: [
+          "amazon-bedrock"
+        ],
+        family: "nova",
+        models: [
+          {
+            kind: "glob",
+            value: "*nova-2-lite-v1:0"
+          },
+          {
+            kind: "glob",
+            value: "*nova-lite-v1:0"
+          },
+          {
+            kind: "glob",
+            value: "*nova-micro-v1:0"
+          },
+          {
+            kind: "glob",
+            value: "*nova-premier-v1:0"
+          },
+          {
+            kind: "glob",
+            value: "*nova-pro-v1:0"
+          }
+        ],
+        wire: {
+          promptCacheMode: "explicit",
+          promptCacheMinimumTokens: 1024,
+          promptCacheMaximumCheckpoints: 4
+        }
+      },
+      {
+        source: "classes/amazon.kdl:17",
+        class: "amazon",
+        providers: [
+          "kilo",
+          "nanogpt",
+          "vercel-ai-gateway"
+        ],
+        family: "nova",
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      },
+      {
+        source: "classes/anthropic.kdl:5",
+        class: "anthropic",
+        family: "fable",
+        revision: [
+          {
+            op: ">=",
+            revision: "5.1.0"
+          }
+        ],
+        thinking: {
+          prefixBinding: true
+        }
+      },
+      {
+        source: "classes/anthropic.kdl:15",
+        class: "anthropic",
+        family: "fable",
+        revision: [
+          {
+            op: ">=",
+            revision: "5.0.0"
+          }
+        ],
+        wire: {
+          supportsServerCompaction: true
+        }
+      },
+      {
+        source: "classes/anthropic.kdl:20",
+        class: "anthropic",
+        family: "mythos",
+        revision: [
+          {
+            op: ">=",
+            revision: "5.0.0"
+          }
+        ],
+        wire: {
+          supportsServerCompaction: true
+        }
+      },
+      {
+        source: "classes/anthropic.kdl:25",
+        class: "anthropic",
+        family: "opus",
+        revision: [
+          {
+            op: ">=",
+            revision: "4.6.0"
+          }
+        ],
+        wire: {
+          supportsServerCompaction: true
+        }
+      },
+      {
+        source: "classes/anthropic.kdl:30",
+        class: "anthropic",
+        family: "sonnet",
+        revision: [
+          {
+            op: ">=",
+            revision: "4.6.0"
+          }
+        ],
+        wire: {
+          supportsServerCompaction: true
+        }
+      },
+      {
+        source: "classes/anthropic.kdl:36",
+        class: "anthropic",
+        providers: [
+          "anthropic",
+          "cloudflare-ai-gateway",
+          "google-vertex"
+        ],
+        family: "fable",
+        revision: [
+          {
+            op: ">=",
+            revision: "5.0.0"
+          }
+        ],
+        wire: {
+          supportsMidConversationSystem: true,
+          supportsMidConversationToolChanges: true,
+          supportsTurnScopedSystem: true
+        }
+      },
+      {
+        source: "classes/anthropic.kdl:41",
+        class: "anthropic",
+        providers: [
+          "anthropic",
+          "cloudflare-ai-gateway",
+          "google-vertex"
+        ],
+        family: "fable",
+        revision: [
+          {
+            op: ">=",
+            revision: "5.1.0"
+          }
+        ],
+        wire: {
+          supportsPerMessageEffort: true
+        }
+      },
+      {
+        source: "classes/anthropic.kdl:46",
+        class: "anthropic",
+        providers: [
+          "anthropic",
+          "cloudflare-ai-gateway",
+          "google-vertex"
+        ],
+        family: "mythos",
+        revision: [
+          {
+            op: ">=",
+            revision: "5.0.0"
+          }
+        ],
+        wire: {
+          supportsMidConversationSystem: true,
+          supportsMidConversationToolChanges: true,
+          supportsTurnScopedSystem: true
+        }
+      },
+      {
+        source: "classes/anthropic.kdl:51",
+        class: "anthropic",
+        providers: [
+          "anthropic",
+          "cloudflare-ai-gateway",
+          "google-vertex"
+        ],
+        family: "mythos",
+        revision: [
+          {
+            op: ">=",
+            revision: "5.1.0"
+          }
+        ],
+        wire: {
+          supportsPerMessageEffort: true
+        }
+      },
+      {
+        source: "classes/anthropic.kdl:56",
+        class: "anthropic",
+        providers: [
+          "anthropic",
+          "cloudflare-ai-gateway",
+          "google-vertex"
+        ],
+        family: "fable",
+        revision: [
+          {
+            op: ">=",
+            revision: "5.1.0"
+          }
+        ],
+        wire: {
+          supportsThinkingBindingControls: true
+        }
+      },
+      {
+        source: "classes/anthropic.kdl:61",
+        class: "anthropic",
+        providers: [
+          "anthropic",
+          "cloudflare-ai-gateway",
+          "google-vertex"
+        ],
+        family: "opus",
+        revision: [
+          {
+            op: ">=",
+            revision: "4.8.0"
+          }
+        ],
+        wire: {
+          supportsMidConversationSystem: true,
+          supportsMidConversationToolChanges: true,
+          supportsTurnScopedSystem: true
+        }
+      },
+      {
+        source: "classes/anthropic.kdl:66",
+        class: "anthropic",
+        providers: [
+          "anthropic",
+          "cloudflare-ai-gateway",
+          "google-vertex"
+        ],
+        family: "opus",
+        revision: [
+          {
+            op: ">=",
+            revision: "5.0.0"
+          }
+        ],
+        wire: {
+          supportsPerMessageEffort: true
+        }
+      },
+      {
+        source: "classes/anthropic.kdl:71",
+        class: "anthropic",
+        providers: [
+          "aimlapi",
+          "gitlab-duo",
+          "kilo",
+          "nanogpt",
+          "venice"
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      },
+      {
+        source: "classes/anthropic.kdl:77",
+        class: "anthropic",
+        providers: [
+          "amazon-bedrock",
+          "anthropic",
+          "cloudflare-ai-gateway",
+          "github-copilot",
+          "gitlab-duo",
+          "google-antigravity",
+          "google-vertex",
+          "opencode-zen",
+          "vercel-ai-gateway",
+          "zenmux"
+        ],
+        family: "sonnet",
+        revision: [
+          {
+            op: ">=",
+            revision: "3.7.0"
+          },
+          {
+            op: "<",
+            revision: "4.6.0"
+          }
+        ],
+        thinking: {
+          mode: "budget"
+        }
+      },
+      {
+        source: "classes/anthropic.kdl:84",
+        class: "anthropic",
+        providers: [
+          "amazon-bedrock",
+          "anthropic",
+          "cloudflare-ai-gateway",
+          "github-copilot",
+          "gitlab-duo",
+          "google-vertex",
+          "opencode-zen",
+          "vercel-ai-gateway"
+        ],
+        family: "haiku",
+        thinking: {
+          mode: "budget"
+        }
+      },
+      {
+        source: "classes/anthropic.kdl:91",
+        class: "anthropic",
+        providers: [
+          "amazon-bedrock",
+          "anthropic",
+          "cloudflare-ai-gateway",
+          "github-copilot",
+          "gitlab-duo",
+          "google-vertex",
+          "opencode-zen",
+          "vercel-ai-gateway",
+          "zenmux"
+        ],
+        family: "opus",
+        revision: [
+          {
+            op: ">=",
+            revision: "4.5.0"
+          },
+          {
+            op: "<",
+            revision: "4.6.0"
+          }
+        ],
+        thinking: {
+          mode: "anthropic-budget-effort"
+        }
+      },
+      {
+        source: "classes/anthropic.kdl:99",
+        class: "anthropic",
+        providers: [
+          "amazon-bedrock",
+          "anthropic",
+          "cloudflare-ai-gateway",
+          "github-copilot",
+          "google-vertex",
+          "opencode-zen",
+          "openrouter",
+          "vercel-ai-gateway",
+          "zenmux"
+        ],
+        family: "opus",
+        revision: [
+          {
+            op: ">=",
+            revision: "4.6.0"
+          },
+          {
+            op: "<",
+            revision: "4.7.0"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "low",
+            "medium",
+            "high",
+            "max"
+          ]
+        }
+      },
+      {
+        source: "classes/anthropic.kdl:106",
+        class: "anthropic",
+        providers: [
+          "amazon-bedrock",
+          "anthropic",
+          "cloudflare-ai-gateway",
+          "github-copilot",
+          "google-vertex",
+          "opencode-zen",
+          "vercel-ai-gateway",
+          "zenmux"
+        ],
+        revision: [
+          {
+            op: ">=",
+            revision: "4.7.0"
+          },
+          {
+            op: "<",
+            revision: "45.1.0"
+          }
+        ],
+        thinking: {
+          mode: "anthropic-adaptive"
+        }
+      },
+      {
+        source: "classes/anthropic.kdl:113",
+        class: "anthropic",
+        providers: [
+          "amazon-bedrock",
+          "anthropic",
+          "cloudflare-ai-gateway",
+          "opencode-zen",
+          "vercel-ai-gateway",
+          "zenmux"
+        ],
+        family: "opus",
+        revision: [
+          {
+            op: ">=",
+            revision: "4.0.0"
+          },
+          {
+            op: "<",
+            revision: "4.5.0"
+          }
+        ],
+        thinking: {
+          mode: "budget"
+        }
+      },
+      {
+        source: "classes/anthropic.kdl:120",
+        class: "anthropic",
+        providers: [
+          "amazon-bedrock",
+          "cursor",
+          "google-antigravity",
+          "openrouter"
+        ],
+        family: "sonnet",
+        revision: [
+          {
+            op: ">=",
+            revision: "4.6.0"
+          },
+          {
+            op: "<",
+            revision: "5.0.0"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      },
+      {
+        source: "classes/anthropic.kdl:124",
+        class: "anthropic",
+        providers: [
+          "amazon-bedrock",
+          "cursor",
+          "google-antigravity",
+          "openrouter"
+        ],
+        revision: [
+          {
+            op: ">=",
+            revision: "3.7.0"
+          },
+          {
+            op: "<",
+            revision: "4.6.0"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      },
+      {
+        source: "classes/anthropic.kdl:130",
+        class: "anthropic",
+        providers: [
+          "amazon-bedrock",
+          "google-antigravity"
+        ],
+        family: "sonnet",
+        revision: [
+          {
+            op: ">=",
+            revision: "4.6.0"
+          },
+          {
+            op: "<",
+            revision: "5.0.0"
+          }
+        ],
+        thinking: {
+          mode: "budget"
+        }
+      },
+      {
+        source: "classes/anthropic.kdl:137",
+        class: "anthropic",
+        providers: [
+          "anthropic",
+          "cloudflare-ai-gateway",
+          "github-copilot",
+          "google-vertex",
+          "opencode-zen",
+          "openrouter",
+          "vercel-ai-gateway",
+          "zenmux"
+        ],
+        revision: [
+          {
+            op: ">=",
+            revision: "4.7.0"
+          },
+          {
+            op: "<",
+            revision: "45.1.0"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      },
+      {
+        source: "classes/anthropic.kdl:144",
+        class: "anthropic",
+        providers: [
+          "anthropic",
+          "cloudflare-ai-gateway",
+          "github-copilot",
+          "google-vertex",
+          "opencode-zen",
+          "vercel-ai-gateway",
+          "zenmux"
+        ],
+        family: "sonnet",
+        revision: [
+          {
+            op: ">=",
+            revision: "4.6.0"
+          },
+          {
+            op: "<",
+            revision: "5.0.0"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      },
+      {
+        source: "classes/anthropic.kdl:148",
+        class: "anthropic",
+        providers: [
+          "anthropic",
+          "cloudflare-ai-gateway",
+          "github-copilot",
+          "google-vertex",
+          "opencode-zen",
+          "vercel-ai-gateway",
+          "zenmux"
+        ],
+        revision: [
+          {
+            op: ">=",
+            revision: "4.6.0"
+          },
+          {
+            op: "<",
+            revision: "4.7.0"
+          }
+        ],
+        thinking: {
+          mode: "anthropic-adaptive"
+        }
+      },
+      {
+        source: "classes/anthropic.kdl:155",
+        class: "anthropic",
+        providers: [
+          "anthropic"
+        ],
+        family: "opus",
+        revision: [
+          {
+            op: "=",
+            revision: "4.5.0"
+          }
+        ],
+        catalog: {
+          costPatch: {
+            cacheRead: 0.5,
+            cacheWrite: 6.25
+          }
+        }
+      },
+      {
+        source: "classes/anthropic.kdl:165",
+        class: "anthropic",
+        providers: [
+          "anthropic"
+        ],
+        family: "fable",
+        catalog: {
+          costPatch: {
+            input: 10,
+            output: 50,
+            cacheRead: 1,
+            cacheWrite: 12.5
+          },
+          limitsPatch: {
+            contextWindow: 1e6,
+            maxTokens: 128000
+          }
+        }
+      },
+      {
+        source: "classes/anthropic.kdl:177",
+        class: "anthropic",
+        providers: [
+          "anthropic"
+        ],
+        family: "mythos",
+        catalog: {
+          costPatch: {
+            input: 10,
+            output: 50,
+            cacheRead: 1,
+            cacheWrite: 12.5
+          },
+          limitsPatch: {
+            contextWindow: 1e6,
+            maxTokens: 128000
+          }
+        }
+      },
+      {
+        source: "classes/anthropic.kdl:195",
+        class: "anthropic",
+        providers: [
+          "amazon-bedrock"
+        ],
+        family: "opus",
+        revision: [
+          {
+            op: ">=",
+            revision: "4.0.0"
+          },
+          {
+            op: "<",
+            revision: "4.5.0"
+          }
+        ],
+        wire: {
+          promptCacheMode: "explicit",
+          promptCacheMinimumTokens: 1024,
+          promptCacheMaximumCheckpoints: 4
+        }
+      },
+      {
+        source: "classes/anthropic.kdl:200",
+        class: "anthropic",
+        providers: [
+          "amazon-bedrock"
+        ],
+        family: "opus",
+        revision: [
+          {
+            op: "=",
+            revision: "4.5.0"
+          }
+        ],
+        wire: {
+          promptCacheMode: "explicit",
+          promptCacheMinimumTokens: 4096,
+          promptCacheMaximumCheckpoints: 4,
+          supportsLongPromptCacheRetention: true
+        }
+      },
+      {
+        source: "classes/anthropic.kdl:206",
+        class: "anthropic",
+        providers: [
+          "amazon-bedrock"
+        ],
+        family: "opus",
+        revision: [
+          {
+            op: "=",
+            revision: "4.6.0"
+          }
+        ],
+        wire: {
+          promptCacheMode: "explicit",
+          promptCacheMinimumTokens: 4096,
+          promptCacheMaximumCheckpoints: 4
+        },
+        catalog: {
+          costPatch: {
+            cacheRead: 0.5,
+            cacheWrite: 6.25
+          },
+          limitsPatch: {
+            contextWindow: 1e6,
+            maxTokens: 128000
+          }
+        }
+      },
+      {
+        source: "classes/anthropic.kdl:220",
+        class: "anthropic",
+        providers: [
+          "amazon-bedrock"
+        ],
+        family: "opus",
+        revision: [
+          {
+            op: ">=",
+            revision: "4.7.0"
+          },
+          {
+            op: "<",
+            revision: "5.0.0"
+          }
+        ],
+        wire: {
+          promptCacheMode: "explicit",
+          promptCacheMinimumTokens: 4096,
+          promptCacheMaximumCheckpoints: 4,
+          supportsLongPromptCacheRetention: true
+        }
+      },
+      {
+        source: "classes/anthropic.kdl:226",
+        class: "anthropic",
+        providers: [
+          "amazon-bedrock"
+        ],
+        family: "opus",
+        revision: [
+          {
+            op: ">=",
+            revision: "5.0.0"
+          }
+        ],
+        wire: {
+          promptCacheMode: "explicit",
+          promptCacheMinimumTokens: 512,
+          promptCacheMaximumCheckpoints: 4,
+          supportsLongPromptCacheRetention: true
+        }
+      },
+      {
+        source: "classes/anthropic.kdl:235",
+        class: "anthropic",
+        providers: [
+          "amazon-bedrock"
+        ],
+        family: "sonnet",
+        revision: [
+          {
+            op: "=",
+            revision: "3.5.0"
+          }
+        ],
+        models: [
+          {
+            kind: "glob",
+            value: "*3-5-sonnet-20241022-v2*"
+          }
+        ],
+        wire: {
+          promptCacheMode: "explicit",
+          promptCacheMinimumTokens: 1024,
+          promptCacheMaximumCheckpoints: 4
+        }
+      },
+      {
+        source: "classes/anthropic.kdl:241",
+        class: "anthropic",
+        providers: [
+          "amazon-bedrock"
+        ],
+        family: "sonnet",
+        revision: [
+          {
+            op: "=",
+            revision: "3.7.0"
+          }
+        ],
+        wire: {
+          promptCacheMode: "explicit",
+          promptCacheMinimumTokens: 1024,
+          promptCacheMaximumCheckpoints: 4
+        }
+      },
+      {
+        source: "classes/anthropic.kdl:246",
+        class: "anthropic",
+        providers: [
+          "amazon-bedrock"
+        ],
+        family: "sonnet",
+        revision: [
+          {
+            op: ">=",
+            revision: "4.0.0"
+          },
+          {
+            op: "<",
+            revision: "4.5.0"
+          }
+        ],
+        wire: {
+          promptCacheMode: "explicit",
+          promptCacheMinimumTokens: 1024,
+          promptCacheMaximumCheckpoints: 4
+        }
+      },
+      {
+        source: "classes/anthropic.kdl:251",
+        class: "anthropic",
+        providers: [
+          "amazon-bedrock"
+        ],
+        family: "sonnet",
+        revision: [
+          {
+            op: "=",
+            revision: "4.5.0"
+          }
+        ],
+        wire: {
+          promptCacheMode: "explicit",
+          promptCacheMinimumTokens: 4096,
+          promptCacheMaximumCheckpoints: 4,
+          supportsLongPromptCacheRetention: true
+        }
+      },
+      {
+        source: "classes/anthropic.kdl:257",
+        class: "anthropic",
+        providers: [
+          "amazon-bedrock"
+        ],
+        family: "sonnet",
+        revision: [
+          {
+            op: "=",
+            revision: "4.6.0"
+          }
+        ],
+        wire: {
+          promptCacheMode: "explicit",
+          promptCacheMinimumTokens: 1024,
+          promptCacheMaximumCheckpoints: 4
+        }
+      },
+      {
+        source: "classes/anthropic.kdl:262",
+        class: "anthropic",
+        providers: [
+          "amazon-bedrock"
+        ],
+        family: "sonnet",
+        revision: [
+          {
+            op: ">=",
+            revision: "5.0.0"
+          }
+        ],
+        wire: {
+          promptCacheMode: "explicit",
+          promptCacheMinimumTokens: 4096,
+          promptCacheMaximumCheckpoints: 4,
+          supportsLongPromptCacheRetention: true
+        }
+      },
+      {
+        source: "classes/anthropic.kdl:270",
+        class: "anthropic",
+        providers: [
+          "amazon-bedrock"
+        ],
+        family: "haiku",
+        revision: [
+          {
+            op: "=",
+            revision: "3.5.0"
+          }
+        ],
+        wire: {
+          promptCacheMode: "explicit",
+          promptCacheMinimumTokens: 2048,
+          promptCacheMaximumCheckpoints: 4
+        }
+      },
+      {
+        source: "classes/anthropic.kdl:275",
+        class: "anthropic",
+        providers: [
+          "amazon-bedrock"
+        ],
+        family: "haiku",
+        revision: [
+          {
+            op: ">=",
+            revision: "4.5.0"
+          }
+        ],
+        wire: {
+          promptCacheMode: "explicit",
+          promptCacheMinimumTokens: 4096,
+          promptCacheMaximumCheckpoints: 4,
+          supportsLongPromptCacheRetention: true
+        }
+      },
+      {
+        source: "classes/anthropic.kdl:283",
+        class: "anthropic",
+        providers: [
+          "amazon-bedrock"
+        ],
+        family: "fable",
+        revision: [
+          {
+            op: ">=",
+            revision: "5.0.0"
+          }
+        ],
+        wire: {
+          promptCacheMode: "explicit",
+          promptCacheMinimumTokens: 1024,
+          promptCacheMaximumCheckpoints: 4,
+          supportsLongPromptCacheRetention: true
+        }
+      },
+      {
+        source: "classes/anthropic.kdl:293",
+        class: "anthropic",
+        family: "haiku",
+        revision: [
+          {
+            op: "=",
+            revision: "3.5.0"
+          }
+        ],
+        wire: {
+          injectClaudeCodeInstruction: false
+        }
+      },
+      {
+        source: "classes/anthropic.kdl:299",
+        class: "anthropic",
+        providers: [
+          "google-antigravity",
+          "google-gemini-cli"
+        ],
+        wire: {
+          supportsFunctionPartId: true,
+          ccaLegacyParametersSchema: true
+        }
+      },
+      {
+        source: "classes/anthropic.kdl:303",
+        class: "anthropic",
+        providers: [
+          "google-antigravity"
+        ],
+        wire: {
+          dropUnsignedThinking: true,
+          claudeThinkingBetaHeader: true,
+          antigravityClaudeToolMode: true,
+          antigravityUsageLabel: "true"
+        }
+      },
+      {
+        source: "classes/baidu.kdl:5",
+        class: "baidu",
+        providers: [
+          "aimlapi",
+          "kilo",
+          "nanogpt",
+          "novita",
+          "zenmux"
+        ],
+        family: "ernie",
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      },
+      {
+        source: "classes/bytedance.kdl:5",
+        class: "bytedance",
+        providers: [
+          "nanogpt",
+          "zenmux"
+        ],
+        family: "doubao",
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      },
+      {
+        source: "classes/cohere.kdl:4",
+        class: "cohere",
+        providers: [
+          "kilo"
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      },
+      {
+        source: "classes/deepseek.kdl:7",
+        class: "deepseek",
+        providers: [
+          "aiand",
+          "aimlapi",
+          "alibaba-token-plan",
+          "baseten",
+          "coreweave",
+          "deepseek",
+          "fireworks",
+          "huggingface",
+          "kilo",
+          "nanogpt",
+          "novita",
+          "nvidia",
+          "opencode-go",
+          "opencode-zen",
+          "together",
+          "venice",
+          "wafer-serverless",
+          "zenmux"
+        ],
+        family: "pro",
+        thinking: {
+          efforts: [
+            "low",
+            "high",
+            "max"
+          ]
+        }
+      },
+      {
+        source: "classes/deepseek.kdl:14",
+        class: "deepseek",
+        providers: [
+          "aiand",
+          "aimlapi",
+          "coreweave",
+          "deepseek",
+          "fireworks",
+          "gmi-cloud",
+          "huggingface",
+          "kilo",
+          "nanogpt",
+          "novita",
+          "nvidia",
+          "ollama-cloud",
+          "opencode-go",
+          "opencode-zen",
+          "openrouter",
+          "together",
+          "venice",
+          "wafer-serverless",
+          "zenmux"
+        ],
+        family: "flash",
+        thinking: {
+          efforts: [
+            "low",
+            "high",
+            "max"
+          ]
+        }
+      },
+      {
+        source: "classes/deepseek.kdl:21",
+        class: "deepseek",
+        family: "pro",
+        thinking: {
+          efforts: [
+            "low",
+            "high",
+            "max"
+          ]
+        }
+      },
+      {
+        source: "classes/deepseek.kdl:24",
+        class: "deepseek",
+        family: "flash",
+        thinking: {
+          efforts: [
+            "low",
+            "high",
+            "max"
+          ]
+        }
+      },
+      {
+        source: "classes/deepseek.kdl:27",
+        class: "deepseek",
+        family: "v4",
+        thinking: {
+          efforts: [
+            "low",
+            "high",
+            "max"
+          ]
+        }
+      },
+      {
+        source: "classes/deepseek.kdl:30",
+        class: "deepseek",
+        family: "r1",
+        thinking: {
+          efforts: [
+            "high",
+            "max"
+          ]
+        }
+      },
+      {
+        source: "classes/deepseek.kdl:33",
+        class: "deepseek",
+        family: "v3",
+        thinking: {
+          efforts: [
+            "high",
+            "max"
+          ]
+        }
+      },
+      {
+        source: "classes/deepseek.kdl:36",
+        class: "deepseek",
+        family: "reasoner",
+        thinking: {
+          efforts: [
+            "high",
+            "max"
+          ]
+        }
+      },
+      {
+        source: "classes/deepseek.kdl:42",
+        class: "deepseek",
+        providers: [
+          "openrouter"
+        ],
+        family: "pro",
+        models: [
+          {
+            kind: "glob",
+            value: "*deepseek-v4-pro-0813*"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "low",
+            "high",
+            "max"
+          ]
+        }
+      },
+      {
+        source: "classes/deepseek.kdl:40",
+        class: "deepseek",
+        providers: [
+          "openrouter"
+        ],
+        family: "pro",
+        thinking: {
+          efforts: [
+            "high"
+          ]
+        }
+      },
+      {
+        source: "classes/deepseek.kdl:46",
+        class: "deepseek",
+        providers: [
+          "openrouter"
+        ],
+        family: "v4",
+        thinking: {
+          efforts: [
+            "high"
+          ]
+        }
+      },
+      {
+        source: "classes/deepseek.kdl:49",
+        class: "deepseek",
+        providers: [
+          "openrouter"
+        ],
+        family: "r1",
+        thinking: {
+          efforts: [
+            "high"
+          ]
+        }
+      },
+      {
+        source: "classes/deepseek.kdl:52",
+        class: "deepseek",
+        providers: [
+          "openrouter"
+        ],
+        family: "v3",
+        thinking: {
+          efforts: [
+            "high"
+          ]
+        }
+      },
+      {
+        source: "classes/deepseek.kdl:55",
+        class: "deepseek",
+        providers: [
+          "openrouter"
+        ],
+        family: "reasoner",
+        thinking: {
+          efforts: [
+            "high"
+          ]
+        }
+      },
+      {
+        source: "classes/deepseek.kdl:59",
+        class: "deepseek",
+        providers: [
+          "alibaba-token-plan",
+          "deepseek"
+        ],
+        wire: {
+          supportsDeveloperRole: false
+        }
+      },
+      {
+        source: "classes/deepseek.kdl:63",
+        class: "deepseek",
+        providers: [
+          "deepseek",
+          "opencode-go"
+        ],
+        family: "pro",
+        wire: {
+          maxTokensField: "max_tokens",
+          reasoningContentField: "reasoning_content",
+          requiresReasoningContentForToolCalls: true
+        }
+      },
+      {
+        source: "classes/deepseek.kdl:70",
+        class: "deepseek",
+        models: [
+          {
+            kind: "token",
+            value: "ocr"
+          }
+        ],
+        wire: {
+          stripImageInput: false
+        }
+      },
+      {
+        source: "classes/deepseek.kdl:73",
+        class: "deepseek",
+        models: [
+          {
+            kind: "token",
+            value: "vision"
+          }
+        ],
+        wire: {
+          stripImageInput: false
+        }
+      },
+      {
+        source: "classes/deepseek.kdl:76",
+        class: "deepseek",
+        providers: [
+          "ollama-cloud",
+          "nvidia",
+          "deepseek",
+          "fireworks",
+          "nanogpt",
+          "opencode-go",
+          "openrouter"
+        ],
+        wire: {
+          streamMarkupHealingPattern: "dsml"
+        }
+      },
+      {
+        source: "classes/deepseek.kdl:3",
+        class: "deepseek",
+        wire: {
+          stripImageInput: true,
+          thinkingLoopGuard: "deepseek"
+        }
+      },
+      {
+        source: "classes/gemini.kdl:9",
+        class: "gemini",
+        family: "pro",
+        revision: [
+          {
+            op: ">=",
+            revision: "2.5.0"
+          },
+          {
+            op: "<",
+            revision: "3.0.0"
+          }
+        ],
+        thinking: {
+          requiresEffort: true
+        }
+      },
+      {
+        source: "classes/gemini.kdl:12",
+        class: "gemini",
+        family: "pro",
+        revision: [
+          {
+            op: "<",
+            revision: "3.0.0"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      },
+      {
+        source: "classes/gemini.kdl:15",
+        class: "gemini",
+        family: "pro",
+        revision: [
+          {
+            op: ">=",
+            revision: "3.0.0"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "low",
+            "high"
+          ]
+        }
+      },
+      {
+        source: "classes/gemini.kdl:20",
+        class: "gemini",
+        family: "flash",
+        revision: [
+          {
+            op: ">=",
+            revision: "0.0.0"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      },
+      {
+        source: "classes/gemini.kdl:25",
+        class: "gemini",
+        family: "lite",
+        revision: [
+          {
+            op: ">=",
+            revision: "0.0.0"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      },
+      {
+        source: "classes/gemini.kdl:33",
+        class: "gemini",
+        providers: [
+          "google",
+          "google-vertex",
+          "opencode-zen"
+        ],
+        family: "pro",
+        revision: [
+          {
+            op: ">=",
+            revision: "2.5.0"
+          },
+          {
+            op: "<",
+            revision: "2.6.0"
+          }
+        ],
+        thinking: {
+          effortBudgets: {
+            minimal: 128,
+            low: 2048,
+            medium: 8192,
+            high: 32768,
+            xhigh: 32768,
+            max: 32768
+          }
+        }
+      },
+      {
+        source: "classes/gemini.kdl:45",
+        class: "gemini",
+        providers: [
+          "google",
+          "google-vertex",
+          "opencode-zen"
+        ],
+        family: "flash",
+        revision: [
+          {
+            op: ">=",
+            revision: "2.5.0"
+          },
+          {
+            op: "<",
+            revision: "2.6.0"
+          }
+        ],
+        thinking: {
+          effortBudgets: {
+            minimal: 128,
+            low: 2048,
+            medium: 8192,
+            high: 24576,
+            xhigh: 24576,
+            max: 24576
+          }
+        }
+      },
+      {
+        source: "classes/gemini.kdl:57",
+        class: "gemini",
+        providers: [
+          "google",
+          "google-vertex",
+          "opencode-zen"
+        ],
+        family: "lite",
+        revision: [
+          {
+            op: ">=",
+            revision: "2.5.0"
+          },
+          {
+            op: "<",
+            revision: "2.6.0"
+          }
+        ],
+        thinking: {
+          effortBudgets: {
+            minimal: 128,
+            low: 2048,
+            medium: 8192,
+            high: 24576,
+            xhigh: 24576,
+            max: 24576
+          }
+        }
+      },
+      {
+        source: "classes/gemini.kdl:79",
+        class: "gemini",
+        providers: [
+          "google",
+          "google-vertex",
+          "opencode-zen"
+        ],
+        family: "flash",
+        revision: [
+          {
+            op: ">=",
+            revision: "3.7.0"
+          },
+          {
+            op: "<",
+            revision: "3.8.0"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      },
+      {
+        source: "classes/gemini.kdl:85",
+        class: "gemini",
+        revision: [
+          {
+            op: ">=",
+            revision: "3.0.0"
+          }
+        ],
+        wire: {
+          multimodalFunctionResponse: true
+        },
+        thinking: {
+          requiresEffort: true
+        }
+      },
+      {
+        source: "classes/gemini.kdl:96",
+        class: "gemini",
+        apis: [
+          "google-generative-ai"
+        ],
+        revision: [
+          {
+            op: ">=",
+            revision: "3.0.0"
+          }
+        ],
+        wire: {
+          requiresSkipThoughtSignature: true,
+          supportsFunctionPartId: true
+        }
+      },
+      {
+        source: "classes/gemini.kdl:102",
+        class: "gemini",
+        providers: [
+          "google-antigravity",
+          "google-gemini-cli"
+        ],
+        family: "flash",
+        wire: {
+          streamFirstEventTimeoutMs: 60000,
+          flashStreamLeakWorkaround: true
+        }
+      },
+      {
+        source: "classes/gemini.kdl:3",
+        class: "gemini",
+        wire: {
+          thinkingLoopGuard: "gemini"
+        }
+      },
+      {
+        source: "classes/gemma.kdl:4",
+        class: "gemma",
+        providers: [
+          "aiand",
+          "aimlapi",
+          "cerebras",
+          "coreweave",
+          "huggingface",
+          "kilo",
+          "nanogpt",
+          "novita",
+          "nvidia",
+          "together",
+          "vercel-ai-gateway",
+          "zenmux"
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      },
+      {
+        source: "classes/gemma.kdl:8",
+        class: "gemma",
+        providers: [
+          "google",
+          "ollama-cloud",
+          "openrouter"
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      },
+      {
+        source: "classes/gemma.kdl:11",
+        class: "gemma",
+        providers: [
+          "google",
+          "vercel-ai-gateway"
+        ],
+        thinking: {
+          mode: "budget"
+        }
+      },
+      {
+        source: "classes/glm.kdl:6",
+        class: "glm",
+        providers: [
+          "zhipu-coding-plan",
+          "opencode-go",
+          "opencode-zen"
+        ],
+        revision: [
+          {
+            op: ">=",
+            revision: "5.0.0"
+          }
+        ],
+        wire: {
+          streamIdleTimeoutMs: 600000
+        }
+      },
+      {
+        source: "classes/glm.kdl:16",
+        class: "glm",
+        revision: [
+          {
+            op: ">=",
+            revision: "5.2.0"
+          },
+          {
+            op: "<",
+            revision: "5.3.0"
+          }
+        ],
+        priority: 10,
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "max"
+          ]
+        }
+      },
+      {
+        source: "classes/glm.kdl:20",
+        class: "glm",
+        providers: [
+          "zai",
+          "zhipu-coding-plan"
+        ],
+        revision: [
+          {
+            op: ">=",
+            revision: "5.2.0"
+          },
+          {
+            op: "<",
+            revision: "5.3.0"
+          }
+        ],
+        wire: {
+          zaiReasoningEffortDialect: true,
+          clampOutputToModelMax: true
+        }
+      },
+      {
+        source: "classes/glm.kdl:26",
+        class: "glm",
+        providers: [
+          "zai",
+          "zhipu-coding-plan",
+          "umans",
+          "ollama-cloud",
+          "baseten"
+        ],
+        revision: [
+          {
+            op: ">=",
+            revision: "5.2.0"
+          },
+          {
+            op: "<",
+            revision: "5.3.0"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "high",
+            "max"
+          ]
+        }
+      },
+      {
+        source: "classes/glm.kdl:32",
+        class: "glm",
+        providers: [
+          "vercel-ai-gateway"
+        ],
+        revision: [
+          {
+            op: ">=",
+            revision: "5.2.0"
+          },
+          {
+            op: "<",
+            revision: "5.3.0"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      },
+      {
+        source: "classes/glm.kdl:46",
+        class: "glm",
+        providers: [
+          "abliteration"
+        ],
+        revision: [
+          {
+            op: ">=",
+            revision: "5.2.0"
+          },
+          {
+            op: "<",
+            revision: "5.3.0"
+          }
+        ],
+        wire: {
+          reasoningEffortMap: {
+            xhigh: "max"
+          }
+        },
+        thinking: {
+          defaultLevel: "high",
+          efforts: [
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      },
+      {
+        source: "classes/glm.kdl:55",
+        class: "glm",
+        providers: [
+          "abliteration"
+        ],
+        revision: [
+          {
+            op: ">=",
+            revision: "5.3.0"
+          }
+        ],
+        wire: {
+          reasoningEffortMap: {
+            medium: "high",
+            xhigh: "max"
+          }
+        },
+        thinking: {
+          defaultLevel: "max",
+          efforts: [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          requiresEffort: true
+        }
+      },
+      {
+        source: "classes/glm.kdl:42",
+        class: "glm",
+        providers: [
+          "abliteration"
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      },
+      {
+        source: "classes/glm.kdl:68",
+        class: "glm",
+        providers: [
+          "zai",
+          "zhipu-coding-plan"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "glm-5.2"
+          },
+          {
+            kind: "exact",
+            value: "glm-5.3"
+          },
+          {
+            kind: "exact",
+            value: "glm-5.3-flash"
+          }
+        ],
+        catalog: {
+          limitsPatch: {
+            contextWindow: 1e6,
+            maxTokens: 131072
+          }
+        }
+      },
+      {
+        source: "classes/glm.kdl:78",
+        class: "glm",
+        providers: [
+          "zai"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "glm-5.3-flash"
+          }
+        ],
+        catalog: {
+          costPatch: {
+            input: 0.15,
+            output: 0.5,
+            cacheRead: 0.03,
+            cacheWrite: 0
+          }
+        }
+      },
+      {
+        source: "classes/glm.kdl:90",
+        class: "glm",
+        providers: [
+          "zai",
+          "zhipu-coding-plan"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "glm-5.3-flash"
+          }
+        ],
+        catalog: {
+          inputModalities: [
+            "text",
+            "image"
+          ]
+        }
+      },
+      {
+        source: "classes/glm.kdl:94",
+        class: "glm",
+        providers: [
+          "alibaba-coding-plan",
+          "alibaba-token-plan",
+          "wafer-serverless"
+        ],
+        wire: {
+          supportsDeveloperRole: false
+        }
+      },
+      {
+        source: "classes/glm.kdl:98",
+        class: "glm",
+        providers: [
+          "openrouter",
+          "zhipu-coding-plan"
+        ],
+        family: "air",
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      },
+      {
+        source: "classes/glm.kdl:109",
+        class: "glm",
+        models: [
+          {
+            kind: "glob",
+            value: "*glm-5.3"
+          },
+          {
+            kind: "glob",
+            value: "*glm-5.3-air"
+          },
+          {
+            kind: "glob",
+            value: "*glm-5.3-turbo"
+          },
+          {
+            kind: "glob",
+            value: "*glm-5.3-flash"
+          },
+          {
+            kind: "glob",
+            value: "*glm-5.3:*"
+          },
+          {
+            kind: "glob",
+            value: "*glm-5.3-flash-uncensored"
+          },
+          {
+            kind: "glob",
+            value: "*glm-5.3-free"
+          },
+          {
+            kind: "glob",
+            value: "*glm-5.3-highspeed"
+          },
+          {
+            kind: "glob",
+            value: "*glm-5.3-flash-lab"
+          }
+        ],
+        priority: 10,
+        thinking: {
+          defaultLevel: "max",
+          efforts: [
+            "low",
+            "high",
+            "max"
+          ],
+          requiresEffort: true
+        }
+      },
+      {
+        source: "classes/gpt-oss.kdl:7",
+        class: "gpt-oss",
+        providers: [
+          "baseten"
+        ],
+        thinking: {
+          efforts: [
+            "high",
+            "max"
+          ]
+        }
+      },
+      {
+        source: "classes/gpt-oss.kdl:10",
+        class: "gpt-oss",
+        providers: [
+          "amazon-bedrock",
+          "google-antigravity",
+          "ollama-cloud"
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      },
+      {
+        source: "classes/gpt-oss.kdl:13",
+        class: "gpt-oss",
+        providers: [
+          "venice",
+          "vercel-ai-gateway"
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      },
+      {
+        source: "classes/gpt-oss.kdl:3",
+        class: "gpt-oss",
+        thinking: {
+          efforts: [
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      },
+      {
+        source: "classes/kimi.kdl:8",
+        class: "kimi",
+        providers: [
+          "baseten",
+          "cline-pass",
+          "cloudflare-ai-gateway",
+          "coreweave",
+          "deepinfra",
+          "firepass",
+          "fireworks",
+          "huggingface",
+          "moonshot",
+          "novita",
+          "nvidia",
+          "opencode-go",
+          "opencode-zen",
+          "openrouter",
+          "together",
+          "wafer-serverless",
+          "zenmux"
+        ],
+        family: "k2.6",
+        wire: {
+          streamIdleTimeoutMs: 300000
+        }
+      },
+      {
+        source: "classes/kimi.kdl:14",
+        class: "kimi",
+        providers: [
+          "kimi-code",
+          "moonshot"
+        ],
+        family: "k3",
+        wire: {
+          streamIdleTimeoutMs: 300000
+        }
+      },
+      {
+        source: "classes/kimi.kdl:17",
+        class: "kimi",
+        providers: [
+          "kimi-code",
+          "moonshot"
+        ],
+        family: "k2.7-code",
+        wire: {
+          streamIdleTimeoutMs: 300000
+        }
+      },
+      {
+        source: "classes/kimi.kdl:23",
+        class: "kimi",
+        providers: [
+          "aiand",
+          "baseten",
+          "coreweave",
+          "fireworks",
+          "huggingface",
+          "kilo",
+          "nanogpt",
+          "novita",
+          "opencode-go",
+          "opencode-zen",
+          "together",
+          "vercel-ai-gateway",
+          "zenmux"
+        ],
+        family: "k2.7-code",
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      },
+      {
+        source: "classes/kimi.kdl:27",
+        class: "kimi",
+        family: "k3",
+        wire: {
+          reasoningEffortMap: {
+            minimal: "low",
+            medium: "high",
+            xhigh: "max",
+            max: "max"
+          }
+        },
+        thinking: {
+          defaultLevel: "max",
+          efforts: [
+            "low",
+            "high",
+            "max"
+          ],
+          requiresEffort: true
+        }
+      },
+      {
+        source: "classes/kimi.kdl:42",
+        class: "kimi",
+        providers: [
+          "alibaba-coding-plan",
+          "cursor",
+          "kimi-code",
+          "moonshot",
+          "ollama-cloud",
+          "openrouter"
+        ],
+        family: "k2.5",
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      },
+      {
+        source: "classes/kimi.kdl:46",
+        class: "kimi",
+        providers: [
+          "alibaba-coding-plan",
+          "github-copilot",
+          "wafer-serverless"
+        ],
+        wire: {
+          supportsDeveloperRole: false
+        }
+      },
+      {
+        source: "classes/kimi.kdl:51",
+        class: "kimi",
+        providers: [
+          "baseten",
+          "cloudflare-ai-gateway",
+          "coreweave",
+          "fireworks",
+          "huggingface",
+          "kilo",
+          "nanogpt",
+          "novita",
+          "nvidia",
+          "opencode-go",
+          "opencode-zen",
+          "together",
+          "vercel-ai-gateway",
+          "zenmux"
+        ],
+        family: "k2.6",
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      },
+      {
+        source: "classes/kimi.kdl:58",
+        class: "kimi",
+        providers: [
+          "cloudflare-ai-gateway",
+          "coreweave",
+          "fireworks",
+          "huggingface",
+          "kilo",
+          "nanogpt",
+          "novita",
+          "nvidia",
+          "opencode-go",
+          "opencode-zen",
+          "together",
+          "vercel-ai-gateway",
+          "zenmux"
+        ],
+        family: "k2.5",
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      },
+      {
+        source: "classes/kimi.kdl:63",
+        class: "kimi",
+        providers: [
+          "cursor",
+          "github-copilot",
+          "moonshot",
+          "ollama-cloud",
+          "openrouter",
+          "wafer-serverless"
+        ],
+        family: "k2.7-code",
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      },
+      {
+        source: "classes/kimi.kdl:68",
+        class: "kimi",
+        providers: [
+          "huggingface",
+          "moonshot",
+          "nanogpt",
+          "novita",
+          "nvidia",
+          "ollama-cloud",
+          "zenmux"
+        ],
+        family: "k2",
+        thinking: {
+          requiresEffort: true
+        }
+      },
+      {
+        source: "classes/kimi.kdl:73",
+        class: "kimi",
+        providers: [
+          "huggingface",
+          "nanogpt",
+          "novita",
+          "nvidia",
+          "opencode-zen",
+          "venice",
+          "vercel-ai-gateway",
+          "zenmux"
+        ],
+        family: "k2",
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      },
+      {
+        source: "classes/kimi.kdl:78",
+        class: "kimi",
+        providers: [
+          "kilo",
+          "moonshot",
+          "openrouter",
+          "vercel-ai-gateway",
+          "zenmux"
+        ],
+        family: "k2-thinking",
+        thinking: {
+          requiresEffort: true
+        }
+      },
+      {
+        source: "classes/kimi.kdl:83",
+        class: "kimi",
+        providers: [
+          "kilo",
+          "vercel-ai-gateway",
+          "zenmux"
+        ],
+        family: "k2-thinking",
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      },
+      {
+        source: "classes/kimi.kdl:88",
+        class: "kimi",
+        providers: [
+          "moonshot",
+          "ollama-cloud"
+        ],
+        family: "k2",
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      },
+      {
+        source: "classes/kimi.kdl:93",
+        class: "kimi",
+        providers: [
+          "moonshot",
+          "ollama-cloud",
+          "openrouter",
+          "wafer-serverless"
+        ],
+        family: "k2.6",
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      },
+      {
+        source: "classes/kimi.kdl:98",
+        class: "kimi",
+        providers: [
+          "moonshot",
+          "openrouter"
+        ],
+        family: "k2-thinking",
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      },
+      {
+        source: "classes/kimi.kdl:104",
+        class: "kimi",
+        models: [
+          {
+            kind: "glob",
+            value: "*kimi*k2*"
+          }
+        ],
+        wire: {
+          streamMarkupHealingPattern: "kimi"
+        }
+      },
+      {
+        source: "classes/kimi.kdl:108",
+        class: "kimi",
+        providers: [
+          "kimi-code",
+          "moonshot"
+        ],
+        family: "k3",
+        wire: {
+          nativeKimiK3Reasoning: true,
+          clampOutputToModelMax: true
+        }
+      },
+      {
+        source: "classes/meta.kdl:8",
+        class: "meta",
+        models: [
+          {
+            kind: "exact",
+            value: "muse-spark-1.3"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          mode: "effort"
+        }
+      },
+      {
+        source: "classes/meta.kdl:12",
+        class: "meta",
+        models: [
+          {
+            kind: "exact",
+            value: "muse-spark-1.1"
+          },
+          {
+            kind: "exact",
+            value: "muse-spark-1.2"
+          },
+          {
+            kind: "exact",
+            value: "muse-spark-1.2-contributor"
+          },
+          {
+            kind: "exact",
+            value: "muse-spark-1.3-contributor"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ],
+          mode: "effort"
+        }
+      },
+      {
+        source: "classes/meta.kdl:17",
+        class: "meta",
+        providers: [
+          "kilo",
+          "nvidia"
+        ],
+        family: "llama",
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      },
+      {
+        source: "classes/mimo.kdl:5",
+        class: "mimo",
+        providers: [
+          "xiaomi-token-plan-ams",
+          "xiaomi-token-plan-cn",
+          "xiaomi-token-plan-sgp"
+        ],
+        wire: {
+          thinkingFormat: "zai"
+        }
+      },
+      {
+        source: "classes/mimo.kdl:9",
+        class: "mimo",
+        providers: [
+          "xiaomi",
+          "xiaomi-token-plan-ams",
+          "xiaomi-token-plan-cn",
+          "xiaomi-token-plan-sgp"
+        ],
+        wire: {
+          streamIdleTimeoutMs: 300000
+        }
+      },
+      {
+        source: "classes/mimo.kdl:14",
+        class: "mimo",
+        providers: [
+          "aimlapi",
+          "cline-pass",
+          "deepinfra",
+          "huggingface",
+          "kilo",
+          "nanogpt",
+          "novita",
+          "opencode-go",
+          "opencode-zen",
+          "openrouter",
+          "venice",
+          "zenmux"
+        ],
+        wire: {
+          reasoningEffortMap: {
+            minimal: "low",
+            xhigh: "high"
+          }
+        }
+      },
+      {
+        source: "classes/mimo.kdl:23",
+        class: "mimo",
+        providers: [
+          "aimlapi",
+          "cline-pass",
+          "deepinfra",
+          "huggingface",
+          "kilo",
+          "nanogpt",
+          "novita",
+          "opencode-go",
+          "opencode-zen",
+          "openrouter",
+          "venice",
+          "zenmux"
+        ],
+        family: "v2",
+        thinking: {
+          efforts: [
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      },
+      {
+        source: "classes/mimo.kdl:28",
+        class: "mimo",
+        providers: [
+          "xiaomi",
+          "xiaomi-token-plan-ams",
+          "xiaomi-token-plan-cn",
+          "xiaomi-token-plan-sgp"
+        ],
+        family: "v2",
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      },
+      {
+        source: "classes/minimax.kdl:5",
+        class: "minimax",
+        family: "m2",
+        thinking: {
+          requiresEffort: true
+        }
+      },
+      {
+        source: "classes/minimax.kdl:12",
+        class: "minimax",
+        providers: [
+          "aimlapi",
+          "coreweave",
+          "fireworks",
+          "huggingface",
+          "kilo",
+          "nanogpt",
+          "novita",
+          "nvidia",
+          "opencode-go",
+          "opencode-zen",
+          "together",
+          "venice",
+          "wafer-serverless",
+          "zenmux"
+        ],
+        family: "m3",
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      },
+      {
+        source: "classes/minimax.kdl:20",
+        class: "minimax",
+        providers: [
+          "alibaba-coding-plan",
+          "amazon-bedrock",
+          "coreweave",
+          "fireworks",
+          "huggingface",
+          "kilo",
+          "minimax",
+          "minimax-cn",
+          "minimax-code",
+          "minimax-code-cn",
+          "nanogpt",
+          "novita",
+          "nvidia",
+          "ollama-cloud",
+          "opencode-go",
+          "opencode-zen",
+          "openrouter",
+          "together",
+          "venice",
+          "vercel-ai-gateway",
+          "zenmux"
+        ],
+        family: "m2",
+        thinking: {
+          requiresEffort: true
+        }
+      },
+      {
+        source: "classes/minimax.kdl:26",
+        class: "minimax",
+        family: "m2",
+        thinking: {
+          efforts: [
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      },
+      {
+        source: "classes/minimax.kdl:34",
+        class: "minimax",
+        providers: [
+          "charm-hyper",
+          "minimax",
+          "minimax-cn",
+          "minimax-code",
+          "minimax-code-cn"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "MiniMax-M3"
+          },
+          {
+            kind: "exact",
+            value: "minimax-m3"
+          }
+        ],
+        catalog: {
+          limitsPatch: {
+            contextWindow: 1e6,
+            maxTokens: 128000
+          }
+        }
+      },
+      {
+        source: "classes/minimax.kdl:41",
+        class: "minimax",
+        providers: [
+          "alibaba-coding-plan",
+          "minimax-code",
+          "minimax-code-cn",
+          "wafer-serverless"
+        ],
+        wire: {
+          supportsDeveloperRole: false
+        }
+      },
+      {
+        source: "classes/minimax.kdl:46",
+        class: "minimax",
+        providers: [
+          "amazon-bedrock",
+          "ollama-cloud"
+        ],
+        priority: 1,
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      },
+      {
+        source: "classes/minimax.kdl:50",
+        class: "minimax",
+        providers: [
+          "kilo",
+          "novita"
+        ],
+        family: "m1",
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      },
+      {
+        source: "classes/minimax.kdl:56",
+        class: "minimax",
+        providers: [
+          "minimax",
+          "minimax-cn",
+          "vercel-ai-gateway"
+        ],
+        family: "m2",
+        thinking: {
+          effortMap: {
+            low: "adaptive",
+            medium: "adaptive",
+            high: "adaptive"
+          }
+        }
+      },
+      {
+        source: "classes/minimax.kdl:64",
+        class: "minimax",
+        providers: [
+          "minimax",
+          "minimax-cn",
+          "vercel-ai-gateway"
+        ],
+        family: "m3",
+        thinking: {
+          effortMap: {
+            low: "adaptive",
+            medium: "adaptive",
+            high: "adaptive"
+          },
+          efforts: [
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      },
+      {
+        source: "classes/minimax.kdl:54",
+        class: "minimax",
+        providers: [
+          "minimax",
+          "minimax-cn",
+          "vercel-ai-gateway"
+        ],
+        thinking: {
+          mode: "anthropic-adaptive"
+        }
+      },
+      {
+        source: "classes/minimax.kdl:74",
+        class: "minimax",
+        providers: [
+          "minimax-code",
+          "minimax-code-cn"
+        ],
+        wire: {
+          supportsReasoningEffort: false,
+          supportsStore: false
+        }
+      },
+      {
+        source: "classes/minimax.kdl:78",
+        class: "minimax",
+        providers: [
+          "minimax-code",
+          "minimax-code-cn",
+          "wafer-serverless"
+        ],
+        wire: {
+          reasoningContentField: "reasoning_content"
+        }
+      },
+      {
+        source: "classes/minimax.kdl:3",
+        class: "minimax",
+        wire: {
+          reasoningDeltasMayBeCumulative: true
+        }
+      },
+      {
+        source: "classes/mistral.kdl:5",
+        class: "mistral",
+        providers: [
+          "amazon-bedrock",
+          "openrouter"
+        ],
+        family: "mistral",
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      },
+      {
+        source: "classes/mistral.kdl:10",
+        class: "mistral",
+        providers: [
+          "amazon-bedrock",
+          "vercel-ai-gateway"
+        ],
+        family: "mistral",
+        thinking: {
+          mode: "budget"
+        }
+      },
+      {
+        source: "classes/mistral.kdl:15",
+        class: "mistral",
+        providers: [
+          "kilo",
+          "mistral",
+          "nanogpt",
+          "nvidia",
+          "venice",
+          "vercel-ai-gateway"
+        ],
+        family: "mistral",
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      },
+      {
+        source: "classes/openai.kdl:5",
+        class: "openai",
+        family: "o-series",
+        thinking: {
+          requiresEffort: true
+        }
+      },
+      {
+        source: "classes/openai.kdl:12",
+        class: "openai",
+        family: "gpt",
+        revision: [
+          {
+            op: "<",
+            revision: "5.2.0"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      },
+      {
+        source: "classes/openai.kdl:17",
+        class: "openai",
+        family: "codex",
+        revision: [
+          {
+            op: "<",
+            revision: "5.2.0"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      },
+      {
+        source: "classes/openai.kdl:21",
+        class: "openai",
+        family: "codex",
+        revision: [
+          {
+            op: "=",
+            revision: "5.1.0"
+          }
+        ],
+        models: [
+          {
+            kind: "glob",
+            value: "*codex-mini*"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "medium",
+            "high"
+          ]
+        }
+      },
+      {
+        source: "classes/openai.kdl:26",
+        class: "openai",
+        revision: [
+          {
+            op: ">=",
+            revision: "5.2.0"
+          },
+          {
+            op: "<",
+            revision: "5.6.0"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      },
+      {
+        source: "classes/openai.kdl:29",
+        class: "openai",
+        revision: [
+          {
+            op: ">=",
+            revision: "5.6.0"
+          }
+        ],
+        wire: {
+          requiresReasoningOffJuiceInstruction: true
+        },
+        thinking: {
+          efforts: [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      },
+      {
+        source: "classes/openai.kdl:37",
+        class: "openai",
+        revision: [
+          {
+            op: "=",
+            revision: "5.6.0"
+          }
+        ],
+        catalog: {
+          delegationBias: "gated"
+        }
+      },
+      {
+        source: "classes/openai.kdl:40",
+        class: "openai",
+        revision: [
+          {
+            op: ">=",
+            revision: "6.0.0"
+          }
+        ],
+        catalog: {
+          delegationBias: "restrained"
+        }
+      },
+      {
+        source: "classes/openai.kdl:46",
+        class: "openai",
+        models: [
+          {
+            kind: "exact",
+            value: "gpt-6-astra"
+          }
+        ],
+        wire: {
+          supportsConfigurationUpdate: true
+        }
+      },
+      {
+        source: "classes/openai.kdl:52",
+        class: "openai",
+        family: "codex",
+        revision: [
+          {
+            op: ">=",
+            revision: "1.0.0"
+          }
+        ],
+        catalog: {
+          limitsPatch: {
+            contextWindow: 272000
+          }
+        }
+      },
+      {
+        source: "classes/qwen.kdl:4",
+        class: "qwen",
+        providers: [
+          "aiand",
+          "aimlapi",
+          "alibaba-coding-plan",
+          "amazon-bedrock",
+          "coreweave",
+          "groq",
+          "huggingface",
+          "kilo",
+          "nanogpt",
+          "novita",
+          "nvidia",
+          "ollama-cloud",
+          "openrouter",
+          "synthetic",
+          "together",
+          "venice",
+          "wafer-serverless",
+          "zenmux"
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      },
+      {
+        source: "classes/qwen.kdl:13",
+        class: "qwen",
+        providers: [
+          "aimlapi",
+          "coreweave",
+          "venice",
+          "zenmux"
+        ],
+        models: [
+          {
+            kind: "glob",
+            value: "*qwen3-235b-a22b-thinking-2507"
+          }
+        ],
+        thinking: {
+          requiresEffort: true
+        }
+      },
+      {
+        source: "classes/qwen.kdl:17",
+        class: "qwen",
+        providers: [
+          "alibaba-coding-plan",
+          "alibaba-token-plan",
+          "wafer-serverless"
+        ],
+        wire: {
+          supportsDeveloperRole: false
+        }
+      },
+      {
+        source: "classes/qwen.kdl:20",
+        class: "qwen",
+        providers: [
+          "amazon-bedrock",
+          "umans",
+          "vercel-ai-gateway"
+        ],
+        thinking: {
+          mode: "budget"
+        }
+      },
+      {
+        source: "classes/qwen.kdl:23",
+        class: "qwen",
+        providers: [
+          "fireworks",
+          "umans",
+          "vercel-ai-gateway"
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      },
+      {
+        source: "classes/qwen.kdl:30",
+        class: "qwen",
+        providers: [
+          "kilo",
+          "nanogpt",
+          "novita",
+          "nvidia",
+          "openrouter"
+        ],
+        models: [
+          {
+            kind: "glob",
+            value: "*qwen3-*thinking*"
+          }
+        ],
+        thinking: {
+          requiresEffort: true
+        }
+      },
+      {
+        source: "classes/qwen.kdl:41",
+        class: "qwen",
+        providers: [
+          "llama.cpp",
+          "lm-studio"
+        ],
+        revision: [
+          {
+            op: ">=",
+            revision: "3.8.0"
+          }
+        ],
+        wire: {
+          supportsReasoningEffort: true,
+          qwenTemplateReasoningEffort: true,
+          thinkingFormat: "qwen"
+        },
+        thinking: {
+          efforts: [
+            "low",
+            "medium",
+            "xhigh"
+          ],
+          requiresEffort: true
+        }
+      },
+      {
+        source: "classes/qwen.kdl:50",
+        class: "qwen",
+        providers: [
+          "vllm"
+        ],
+        revision: [
+          {
+            op: ">=",
+            revision: "3.8.0"
+          }
+        ],
+        wire: {
+          supportsReasoningEffort: true,
+          qwenTemplateReasoningEffort: true,
+          thinkingFormat: "qwen-chat-template"
+        },
+        thinking: {
+          efforts: [
+            "low",
+            "medium",
+            "xhigh"
+          ],
+          requiresEffort: true
+        }
+      },
+      {
+        source: "classes/qwen.kdl:60",
+        class: "qwen",
+        providers: [
+          "alibaba-token-plan"
+        ],
+        family: "coder",
+        wire: {
+          stripImageInput: true
+        }
+      },
+      {
+        source: "classes/qwen.kdl:64",
+        class: "qwen",
+        providers: [
+          "alibaba-token-plan"
+        ],
+        revision: [
+          {
+            op: "<",
+            revision: "3.8.0"
+          }
+        ],
+        models: [
+          {
+            kind: "token",
+            value: "max"
+          }
+        ],
+        wire: {
+          stripImageInput: true
+        }
+      },
+      {
+        source: "classes/qwen.kdl:68",
+        class: "qwen",
+        providers: [
+          "alibaba-token-plan"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "qwen-max"
+          }
+        ],
+        wire: {
+          stripImageInput: true
+        }
+      },
+      {
+        source: "classes/stepfun.kdl:6",
+        class: "stepfun",
+        providers: [
+          "aimlapi",
+          "huggingface",
+          "kilo",
+          "nanogpt",
+          "novita",
+          "nvidia",
+          "vercel-ai-gateway",
+          "zenmux"
+        ],
+        family: "step",
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      },
+      {
+        source: "classes/xai.kdl:8",
+        class: "xai",
+        providers: [
+          "xai",
+          "xai-oauth"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "grok-4.3"
+          },
+          {
+            kind: "exact",
+            value: "grok-4.5"
+          },
+          {
+            kind: "exact",
+            value: "grok-4.6"
+          },
+          {
+            kind: "exact",
+            value: "grok-build-0.1"
+          },
+          {
+            kind: "glob",
+            value: "grok-4.20*"
+          }
+        ],
+        catalog: {
+          longContext: {
+            inputThreshold: 200000,
+            inputThresholdInclusive: true,
+            multiplier: 2
+          }
+        }
+      },
+      {
+        source: "classes/xai.kdl:18",
+        class: "xai",
+        providers: [
+          "aimlapi",
+          "kilo",
+          "nanogpt",
+          "opencode-go",
+          "opencode-zen",
+          "venice",
+          "vercel-ai-gateway",
+          "zenmux"
+        ],
+        family: "grok",
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      },
+      {
+        source: "classes/xai.kdl:24",
+        class: "xai",
+        providers: [
+          "cursor",
+          "openrouter",
+          "xai",
+          "xai-oauth"
+        ],
+        family: "grok",
+        revision: [
+          {
+            op: ">=",
+            revision: "0.0.0"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      },
+      {
+        source: "classes/xai.kdl:32",
+        class: "xai",
+        providers: [
+          "xai",
+          "xai-oauth"
+        ],
+        family: "grok",
+        models: [
+          {
+            kind: "glob",
+            value: "grok-4.6*"
+          },
+          {
+            kind: "glob",
+            value: "grok-4.20-multi-agent*"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      },
+      {
+        source: "classes/xai.kdl:39",
+        class: "xai",
+        providers: [
+          "xai-oauth"
+        ],
+        family: "grok",
+        revision: [
+          {
+            op: ">=",
+            revision: "0.1.0"
+          },
+          {
+            op: "<",
+            revision: "4.3.0"
+          }
+        ],
+        wire: {
+          supportsReasoningEffort: false
+        }
+      },
+      {
+        source: "classes/xai.kdl:3",
+        class: "xai",
+        wire: {
+          thinkingLoopGuard: "xai"
+        }
+      },
+      {
+        source: "providers/abliteration.kdl:5",
+        providers: [
+          "abliteration"
+        ],
+        wire: {
+          includeEncryptedReasoning: false,
+          streamIdleTimeoutMs: 0
+        }
+      },
+      {
+        source: "providers/aiand.kdl:4",
+        providers: [
+          "aiand"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "moonshotai/kimi-k3"
+          },
+          {
+            kind: "exact",
+            value: "deepseek-ai/deepseek-v4-pro"
+          },
+          {
+            kind: "exact",
+            value: "deepseek-ai/deepseek-v4-flash"
+          },
+          {
+            kind: "exact",
+            value: "openai/gpt-oss-120b"
+          },
+          {
+            kind: "exact",
+            value: "zai-org/glm-5.2"
+          },
+          {
+            kind: "exact",
+            value: "google/gemma-4-31b-it"
+          },
+          {
+            kind: "exact",
+            value: "moonshotai/kimi-k2.7-code"
+          },
+          {
+            kind: "exact",
+            value: "qwen/qwen3.6-27b"
+          },
+          {
+            kind: "exact",
+            value: "motif-technologies/motif-3"
+          }
+        ],
+        thinking: {
+          mode: "effort"
+        }
+      },
+      {
+        source: "providers/aiand.kdl:10",
+        providers: [
+          "aiand"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "deepseek-ai/deepseek-v4-pro"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "low",
+            "high",
+            "max"
+          ]
+        }
+      },
+      {
+        source: "providers/aiand.kdl:13",
+        providers: [
+          "aiand"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "motif-technologies/motif-3"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      },
+      {
+        source: "providers/aiand.kdl:16",
+        providers: [
+          "aiand"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "moonshotai/kimi-k2.7-code"
+          },
+          {
+            kind: "exact",
+            value: "deepseek-ai/deepseek-v4-flash"
+          }
+        ],
+        catalog: {
+          editRevision: "sloppy.1"
+        }
+      },
+      {
+        source: "providers/aimlapi.kdl:6",
+        providers: [
+          "aimlapi"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "deepseek/deepseek-chat-v3.1"
+          }
+        ],
+        wire: {
+          requiresReasoningContentForAllAssistantTurns: true
+        },
+        thinking: {
+          efforts: [
+            "high",
+            "max"
+          ]
+        }
+      },
+      {
+        source: "providers/aimlapi.kdl:10",
+        providers: [
+          "aimlapi"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "deepseek-v4-pro"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "low",
+            "high",
+            "max"
+          ]
+        }
+      },
+      {
+        source: "providers/aimlapi.kdl:14",
+        providers: [
+          "aimlapi"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "gpt-5.1-codex"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      },
+      {
+        source: "providers/aimlapi.kdl:18",
+        providers: [
+          "aimlapi"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "gpt-5.1-codex-mini"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "medium",
+            "high"
+          ]
+        }
+      },
+      {
+        source: "providers/aimlapi.kdl:21",
+        providers: [
+          "aimlapi"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "xiaomi/mimo-v2.5"
+          },
+          {
+            kind: "exact",
+            value: "stepfun/step-3.7-flash"
+          }
+        ],
+        catalog: {
+          editRevision: "sloppy.1"
+        }
+      },
+      {
+        source: "providers/aimlapi.kdl:3",
+        providers: [
+          "aimlapi"
+        ],
+        thinking: {
+          mode: "effort"
+        }
+      },
+      {
+        source: "providers/alibaba-coding-plan.kdl:9",
+        class: "glm",
+        providers: [
+          "alibaba-coding-plan"
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      },
+      {
+        source: "providers/alibaba-coding-plan.kdl:13",
+        providers: [
+          "alibaba-coding-plan"
+        ],
+        models: [
+          {
+            kind: "glob",
+            value: "*.5"
+          }
+        ],
+        wire: {
+          thinkingFormat: "qwen"
+        }
+      },
+      {
+        source: "providers/alibaba-coding-plan.kdl:17",
+        providers: [
+          "alibaba-coding-plan"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "glm-5"
+          }
+        ],
+        wire: {
+          thinkingFormat: "qwen"
+        }
+      },
+      {
+        source: "providers/alibaba-coding-plan.kdl:3",
+        providers: [
+          "alibaba-coding-plan"
+        ],
+        wire: {
+          thinkingFormat: "qwen",
+          streamIdleTimeoutMs: 600000
+        },
+        thinking: {
+          mode: "effort"
+        }
+      },
+      {
+        source: "providers/alibaba-token-plan.kdl:8",
+        class: "qwen",
+        providers: [
+          "alibaba-token-plan"
+        ],
+        revision: [
+          {
+            op: ">=",
+            revision: "3.6.0"
+          },
+          {
+            op: "<",
+            revision: "3.8.0"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      },
+      {
+        source: "providers/alibaba-token-plan.kdl:11",
+        class: "qwen",
+        providers: [
+          "alibaba-token-plan"
+        ],
+        revision: [
+          {
+            op: ">=",
+            revision: "3.8.0"
+          },
+          {
+            op: "<",
+            revision: "3.9.0"
+          }
+        ],
+        wire: {
+          supportsReasoningEffort: true
+        }
+      },
+      {
+        source: "providers/alibaba-token-plan.kdl:16",
+        providers: [
+          "alibaba-token-plan"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "deepseek-v4-pro"
+          }
+        ],
+        wire: {
+          thinkingFormat: "qwen"
+        }
+      },
+      {
+        source: "providers/alibaba-token-plan.kdl:20",
+        providers: [
+          "alibaba-token-plan"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "qwen3.8-max"
+          }
+        ],
+        wire: {
+          whenThinking: {
+            extraBody: {
+              enable_thinking: true
+            },
+            thinkingFormat: "openai"
+          }
+        },
+        thinking: {
+          defaultLevel: "xhigh",
+          efforts: [
+            "low",
+            "medium",
+            "xhigh"
+          ]
+        }
+      },
+      {
+        source: "providers/alibaba-token-plan.kdl:31",
+        providers: [
+          "alibaba-token-plan"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "qwen3.8-max-preview"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "low",
+            "high",
+            "xhigh"
+          ],
+          requiresEffort: true
+        }
+      },
+      {
+        source: "providers/alibaba-token-plan.kdl:3",
+        providers: [
+          "alibaba-token-plan"
+        ],
+        wire: {
+          thinkingFormat: "qwen"
+        },
+        thinking: {
+          mode: "effort"
+        }
+      },
+      {
+        source: "providers/amazon-bedrock.kdl:6",
+        class: "anthropic",
+        providers: [
+          "amazon-bedrock"
+        ],
+        family: "opus",
+        revision: [
+          {
+            op: ">=",
+            revision: "4.6.0"
+          },
+          {
+            op: "<",
+            revision: "4.7.0"
+          }
+        ],
+        thinking: {
+          mode: "anthropic-adaptive"
+        }
+      },
+      {
+        source: "providers/amazon-bedrock.kdl:10",
+        class: "anthropic",
+        providers: [
+          "amazon-bedrock"
+        ],
+        revision: [
+          {
+            op: ">=",
+            revision: "4.7.0"
+          },
+          {
+            op: "<",
+            revision: "5.1.0"
+          }
+        ],
+        wire: {
+          streamIdleTimeoutMs: 900000
+        },
+        thinking: {
+          efforts: [
+            "low",
+            "medium",
+            "high",
+            "max"
+          ]
+        }
+      },
+      {
+        source: "providers/amazon-bedrock.kdl:16",
+        class: "openai",
+        providers: [
+          "amazon-bedrock"
+        ],
+        thinking: {
+          mode: "effort"
+        },
+        catalog: {
+          requiresToolResultImageHoisting: true
+        }
+      },
+      {
+        source: "providers/amazon-bedrock.kdl:21",
+        class: "deepseek",
+        providers: [
+          "amazon-bedrock"
+        ],
+        wire: {
+          requiresReasoningContentForAllAssistantTurns: true
+        },
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      },
+      {
+        source: "providers/amazon-bedrock.kdl:26",
+        class: "minimax",
+        providers: [
+          "amazon-bedrock"
+        ],
+        family: "m2",
+        thinking: {
+          mode: "budget"
+        }
+      },
+      {
+        source: "providers/amazon-bedrock.kdl:30",
+        class: "unknown",
+        providers: [
+          "amazon-bedrock"
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ],
+          mode: "budget"
+        },
+        catalog: {
+          requiresToolResultImageHoisting: true
+        }
+      },
+      {
+        source: "providers/amazon-bedrock.kdl:40",
+        providers: [
+          "amazon-bedrock"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "moonshot.kimi-k2-thinking"
+          }
+        ],
+        thinking: {
+          requiresEffort: true
+        }
+      },
+      {
+        source: "providers/anthropic.kdl:13",
+        class: "anthropic",
+        providers: [
+          "anthropic"
+        ],
+        revision: [
+          {
+            op: ">=",
+            revision: "3.7.0"
+          },
+          {
+            op: "<",
+            revision: "4.6.0"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      },
+      {
+        source: "providers/anthropic.kdl:18",
+        providers: [
+          "anthropic"
+        ],
+        models: [
+          {
+            kind: "glob",
+            value: "*20240229"
+          },
+          {
+            kind: "exact",
+            value: "claude-3-7-sonnet-20250219"
+          }
+        ],
+        wire: {
+          disableAdaptiveThinking: false,
+          escapeBuiltinToolNames: false,
+          officialEndpoint: true,
+          replayUnsignedThinking: false,
+          requiresThinkingEnabled: false,
+          requiresToolResultId: false,
+          signingEndpoint: true,
+          supportsEagerToolInputStreaming: true,
+          supportsForcedToolChoice: true,
+          supportsLongCacheRetention: true,
+          supportsMidConversationSystem: false,
+          supportsSamplingParams: true
+        }
+      },
+      {
+        source: "providers/anthropic.kdl:3",
+        providers: [
+          "anthropic"
+        ],
+        wire: {
+          firstPartyProvider: true
+        }
+      },
+      {
+        source: "providers/azure.kdl:4",
+        class: "openai",
+        providers: [
+          "azure"
+        ],
+        thinking: {
+          mode: "effort"
+        }
+      },
+      {
+        source: "providers/azure.kdl:8",
+        providers: [
+          "azure"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "codex-mini"
+          },
+          {
+            kind: "exact",
+            value: "gpt-chat-latest"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      },
+      {
+        source: "providers/azure.kdl:12",
+        providers: [
+          "azure"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "gpt-5.1-codex"
+          },
+          {
+            kind: "exact",
+            value: "gpt-5.1-codex-max"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      },
+      {
+        source: "providers/azure.kdl:16",
+        providers: [
+          "azure"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "gpt-5.1-codex-mini"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "medium",
+            "high"
+          ]
+        }
+      },
+      {
+        source: "providers/baseten.kdl:7",
+        providers: [
+          "baseten"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "moonshotai/Kimi-K3"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "low",
+            "high",
+            "max"
+          ],
+          defaultLevel: "max"
+        }
+      },
+      {
+        source: "providers/baseten.kdl:12",
+        providers: [
+          "baseten"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B"
+          },
+          {
+            kind: "exact",
+            value: "zai-org/GLM-4.7"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      },
+      {
+        source: "providers/baseten.kdl:16",
+        providers: [
+          "baseten"
+        ],
+        models: [
+          {
+            kind: "glob",
+            value: "zai-org/glm-5*"
+          },
+          {
+            kind: "exact",
+            value: "openai/gpt-oss-120b"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "high",
+            "max"
+          ]
+        }
+      },
+      {
+        source: "providers/baseten.kdl:3",
+        providers: [
+          "baseten"
+        ],
+        thinking: {
+          mode: "effort"
+        }
+      },
+      {
+        source: "providers/bedrock-mantle.kdl:4",
+        class: "unknown",
+        providers: [
+          "bedrock-mantle"
+        ],
+        thinking: {
+          mode: "effort"
+        }
+      },
+      {
+        source: "providers/bedrock-mantle.kdl:8",
+        providers: [
+          "bedrock-mantle"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "openai.gpt-5.4"
+          },
+          {
+            kind: "exact",
+            value: "openai.gpt-5.5"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      },
+      {
+        source: "providers/bedrock-mantle.kdl:12",
+        providers: [
+          "bedrock-mantle"
+        ],
+        models: [
+          {
+            kind: "glob",
+            value: "openai.gpt-5.6*"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      },
+      {
+        source: "providers/cerebras.kdl:11",
+        providers: [
+          "cerebras"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "gemma-4-31b"
+          }
+        ],
+        catalog: {
+          inputModalities: [
+            "text",
+            "image"
+          ]
+        }
+      },
+      {
+        source: "providers/cerebras.kdl:16",
+        providers: [
+          "cerebras"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "zai-glm-4.7"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      },
+      {
+        source: "providers/cerebras.kdl:3",
+        providers: [
+          "cerebras"
+        ],
+        wire: {
+          supportsStrictMode: true,
+          supportsUsageInStreaming: false,
+          toolStrictMode: "all_strict"
+        },
+        thinking: {
+          mode: "effort"
+        }
+      },
+      {
+        source: "providers/charm-hyper.kdl:72",
+        providers: [
+          "charm-hyper"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "glm-5.1"
+          }
+        ],
+        catalog: {
+          limitsPatch: {
+            maxTokens: 20275
+          }
+        }
+      },
+      {
+        source: "providers/charm-hyper.kdl:77",
+        providers: [
+          "charm-hyper"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "minimax-m2.7"
+          }
+        ],
+        catalog: {
+          limitsPatch: {
+            maxTokens: 26214
+          }
+        }
+      },
+      {
+        source: "providers/charm-hyper.kdl:9",
+        providers: [
+          "charm-hyper"
+        ],
+        wire: {
+          supportsDeveloperRole: false,
+          supportsStore: false,
+          maxTokensField: "max_tokens",
+          reasoningContentField: "reasoning_content"
+        },
+        thinking: {
+          mode: "effort"
+        }
+      },
+      {
+        source: "providers/cline-pass.kdl:3",
+        providers: [
+          "cline-pass"
+        ],
+        wire: {
+          wireModelIdMode: "cline-pass",
+          thinkingFormat: "openai"
+        }
+      },
+      {
+        source: "providers/cloudflare-ai-gateway.kdl:6",
+        providers: [
+          "cloudflare-ai-gateway"
+        ],
+        models: [
+          {
+            kind: "glob",
+            value: "deepseek/*"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      },
+      {
+        source: "providers/cloudflare-ai-gateway.kdl:10",
+        class: "anthropic",
+        providers: [
+          "cloudflare-ai-gateway"
+        ],
+        revision: [
+          {
+            op: ">=",
+            revision: "4.0.0"
+          },
+          {
+            op: "<",
+            revision: "4.6.0"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      },
+      {
+        source: "providers/cloudflare-ai-gateway.kdl:15",
+        providers: [
+          "cloudflare-ai-gateway"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "openai/gpt-5.1-codex"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      },
+      {
+        source: "providers/cloudflare-ai-gateway.kdl:19",
+        providers: [
+          "cloudflare-ai-gateway"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "workers-ai/@cf/nvidia/nemotron-3-120b-a12b"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      },
+      {
+        source: "providers/cloudflare-ai-gateway.kdl:23",
+        providers: [
+          "cloudflare-ai-gateway"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "xai/grok-4.20-0309-reasoning"
+          }
+        ],
+        thinking: {
+          requiresEffort: true
+        }
+      },
+      {
+        source: "providers/commandcode.kdl:27",
+        class: "anthropic",
+        providers: [
+          "commandcode"
+        ],
+        wire: {
+          supportsEagerToolInputStreaming: false,
+          supportsLongCacheRetention: false
+        },
+        thinking: {
+          mode: "anthropic-adaptive"
+        }
+      },
+      {
+        source: "providers/commandcode.kdl:32",
+        providers: [
+          "commandcode"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "claude-fable-5"
+          },
+          {
+            kind: "exact",
+            value: "claude-fable-5-1"
+          },
+          {
+            kind: "exact",
+            value: "claude-opus-4-7"
+          },
+          {
+            kind: "exact",
+            value: "claude-opus-4-8"
+          },
+          {
+            kind: "exact",
+            value: "claude-opus-5"
+          },
+          {
+            kind: "exact",
+            value: "claude-sonnet-4-6"
+          },
+          {
+            kind: "exact",
+            value: "claude-sonnet-5"
+          }
+        ],
+        wire: {
+          supportsReasoningEffort: true
+        },
+        thinking: {
+          efforts: [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      },
+      {
+        source: "providers/commandcode.kdl:37",
+        providers: [
+          "commandcode"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "deepseek/deepseek-v4-flash"
+          },
+          {
+            kind: "exact",
+            value: "deepseek/deepseek-v4-flash-vision-exp"
+          },
+          {
+            kind: "exact",
+            value: "deepseek/deepseek-v4-pro"
+          },
+          {
+            kind: "exact",
+            value: "zai-org/GLM-5.2"
+          }
+        ],
+        wire: {
+          supportsReasoningEffort: true
+        },
+        thinking: {
+          efforts: [
+            "high",
+            "max"
+          ]
+        }
+      },
+      {
+        source: "providers/commandcode.kdl:42",
+        providers: [
+          "commandcode"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "deepseek/deepseek-v4-flash-fast"
+          },
+          {
+            kind: "exact",
+            value: "moonshotai/Kimi-K3"
+          },
+          {
+            kind: "exact",
+            value: "z-ai/glm-5.3-flash"
+          },
+          {
+            kind: "exact",
+            value: "zai-org/GLM-5.3"
+          }
+        ],
+        wire: {
+          supportsReasoningEffort: true
+        },
+        thinking: {
+          efforts: [
+            "low",
+            "high",
+            "max"
+          ]
+        }
+      },
+      {
+        source: "providers/commandcode.kdl:47",
+        providers: [
+          "commandcode"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "google/gemini-3.1-flash-lite"
+          },
+          {
+            kind: "exact",
+            value: "google/gemini-3.5-flash"
+          },
+          {
+            kind: "exact",
+            value: "google/gemini-3.5-flash-lite"
+          },
+          {
+            kind: "exact",
+            value: "google/gemini-3.6-flash"
+          },
+          {
+            kind: "exact",
+            value: "google/gemini-3.7-flash"
+          },
+          {
+            kind: "exact",
+            value: "google/gemini-3.8-flash"
+          },
+          {
+            kind: "exact",
+            value: "gpt-5.4-mini"
+          },
+          {
+            kind: "exact",
+            value: "xai/grok-4.5"
+          }
+        ],
+        wire: {
+          supportsReasoningEffort: true
+        },
+        thinking: {
+          efforts: [
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      },
+      {
+        source: "providers/commandcode.kdl:53",
+        providers: [
+          "commandcode"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "gpt-5.3-codex"
+          },
+          {
+            kind: "exact",
+            value: "gpt-5.4"
+          },
+          {
+            kind: "exact",
+            value: "gpt-5.5"
+          },
+          {
+            kind: "exact",
+            value: "xai/grok-4.6"
+          }
+        ],
+        wire: {
+          supportsReasoningEffort: true
+        },
+        thinking: {
+          efforts: [
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      },
+      {
+        source: "providers/commandcode.kdl:57",
+        providers: [
+          "commandcode"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "gpt-5.6-luna"
+          },
+          {
+            kind: "exact",
+            value: "gpt-5.6-sol"
+          },
+          {
+            kind: "exact",
+            value: "gpt-5.6-terra"
+          }
+        ],
+        wire: {
+          supportsReasoningEffort: true
+        },
+        thinking: {
+          efforts: [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      },
+      {
+        source: "providers/commandcode.kdl:61",
+        providers: [
+          "commandcode"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "meta/muse-spark-1.1"
+          },
+          {
+            kind: "exact",
+            value: "meta/muse-spark-1.2"
+          },
+          {
+            kind: "exact",
+            value: "meta/muse-spark-1.2-contributor"
+          },
+          {
+            kind: "exact",
+            value: "meta/muse-spark-1.3"
+          },
+          {
+            kind: "exact",
+            value: "meta/muse-spark-1.3-contributor"
+          }
+        ],
+        wire: {
+          supportsReasoningEffort: true
+        },
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      },
+      {
+        source: "providers/commandcode.kdl:66",
+        providers: [
+          "commandcode"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "Qwen/Qwen3.8-27B"
+          },
+          {
+            kind: "exact",
+            value: "Qwen/Qwen3.8-Flash"
+          },
+          {
+            kind: "exact",
+            value: "Qwen/Qwen3.8-Max"
+          },
+          {
+            kind: "exact",
+            value: "Qwen/Qwen3.8-Max-0902"
+          }
+        ],
+        wire: {
+          supportsReasoningEffort: true
+        },
+        thinking: {
+          efforts: [
+            "low",
+            "medium",
+            "xhigh"
+          ]
+        }
+      },
+      {
+        source: "providers/commandcode.kdl:70",
+        providers: [
+          "commandcode"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "sakana/fugu-ultra"
+          }
+        ],
+        wire: {
+          supportsReasoningEffort: true
+        },
+        thinking: {
+          efforts: [
+            "high",
+            "xhigh"
+          ]
+        }
+      },
+      {
+        source: "providers/commandcode.kdl:74",
+        providers: [
+          "commandcode"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "tencent/hy4-preview"
+          }
+        ],
+        wire: {
+          supportsReasoningEffort: true
+        },
+        thinking: {
+          efforts: [
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      },
+      {
+        source: "providers/commandcode.kdl:78",
+        providers: [
+          "commandcode"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "Qwen/Qwen3.8-27B"
+          }
+        ],
+        catalog: {
+          limitsPatch: {
+            maxTokens: 32768
+          }
+        }
+      },
+      {
+        source: "providers/commandcode.kdl:83",
+        providers: [
+          "commandcode"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "z-ai/glm-5.3-flash"
+          }
+        ],
+        catalog: {
+          limitsPatch: {
+            maxTokens: 131072
+          }
+        }
+      },
+      {
+        source: "providers/commandcode.kdl:91",
+        providers: [
+          "commandcode"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "gpt-5.3-codex"
+          }
+        ],
+        catalog: {
+          limitsPatch: {
+            contextWindow: 272000,
+            maxTokens: 65536
+          }
+        }
+      },
+      {
+        source: "providers/commandcode.kdl:112",
+        providers: [
+          "commandcode"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "claude-sonnet-5"
+          }
+        ],
+        catalog: {
+          costPatch: {
+            input: 2,
+            output: 10,
+            cacheRead: 0.2,
+            cacheWrite: 2.5
+          }
+        }
+      },
+      {
+        source: "providers/commandcode.kdl:120",
+        providers: [
+          "commandcode"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "claude-sonnet-4-6"
+          }
+        ],
+        catalog: {
+          costPatch: {
+            input: 3,
+            output: 15,
+            cacheRead: 0.3,
+            cacheWrite: 3.75
+          }
+        }
+      },
+      {
+        source: "providers/commandcode.kdl:129",
+        providers: [
+          "commandcode"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "claude-fable-5-1"
+          }
+        ],
+        catalog: {
+          costPatch: {
+            input: 10,
+            output: 50,
+            cacheRead: 0.25,
+            cacheWrite: 12.5
+          }
+        }
+      },
+      {
+        source: "providers/commandcode.kdl:137",
+        providers: [
+          "commandcode"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "claude-fable-5"
+          }
+        ],
+        catalog: {
+          costPatch: {
+            input: 10,
+            output: 50,
+            cacheRead: 1,
+            cacheWrite: 12.5
+          }
+        }
+      },
+      {
+        source: "providers/commandcode.kdl:145",
+        providers: [
+          "commandcode"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "claude-opus-5"
+          },
+          {
+            kind: "exact",
+            value: "claude-opus-4-8"
+          },
+          {
+            kind: "exact",
+            value: "claude-opus-4-7"
+          }
+        ],
+        catalog: {
+          costPatch: {
+            input: 5,
+            output: 25,
+            cacheRead: 0.5,
+            cacheWrite: 6.25
+          }
+        }
+      },
+      {
+        source: "providers/commandcode.kdl:153",
+        providers: [
+          "commandcode"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "claude-haiku-4-5-20251001"
+          }
+        ],
+        catalog: {
+          costPatch: {
+            input: 1,
+            output: 5,
+            cacheRead: 0.1,
+            cacheWrite: 1.25
+          }
+        }
+      },
+      {
+        source: "providers/commandcode.kdl:161",
+        providers: [
+          "commandcode"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "gpt-5.6-sol"
+          }
+        ],
+        catalog: {
+          costPatch: {
+            input: 5,
+            output: 30,
+            cacheRead: 0.5,
+            cacheWrite: 6.25
+          }
+        }
+      },
+      {
+        source: "providers/commandcode.kdl:169",
+        providers: [
+          "commandcode"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "gpt-5.6-terra"
+          }
+        ],
+        catalog: {
+          costPatch: {
+            input: 2,
+            output: 12,
+            cacheRead: 0.2,
+            cacheWrite: 2.5
+          }
+        }
+      },
+      {
+        source: "providers/commandcode.kdl:177",
+        providers: [
+          "commandcode"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "gpt-5.6-luna"
+          }
+        ],
+        catalog: {
+          costPatch: {
+            input: 0.2,
+            output: 1.2,
+            cacheRead: 0.02,
+            cacheWrite: 0.25
+          }
+        }
+      },
+      {
+        source: "providers/commandcode.kdl:185",
+        providers: [
+          "commandcode"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "gpt-5.5"
+          }
+        ],
+        catalog: {
+          costPatch: {
+            input: 5,
+            output: 30,
+            cacheRead: 0.5,
+            cacheWrite: 0
+          }
+        }
+      },
+      {
+        source: "providers/commandcode.kdl:193",
+        providers: [
+          "commandcode"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "gpt-5.4"
+          }
+        ],
+        catalog: {
+          costPatch: {
+            input: 2.5,
+            output: 15,
+            cacheRead: 0.25,
+            cacheWrite: 0
+          }
+        }
+      },
+      {
+        source: "providers/commandcode.kdl:201",
+        providers: [
+          "commandcode"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "gpt-5.3-codex"
+          }
+        ],
+        catalog: {
+          costPatch: {
+            input: 2,
+            output: 8,
+            cacheRead: 0.5,
+            cacheWrite: 0
+          }
+        }
+      },
+      {
+        source: "providers/commandcode.kdl:209",
+        providers: [
+          "commandcode"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "gpt-5.4-mini"
+          }
+        ],
+        catalog: {
+          costPatch: {
+            input: 0.75,
+            output: 4.5,
+            cacheRead: 0.075,
+            cacheWrite: 0
+          }
+        }
+      },
+      {
+        source: "providers/commandcode.kdl:220",
+        providers: [
+          "commandcode"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "deepseek/deepseek-v4-pro"
+          }
+        ],
+        catalog: {
+          costPatch: {
+            input: 0.66,
+            output: 1.98,
+            cacheRead: 0.022,
+            cacheWrite: 0
+          }
+        }
+      },
+      {
+        source: "providers/commandcode.kdl:228",
+        providers: [
+          "commandcode"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "deepseek/deepseek-v4-flash"
+          },
+          {
+            kind: "exact",
+            value: "deepseek/deepseek-v4-flash-vision-exp"
+          }
+        ],
+        catalog: {
+          costPatch: {
+            input: 0.22,
+            output: 0.66,
+            cacheRead: 0.007,
+            cacheWrite: 0
+          }
+        }
+      },
+      {
+        source: "providers/commandcode.kdl:236",
+        providers: [
+          "commandcode"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "deepseek/deepseek-v4-flash-fast"
+          }
+        ],
+        catalog: {
+          costPatch: {
+            input: 0.28,
+            output: 0.56,
+            cacheRead: 0.07,
+            cacheWrite: 0
+          }
+        }
+      },
+      {
+        source: "providers/commandcode.kdl:246",
+        providers: [
+          "commandcode"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "deepseek/deepseek-v4.1-flash"
+          }
+        ],
+        catalog: {
+          costPatch: {
+            input: 0.15,
+            output: 0.6,
+            cacheRead: 0.003,
+            cacheWrite: 0
+          }
+        }
+      },
+      {
+        source: "providers/commandcode.kdl:254",
+        providers: [
+          "commandcode"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "moonshotai/Kimi-K3"
+          }
+        ],
+        catalog: {
+          costPatch: {
+            input: 3,
+            output: 15,
+            cacheRead: 0.3,
+            cacheWrite: 0
+          }
+        }
+      },
+      {
+        source: "providers/commandcode.kdl:262",
+        providers: [
+          "commandcode"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "moonshotai/Kimi-K2.7-Code"
+          }
+        ],
+        catalog: {
+          costPatch: {
+            input: 0.95,
+            output: 4,
+            cacheRead: 0.19,
+            cacheWrite: 0
+          }
+        }
+      },
+      {
+        source: "providers/commandcode.kdl:270",
+        providers: [
+          "commandcode"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "moonshotai/Kimi-K2.7-Code-Highspeed"
+          }
+        ],
+        catalog: {
+          costPatch: {
+            input: 1.9,
+            output: 8,
+            cacheRead: 0.38,
+            cacheWrite: 0
+          }
+        }
+      },
+      {
+        source: "providers/commandcode.kdl:278",
+        providers: [
+          "commandcode"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "moonshotai/Kimi-K2.6"
+          }
+        ],
+        catalog: {
+          costPatch: {
+            input: 0.95,
+            output: 4,
+            cacheRead: 0.16,
+            cacheWrite: 0
+          }
+        }
+      },
+      {
+        source: "providers/commandcode.kdl:286",
+        providers: [
+          "commandcode"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "moonshotai/Kimi-K2.5"
+          }
+        ],
+        catalog: {
+          costPatch: {
+            input: 0.6,
+            output: 3,
+            cacheRead: 0.1,
+            cacheWrite: 0
+          }
+        }
+      },
+      {
+        source: "providers/commandcode.kdl:296",
+        providers: [
+          "commandcode"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "z-ai/glm-5.3-flash"
+          }
+        ],
+        catalog: {
+          costPatch: {
+            input: 0.15,
+            output: 0.5,
+            cacheRead: 0.03,
+            cacheWrite: 0
+          }
+        }
+      },
+      {
+        source: "providers/commandcode.kdl:304",
+        providers: [
+          "commandcode"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "zai-org/GLM-5.3"
+          },
+          {
+            kind: "exact",
+            value: "zai-org/GLM-5.2"
+          },
+          {
+            kind: "exact",
+            value: "zai-org/GLM-5.1"
+          }
+        ],
+        catalog: {
+          costPatch: {
+            input: 1.4,
+            output: 4.4,
+            cacheRead: 0.26,
+            cacheWrite: 0
+          }
+        }
+      },
+      {
+        source: "providers/commandcode.kdl:312",
+        providers: [
+          "commandcode"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "zai-org/GLM-5.2-Fast"
+          }
+        ],
+        catalog: {
+          costPatch: {
+            input: 3,
+            output: 10.25,
+            cacheRead: 0.5,
+            cacheWrite: 0
+          }
+        }
+      },
+      {
+        source: "providers/commandcode.kdl:320",
+        providers: [
+          "commandcode"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "zai-org/GLM-5"
+          }
+        ],
+        catalog: {
+          costPatch: {
+            input: 1,
+            output: 3.2,
+            cacheRead: 0.2,
+            cacheWrite: 0
+          }
+        }
+      },
+      {
+        source: "providers/commandcode.kdl:329",
+        providers: [
+          "commandcode"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "MiniMaxAI/MiniMax-M3"
+          },
+          {
+            kind: "exact",
+            value: "MiniMaxAI/MiniMax-M2.7"
+          }
+        ],
+        catalog: {
+          costPatch: {
+            input: 0.3,
+            output: 1.2,
+            cacheRead: 0.06,
+            cacheWrite: 0
+          }
+        }
+      },
+      {
+        source: "providers/commandcode.kdl:337",
+        providers: [
+          "commandcode"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "MiniMaxAI/MiniMax-M2.5"
+          }
+        ],
+        catalog: {
+          costPatch: {
+            input: 0.3,
+            output: 1.2,
+            cacheRead: 0.03,
+            cacheWrite: 0
+          }
+        }
+      },
+      {
+        source: "providers/commandcode.kdl:347",
+        providers: [
+          "commandcode"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "xiaomi/mimo-v2.5-pro"
+          }
+        ],
+        catalog: {
+          costPatch: {
+            input: 0.435,
+            output: 0.87,
+            cacheRead: 0.0036,
+            cacheWrite: 0
+          }
+        }
+      },
+      {
+        source: "providers/commandcode.kdl:355",
+        providers: [
+          "commandcode"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "xiaomi/mimo-v2.5"
+          }
+        ],
+        catalog: {
+          costPatch: {
+            input: 0.14,
+            output: 0.28,
+            cacheRead: 0.0028,
+            cacheWrite: 0
+          }
+        }
+      },
+      {
+        source: "providers/commandcode.kdl:363",
+        providers: [
+          "commandcode"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "Qwen/Qwen3.8-Max-0902"
+          }
+        ],
+        catalog: {
+          costPatch: {
+            input: 2,
+            output: 6,
+            cacheRead: 0.25,
+            cacheWrite: 0
+          }
+        }
+      },
+      {
+        source: "providers/commandcode.kdl:371",
+        providers: [
+          "commandcode"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "Qwen/Qwen3.8-Max"
+          }
+        ],
+        catalog: {
+          costPatch: {
+            input: 2,
+            output: 6,
+            cacheRead: 0.25,
+            cacheWrite: 2.5
+          }
+        }
+      },
+      {
+        source: "providers/commandcode.kdl:379",
+        providers: [
+          "commandcode"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "Qwen/Qwen3.8-27B"
+          }
+        ],
+        catalog: {
+          costPatch: {
+            input: 0.4,
+            output: 3,
+            cacheRead: 0.04,
+            cacheWrite: 0
+          }
+        }
+      },
+      {
+        source: "providers/commandcode.kdl:387",
+        providers: [
+          "commandcode"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "Qwen/Qwen3.8-Flash"
+          }
+        ],
+        catalog: {
+          costPatch: {
+            input: 0.16,
+            output: 0.47,
+            cacheRead: 0.016,
+            cacheWrite: 0
+          }
+        }
+      },
+      {
+        source: "providers/commandcode.kdl:395",
+        providers: [
+          "commandcode"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "Qwen/Qwen3.7-Max"
+          }
+        ],
+        catalog: {
+          costPatch: {
+            input: 2.5,
+            output: 7.5,
+            cacheRead: 0.5,
+            cacheWrite: 3.13
+          }
+        }
+      },
+      {
+        source: "providers/commandcode.kdl:403",
+        providers: [
+          "commandcode"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "Qwen/Qwen3.7-Plus"
+          }
+        ],
+        catalog: {
+          costPatch: {
+            input: 0.4,
+            output: 1.6,
+            cacheRead: 0.08,
+            cacheWrite: 0.5
+          },
+          longContext: {
+            inputThreshold: 256000,
+            input: 1.2,
+            output: 4.8,
+            cacheRead: 0.24,
+            cacheWrite: 1.5
+          }
+        }
+      },
+      {
+        source: "providers/commandcode.kdl:422",
+        providers: [
+          "commandcode"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "Qwen/Qwen3.7-Flash"
+          }
+        ],
+        catalog: {
+          costPatch: {
+            input: 0.03,
+            output: 0.13,
+            cacheRead: 0.006,
+            cacheWrite: 0.038
+          },
+          longContext: {
+            inputThreshold: 32000,
+            input: 0.2,
+            output: 0.8,
+            cacheRead: 0.04,
+            cacheWrite: 0.25
+          }
+        }
+      },
+      {
+        source: "providers/commandcode.kdl:437",
+        providers: [
+          "commandcode"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "Qwen/Qwen3.6-Max-Preview"
+          }
+        ],
+        catalog: {
+          costPatch: {
+            input: 1.3,
+            output: 7.8,
+            cacheRead: 0.26,
+            cacheWrite: 1.63
+          }
+        }
+      },
+      {
+        source: "providers/commandcode.kdl:445",
+        providers: [
+          "commandcode"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "Qwen/Qwen3.6-Plus"
+          }
+        ],
+        catalog: {
+          costPatch: {
+            input: 0.5,
+            output: 3,
+            cacheRead: 0.1,
+            cacheWrite: 0
+          }
+        }
+      },
+      {
+        source: "providers/commandcode.kdl:453",
+        providers: [
+          "commandcode"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "stepfun/Step-3.7-Flash"
+          }
+        ],
+        catalog: {
+          costPatch: {
+            input: 0.2,
+            output: 1.15,
+            cacheRead: 0.04,
+            cacheWrite: 0
+          }
+        }
+      },
+      {
+        source: "providers/commandcode.kdl:461",
+        providers: [
+          "commandcode"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "stepfun/Step-3.5-Flash"
+          }
+        ],
+        catalog: {
+          costPatch: {
+            input: 0.1,
+            output: 0.3,
+            cacheRead: 0.02,
+            cacheWrite: 0
+          }
+        }
+      },
+      {
+        source: "providers/commandcode.kdl:469",
+        providers: [
+          "commandcode"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "tencent/hy4-preview"
+          }
+        ],
+        catalog: {
+          costPatch: {
+            input: 0.834,
+            output: 2.501,
+            cacheRead: 0.042,
+            cacheWrite: 0
+          }
+        }
+      },
+      {
+        source: "providers/commandcode.kdl:477",
+        providers: [
+          "commandcode"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "tencent/hy3-paid"
+          }
+        ],
+        catalog: {
+          costPatch: {
+            input: 0.14,
+            output: 0.58,
+            cacheRead: 0.035,
+            cacheWrite: 0
+          }
+        }
+      },
+      {
+        source: "providers/commandcode.kdl:485",
+        providers: [
+          "commandcode"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "google/gemini-3.8-flash"
+          },
+          {
+            kind: "exact",
+            value: "google/gemini-3.6-flash"
+          }
+        ],
+        catalog: {
+          costPatch: {
+            input: 1.5,
+            output: 7.5,
+            cacheRead: 0.15,
+            cacheWrite: 0
+          }
+        }
+      },
+      {
+        source: "providers/commandcode.kdl:494",
+        providers: [
+          "commandcode"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "google/gemini-3.7-flash"
+          }
+        ],
+        catalog: {
+          costPatch: {
+            input: 1.5,
+            output: 7.5,
+            cacheRead: 0.15,
+            cacheWrite: 0.08334
+          }
+        }
+      },
+      {
+        source: "providers/commandcode.kdl:502",
+        providers: [
+          "commandcode"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "google/gemini-3.5-flash"
+          }
+        ],
+        catalog: {
+          costPatch: {
+            input: 1.5,
+            output: 9,
+            cacheRead: 0.15,
+            cacheWrite: 0
+          }
+        }
+      },
+      {
+        source: "providers/commandcode.kdl:510",
+        providers: [
+          "commandcode"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "google/gemini-3.5-flash-lite"
+          }
+        ],
+        catalog: {
+          costPatch: {
+            input: 0.3,
+            output: 2.5,
+            cacheRead: 0.03,
+            cacheWrite: 0
+          }
+        }
+      },
+      {
+        source: "providers/commandcode.kdl:518",
+        providers: [
+          "commandcode"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "google/gemini-3.1-flash-lite"
+          }
+        ],
+        catalog: {
+          costPatch: {
+            input: 0.25,
+            output: 1.5,
+            cacheRead: 0.03,
+            cacheWrite: 0
+          }
+        }
+      },
+      {
+        source: "providers/commandcode.kdl:526",
+        providers: [
+          "commandcode"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "sakana/fugu-ultra"
+          }
+        ],
+        catalog: {
+          costPatch: {
+            input: 5,
+            output: 30,
+            cacheRead: 0.5,
+            cacheWrite: 0
+          }
+        }
+      },
+      {
+        source: "providers/commandcode.kdl:534",
+        providers: [
+          "commandcode"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "nvidia/nemotron-3-ultra-550b-a55b"
+          }
+        ],
+        catalog: {
+          costPatch: {
+            input: 0.6,
+            output: 2.4,
+            cacheRead: 0.12,
+            cacheWrite: 0
+          }
+        }
+      },
+      {
+        source: "providers/commandcode.kdl:542",
+        providers: [
+          "commandcode"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "thinkingmachines/inkling"
+          }
+        ],
+        catalog: {
+          costPatch: {
+            input: 1,
+            output: 4.05,
+            cacheRead: 0.17,
+            cacheWrite: 0
+          }
+        }
+      },
+      {
+        source: "providers/commandcode.kdl:550",
+        providers: [
+          "commandcode"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "thinkingmachines/inkling-small"
+          }
+        ],
+        catalog: {
+          costPatch: {
+            input: 0.5,
+            output: 1.2,
+            cacheRead: 0.1,
+            cacheWrite: 0
+          }
+        }
+      },
+      {
+        source: "providers/commandcode.kdl:558",
+        providers: [
+          "commandcode"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "meta/muse-spark-1.1"
+          },
+          {
+            kind: "exact",
+            value: "meta/muse-spark-1.2"
+          },
+          {
+            kind: "exact",
+            value: "meta/muse-spark-1.3"
+          }
+        ],
+        catalog: {
+          costPatch: {
+            input: 1.25,
+            output: 4.25,
+            cacheRead: 0.15,
+            cacheWrite: 0
+          }
+        }
+      },
+      {
+        source: "providers/commandcode.kdl:566",
+        providers: [
+          "commandcode"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "meta/muse-spark-1.2-contributor"
+          },
+          {
+            kind: "exact",
+            value: "meta/muse-spark-1.3-contributor"
+          }
+        ],
+        catalog: {
+          costPatch: {
+            input: 0.1,
+            output: 0.2,
+            cacheRead: 0.002,
+            cacheWrite: 0
+          }
+        }
+      },
+      {
+        source: "providers/commandcode.kdl:574",
+        providers: [
+          "commandcode"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "xai/grok-4.5"
+          }
+        ],
+        catalog: {
+          costPatch: {
+            input: 2,
+            output: 6,
+            cacheRead: 0.5,
+            cacheWrite: 0
+          }
+        }
+      },
+      {
+        source: "providers/commandcode.kdl:586",
+        providers: [
+          "commandcode"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "xai/grok-4.6"
+          }
+        ],
+        catalog: {
+          costPatch: {
+            input: 2,
+            output: 6,
+            cacheRead: 0.5,
+            cacheWrite: 0
+          },
+          longContext: {
+            inputThreshold: 200000,
+            input: 4,
+            output: 12,
+            cacheRead: 1,
+            cacheWrite: 0
+          }
+        }
+      },
+      {
+        source: "providers/commandcode.kdl:8",
+        providers: [
+          "commandcode"
+        ],
+        wire: {
+          supportsDeveloperRole: false,
+          supportsStore: false,
+          supportsReasoningEffort: false,
+          maxTokensField: "max_tokens"
+        },
+        thinking: {
+          upgradeNeutral: true,
+          mode: "effort"
+        },
+        catalog: {
+          limitsPatch: {
+            maxTokens: 65536
+          }
+        }
+      },
+      {
+        source: "providers/coreweave.kdl:5",
+        class: "unknown",
+        providers: [
+          "coreweave"
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      },
+      {
+        source: "providers/coreweave.kdl:9",
+        providers: [
+          "coreweave"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "zai-org/GLM-5.1"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      },
+      {
+        source: "providers/coreweave.kdl:13",
+        providers: [
+          "coreweave"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "zai-org/GLM-5.2"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "max"
+          ]
+        }
+      },
+      {
+        source: "providers/coreweave.kdl:3",
+        providers: [
+          "coreweave"
+        ],
+        thinking: {
+          mode: "effort"
+        }
+      },
+      {
+        source: "providers/cursor.kdl:6",
+        class: "anthropic",
+        providers: [
+          "cursor"
+        ],
+        family: "fable",
+        catalog: {
+          requiresCursorToolSchemaProjection: true
+        }
+      },
+      {
+        source: "providers/cursor.kdl:14",
+        class: "kimi",
+        providers: [
+          "cursor"
+        ],
+        family: "k3",
+        catalog: {
+          inputModalities: [
+            "text",
+            "image"
+          ],
+          contextWindowFloor: 1e6
+        }
+      },
+      {
+        source: "providers/cursor.kdl:19",
+        providers: [
+          "cursor"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "k3"
+          },
+          {
+            kind: "glob",
+            value: "*/k3"
+          }
+        ],
+        catalog: {
+          inputModalities: [
+            "text",
+            "image"
+          ],
+          contextWindowFloor: 1e6
+        }
+      },
+      {
+        source: "providers/cursor.kdl:25",
+        providers: [
+          "cursor"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "cursor-grok-4"
+          },
+          {
+            kind: "glob",
+            value: "cursor-grok-4.*"
+          },
+          {
+            kind: "glob",
+            value: "cursor-grok-4-*"
+          },
+          {
+            kind: "glob",
+            value: "cursor-grok-4:*"
+          },
+          {
+            kind: "glob",
+            value: "cursor-grok-4_*"
+          }
+        ],
+        catalog: {
+          inputModalities: [
+            "text",
+            "image"
+          ]
+        }
+      },
+      {
+        source: "providers/cursor.kdl:28",
+        providers: [
+          "cursor"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "composer-2.5"
+          },
+          {
+            kind: "glob",
+            value: "composer-2.5.*"
+          },
+          {
+            kind: "glob",
+            value: "composer-2.5-*"
+          },
+          {
+            kind: "glob",
+            value: "composer-2.5:*"
+          },
+          {
+            kind: "glob",
+            value: "composer-2.5_*"
+          }
+        ],
+        catalog: {
+          inputModalities: [
+            "text",
+            "image"
+          ]
+        }
+      },
+      {
+        source: "providers/cursor.kdl:32",
+        providers: [
+          "cursor"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "claude-4.6-opus"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "high",
+            "max"
+          ]
+        }
+      },
+      {
+        source: "providers/cursor.kdl:36",
+        providers: [
+          "cursor"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "claude-fable-5"
+          },
+          {
+            kind: "exact",
+            value: "claude-opus-4-7"
+          },
+          {
+            kind: "exact",
+            value: "claude-opus-4-8"
+          },
+          {
+            kind: "exact",
+            value: "claude-sonnet-5"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      },
+      {
+        source: "providers/cursor.kdl:40",
+        providers: [
+          "cursor"
+        ],
+        models: [
+          {
+            kind: "glob",
+            value: "claude-opus-4*fast"
+          },
+          {
+            kind: "glob",
+            value: "gpt-5.1-codex-max*"
+          },
+          {
+            kind: "exact",
+            value: "claude-opus-5-high-fast"
+          },
+          {
+            kind: "exact",
+            value: "claude-opus-5-low-fast"
+          },
+          {
+            kind: "exact",
+            value: "claude-opus-5-medium-fast"
+          },
+          {
+            kind: "exact",
+            value: "gpt-5-mini"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      },
+      {
+        source: "providers/cursor.kdl:45",
+        providers: [
+          "cursor"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "claude-opus-5"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      },
+      {
+        source: "providers/cursor.kdl:49",
+        providers: [
+          "cursor"
+        ],
+        models: [
+          {
+            kind: "glob",
+            value: "gemini-3.7-flash*"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      },
+      {
+        source: "providers/cursor.kdl:3",
+        providers: [
+          "cursor"
+        ],
+        thinking: {
+          mode: "effort"
+        }
+      },
+      {
+        source: "providers/deepseek.kdl:10",
+        class: "deepseek",
+        providers: [
+          "deepseek"
+        ],
+        thinking: {
+          mode: "effort"
+        }
+      },
+      {
+        source: "providers/deepseek.kdl:18",
+        providers: [
+          "deepseek"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "deepseek-flash"
+          },
+          {
+            kind: "exact",
+            value: "deepseek-v4-flash"
+          },
+          {
+            kind: "exact",
+            value: "deepseek-v4-flash-vision-exp"
+          }
+        ],
+        wire: {
+          clampOutputToModelMax: true
+        },
+        catalog: {
+          timeBased: {
+            offPeakMultiplier: 0.5,
+            peakWindows: {
+              morning: {
+                weekdays: "1,2,3,4,5",
+                startMinute: 60,
+                endMinute: 240
+              },
+              afternoon: {
+                weekdays: "1,2,3,4,5",
+                startMinute: 360,
+                endMinute: 600
+              }
+            }
+          },
+          costPatch: {
+            input: 0.3,
+            output: 1.2,
+            cacheRead: 0.006,
+            cacheWrite: 0
+          }
+        }
+      },
+      {
+        source: "providers/deepseek.kdl:45",
+        providers: [
+          "deepseek"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "deepseek-flash"
+          }
+        ],
+        catalog: {
+          limitsPatch: {
+            contextWindow: 1e6,
+            maxTokens: 384000
+          }
+        }
+      },
+      {
+        source: "providers/deepseek.kdl:52",
+        providers: [
+          "deepseek"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "deepseek-v4-pro"
+          }
+        ],
+        catalog: {
+          costPatch: {
+            input: 1.32,
+            output: 3.96,
+            cacheRead: 0.044,
+            cacheWrite: 0
+          },
+          timeBased: {
+            offPeakMultiplier: 0.5,
+            peakWindows: {
+              morning: {
+                weekdays: "1,2,3,4,5",
+                startMinute: 60,
+                endMinute: 240
+              },
+              afternoon: {
+                weekdays: "1,2,3,4,5",
+                startMinute: 360,
+                endMinute: 600
+              }
+            },
+            effectiveRates: {
+              flashPricing: {
+                effectiveFrom: "2026-09-14T04:00:00Z",
+                input: 0.3,
+                output: 1.2,
+                cacheRead: 0.006,
+                cacheWrite: 0
+              }
+            }
+          }
+        }
+      },
+      {
+        source: "providers/deepseek.kdl:89",
+        providers: [
+          "deepseek"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "deepseek-flash"
+          },
+          {
+            kind: "exact",
+            value: "deepseek-v4-flash"
+          },
+          {
+            kind: "exact",
+            value: "deepseek-v4.1-flash-expires-on-0910"
+          }
+        ],
+        wire: {
+          maxTokensField: "max_tokens",
+          reasoningContentField: "reasoning_content",
+          requiresAssistantContentForToolCalls: true,
+          requiresReasoningContentForToolCalls: true,
+          allowsSyntheticReasoningContentForToolCalls: false,
+          supportsToolChoice: false
+        },
+        thinking: {
+          upgradeNeutral: true,
+          efforts: [
+            "low",
+            "high",
+            "max"
+          ]
+        }
+      },
+      {
+        source: "providers/deepseek.kdl:3",
+        providers: [
+          "deepseek"
+        ],
+        wire: {
+          extraBody: {
+            thinking: {
+              type: "enabled"
+            }
+          },
+          supportsReasoningEffort: true
+        }
+      },
+      {
+        source: "providers/firepass.kdl:10",
+        class: "glm",
+        providers: [
+          "firepass"
+        ],
+        priority: 1,
+        thinking: {
+          mode: "effort",
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "max"
+          ]
+        }
+      },
+      {
+        source: "providers/firepass.kdl:15",
+        class: "kimi",
+        providers: [
+          "firepass"
+        ],
+        priority: 1,
+        thinking: {
+          mode: "effort",
+          efforts: [
+            "low",
+            "high",
+            "max"
+          ]
+        }
+      },
+      {
+        source: "providers/firepass.kdl:3",
+        providers: [
+          "firepass"
+        ],
+        wire: {
+          wireModelIdMode: "firepass"
+        },
+        thinking: {
+          effortMap: {
+            minimal: "none"
+          }
+        }
+      },
+      {
+        source: "providers/fireworks.kdl:10",
+        providers: [
+          "fireworks"
+        ],
+        models: [
+          {
+            kind: "glob",
+            value: "*-fast"
+          }
+        ],
+        wire: {
+          wireModelIdMode: "firepass"
+        }
+      },
+      {
+        source: "providers/fireworks.kdl:17",
+        class: "qwen",
+        providers: [
+          "fireworks"
+        ],
+        wire: {
+          thinkingFormat: "openai"
+        }
+      },
+      {
+        source: "providers/fireworks.kdl:20",
+        class: "unknown",
+        providers: [
+          "fireworks"
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      },
+      {
+        source: "providers/fireworks.kdl:24",
+        providers: [
+          "fireworks"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "deepseek-v4-flash"
+          }
+        ],
+        wire: {
+          requiresReasoningContentForAllAssistantTurns: true
+        }
+      },
+      {
+        source: "providers/fireworks.kdl:28",
+        providers: [
+          "fireworks"
+        ],
+        models: [
+          {
+            kind: "glob",
+            value: "glm-5.1*"
+          },
+          {
+            kind: "exact",
+            value: "glm-5"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      },
+      {
+        source: "providers/fireworks.kdl:32",
+        providers: [
+          "fireworks"
+        ],
+        models: [
+          {
+            kind: "glob",
+            value: "glm-5.2*"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "max"
+          ]
+        }
+      },
+      {
+        source: "providers/fireworks.kdl:36",
+        providers: [
+          "fireworks"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "qwen3-coder-480b-a35b-instruct"
+          }
+        ],
+        wire: {
+          thinkingFormat: "openai"
+        }
+      },
+      {
+        source: "providers/fireworks.kdl:40",
+        providers: [
+          "fireworks"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "qwen3.6-plus"
+          }
+        ],
+        wire: {
+          supportsDeveloperRole: false
+        }
+      },
+      {
+        source: "providers/fireworks.kdl:3",
+        providers: [
+          "fireworks"
+        ],
+        priority: -1,
+        wire: {
+          wireModelIdMode: "fireworks",
+          dropThinkingWhenReasoningEffort: true
+        },
+        thinking: {
+          effortMap: {
+            minimal: "none"
+          },
+          mode: "effort"
+        }
+      },
+      {
+        source: "providers/github-copilot.kdl:11",
+        class: "anthropic",
+        providers: [
+          "github-copilot"
+        ],
+        revision: [
+          {
+            op: ">=",
+            revision: "4.0.0"
+          },
+          {
+            op: "<",
+            revision: "4.6.0"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      },
+      {
+        source: "providers/github-copilot.kdl:16",
+        class: "gemini",
+        providers: [
+          "github-copilot"
+        ],
+        family: "flash",
+        wire: {
+          supportsDeveloperRole: false
+        }
+      },
+      {
+        source: "providers/github-copilot.kdl:19",
+        class: "gemini",
+        providers: [
+          "github-copilot"
+        ],
+        revision: [
+          {
+            op: ">=",
+            revision: "2.5.0"
+          },
+          {
+            op: "<",
+            revision: "3.7.0"
+          }
+        ],
+        thinking: {
+          mode: "effort"
+        }
+      },
+      {
+        source: "providers/github-copilot.kdl:23",
+        class: "kimi",
+        providers: [
+          "github-copilot"
+        ],
+        thinking: {
+          mode: "effort"
+        }
+      },
+      {
+        source: "providers/github-copilot.kdl:27",
+        class: "openai",
+        providers: [
+          "github-copilot"
+        ],
+        revision: [
+          {
+            op: ">=",
+            revision: "5.0.0"
+          },
+          {
+            op: "<",
+            revision: "5.7.0"
+          }
+        ],
+        thinking: {
+          mode: "effort"
+        }
+      },
+      {
+        source: "providers/github-copilot.kdl:31",
+        class: "unknown",
+        providers: [
+          "github-copilot"
+        ],
+        thinking: {
+          mode: "effort"
+        }
+      },
+      {
+        source: "providers/github-copilot.kdl:35",
+        class: "xai",
+        providers: [
+          "github-copilot"
+        ],
+        family: "grok",
+        thinking: {
+          mode: "effort"
+        }
+      },
+      {
+        source: "providers/github-copilot.kdl:40",
+        providers: [
+          "github-copilot"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "gemini-2.5-pro"
+          },
+          {
+            kind: "exact",
+            value: "gemini-3.1-pro-preview"
+          },
+          {
+            kind: "exact",
+            value: "gpt-4.1"
+          }
+        ],
+        wire: {
+          supportsDeveloperRole: false
+        }
+      },
+      {
+        source: "providers/github-copilot.kdl:44",
+        providers: [
+          "github-copilot"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "gpt-5.1-codex"
+          },
+          {
+            kind: "exact",
+            value: "gpt-5.1-codex-max"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      },
+      {
+        source: "providers/github-copilot.kdl:48",
+        providers: [
+          "github-copilot"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "gpt-5.1-codex-mini"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "medium",
+            "high"
+          ]
+        }
+      },
+      {
+        source: "providers/github-copilot.kdl:52",
+        providers: [
+          "github-copilot"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "grok-4.5"
+          },
+          {
+            kind: "exact",
+            value: "mai-code-1-flash-picker"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      },
+      {
+        source: "providers/github-copilot.kdl:59",
+        providers: [
+          "github-copilot"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "grok-4.6"
+          },
+          {
+            kind: "exact",
+            value: "grok-4.6-1m"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      },
+      {
+        source: "providers/github-copilot.kdl:3",
+        providers: [
+          "github-copilot"
+        ],
+        wire: {
+          supportsStrictMode: true,
+          disableStrictTools: true,
+          supportsContextManagement: false
+        }
+      },
+      {
+        source: "providers/gitlab-duo.kdl:5",
+        class: "openai",
+        providers: [
+          "gitlab-duo"
+        ],
+        revision: [
+          {
+            op: ">=",
+            revision: "5.0.0"
+          },
+          {
+            op: "<",
+            revision: "5.2.0"
+          }
+        ],
+        thinking: {
+          mode: "effort"
+        }
+      },
+      {
+        source: "providers/gitlab-duo.kdl:10",
+        providers: [
+          "gitlab-duo"
+        ],
+        models: [
+          {
+            kind: "glob",
+            value: "*5"
+          },
+          {
+            kind: "glob",
+            value: "*6"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ],
+          mode: "budget"
+        }
+      },
+      {
+        source: "providers/gitlab-duo.kdl:15",
+        providers: [
+          "gitlab-duo"
+        ],
+        models: [
+          {
+            kind: "glob",
+            value: "duo-chat-gpt*"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ],
+          mode: "effort"
+        }
+      },
+      {
+        source: "providers/gitlab-duo.kdl:21",
+        providers: [
+          "gitlab-duo"
+        ],
+        models: [
+          {
+            kind: "glob",
+            value: "duo-chat-gpt-5*"
+          }
+        ],
+        wire: {
+          supportsSamplingParams: false
+        }
+      },
+      {
+        source: "providers/gmi-cloud.kdl:5",
+        providers: [
+          "gmi-cloud"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "deepseek-ai/DeepSeek-V4-Flash"
+          }
+        ],
+        thinking: {
+          mode: "effort"
+        }
+      },
+      {
+        source: "providers/google-antigravity.kdl:5",
+        class: "anthropic",
+        providers: [
+          "google-antigravity"
+        ],
+        family: "opus",
+        thinking: {
+          mode: "budget"
+        }
+      },
+      {
+        source: "providers/google-antigravity.kdl:13",
+        class: "gemini",
+        providers: [
+          "google-antigravity"
+        ],
+        revision: [
+          {
+            op: ">=",
+            revision: "3.0.0"
+          }
+        ],
+        wire: {
+          requiresSkipThoughtSignatureOnFirstFunctionCall: true
+        }
+      },
+      {
+        source: "providers/google-antigravity.kdl:17",
+        class: "gemini",
+        providers: [
+          "google-antigravity"
+        ],
+        family: "flash",
+        revision: [
+          {
+            op: ">=",
+            revision: "3.0.0"
+          },
+          {
+            op: "<",
+            revision: "3.6.0"
+          }
+        ],
+        thinking: {
+          effortBudgets: {
+            high: 1e4,
+            low: 1000,
+            medium: 4000,
+            minimal: 1000
+          },
+          mode: "budget",
+          suppressWhenOff: true
+        }
+      },
+      {
+        source: "providers/google-antigravity.kdl:27",
+        class: "gemini",
+        providers: [
+          "google-antigravity"
+        ],
+        family: "flash",
+        revision: [
+          {
+            op: ">=",
+            revision: "3.6.0"
+          }
+        ],
+        thinking: {
+          mode: "google-level",
+          requiresEffort: true
+        }
+      },
+      {
+        source: "providers/google-antigravity.kdl:33",
+        class: "gemini",
+        providers: [
+          "google-antigravity"
+        ],
+        family: "pro",
+        revision: [
+          {
+            op: ">=",
+            revision: "3.0.0"
+          },
+          {
+            op: "<",
+            revision: "3.2.0"
+          }
+        ],
+        thinking: {
+          suppressWhenOff: true
+        }
+      },
+      {
+        source: "providers/google-antigravity.kdl:39",
+        providers: [
+          "google-antigravity"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "claude-opus-4-6"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      },
+      {
+        source: "providers/google-antigravity.kdl:43",
+        providers: [
+          "google-antigravity"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "gemini-3-pro"
+          }
+        ],
+        thinking: {
+          mode: "google-level"
+        }
+      },
+      {
+        source: "providers/google-antigravity.kdl:47",
+        providers: [
+          "google-antigravity"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "gemini-3.1-flash-lite"
+          }
+        ],
+        thinking: {
+          mode: "google-level",
+          requiresEffort: true
+        }
+      },
+      {
+        source: "providers/google-antigravity.kdl:52",
+        providers: [
+          "google-antigravity"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "gemini-3.1-pro"
+          }
+        ],
+        thinking: {
+          effortBudgets: {
+            high: 10001,
+            low: 1001
+          },
+          mode: "budget"
+        }
+      },
+      {
+        source: "providers/google-gemini-cli.kdl:8",
+        class: "gemini",
+        providers: [
+          "google-gemini-cli"
+        ],
+        revision: [
+          {
+            op: ">=",
+            revision: "3.0.0"
+          }
+        ],
+        wire: {
+          requiresSkipThoughtSignatureOnFirstFunctionCall: true
+        }
+      },
+      {
+        source: "providers/google-vertex.kdl:12",
+        class: "anthropic",
+        providers: [
+          "google-vertex"
+        ],
+        revision: [
+          {
+            op: ">=",
+            revision: "4.5.0"
+          },
+          {
+            op: "<",
+            revision: "4.6.0"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      },
+      {
+        source: "providers/google-vertex.kdl:17",
+        providers: [
+          "google-vertex"
+        ],
+        models: [
+          {
+            kind: "glob",
+            value: "*latest"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ],
+          mode: "budget"
+        }
+      },
+      {
+        source: "providers/google-vertex.kdl:22",
+        providers: [
+          "google-vertex"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "openai/gpt-oss-120b-maas"
+          }
+        ],
+        thinking: {
+          mode: "effort"
+        }
+      },
+      {
+        source: "providers/google-vertex.kdl:3",
+        providers: [
+          "google-vertex"
+        ],
+        wire: {
+          supportsFunctionPartId: false,
+          supportsContextManagement: false,
+          supportsOutputEffort: false
+        }
+      },
+      {
+        source: "providers/google.kdl:4",
+        class: "unknown",
+        providers: [
+          "google"
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ],
+          mode: "budget"
+        }
+      },
+      {
+        source: "providers/google.kdl:9",
+        providers: [
+          "google"
+        ],
+        models: [
+          {
+            kind: "glob",
+            value: "*latest"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ],
+          mode: "budget"
+        }
+      },
+      {
+        source: "providers/google.kdl:14",
+        providers: [
+          "google"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "gemini-2.5-computer-use-preview-10-2025"
+          },
+          {
+            kind: "exact",
+            value: "gemini-robotics-er-1.6-preview"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      },
+      {
+        source: "providers/groq.kdl:5",
+        class: "unknown",
+        providers: [
+          "groq"
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      },
+      {
+        source: "providers/groq.kdl:3",
+        providers: [
+          "groq"
+        ],
+        thinking: {
+          mode: "effort"
+        }
+      },
+      {
+        source: "providers/huggingface.kdl:5",
+        class: "unknown",
+        providers: [
+          "huggingface"
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      },
+      {
+        source: "providers/huggingface.kdl:9",
+        providers: [
+          "huggingface"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "Qwen/Qwen3-235B-A22B-Thinking-2507"
+          }
+        ],
+        thinking: {
+          requiresEffort: true
+        }
+      },
+      {
+        source: "providers/huggingface.kdl:13",
+        providers: [
+          "huggingface"
+        ],
+        models: [
+          {
+            kind: "glob",
+            value: "deepseek-ai/deepseek-v3.*"
+          }
+        ],
+        wire: {
+          requiresReasoningContentForAllAssistantTurns: true
+        }
+      },
+      {
+        source: "providers/huggingface.kdl:17",
+        providers: [
+          "huggingface"
+        ],
+        models: [
+          {
+            kind: "glob",
+            value: "zai-org/glm-4*"
+          },
+          {
+            kind: "exact",
+            value: "zai-org/GLM-5"
+          },
+          {
+            kind: "exact",
+            value: "zai-org/GLM-5.1"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      },
+      {
+        source: "providers/huggingface.kdl:21",
+        providers: [
+          "huggingface"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "zai-org/GLM-5.2"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "max"
+          ]
+        }
+      },
+      {
+        source: "providers/huggingface.kdl:3",
+        providers: [
+          "huggingface"
+        ],
+        thinking: {
+          mode: "effort"
+        }
+      },
+      {
+        source: "providers/kilo.kdl:5",
+        providers: [
+          "kilo"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "moonshotai/kimi-k2.6"
+          }
+        ],
+        wire: {
+          streamIdleTimeoutMs: 300000
+        }
+      },
+      {
+        source: "providers/kilo.kdl:10",
+        class: "glm",
+        providers: [
+          "kilo"
+        ],
+        family: "turbo",
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      },
+      {
+        source: "providers/kilo.kdl:14",
+        class: "unknown",
+        providers: [
+          "kilo"
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      },
+      {
+        source: "providers/kilo.kdl:18",
+        providers: [
+          "kilo"
+        ],
+        models: [
+          {
+            kind: "glob",
+            value: "*thinking-2507"
+          },
+          {
+            kind: "exact",
+            value: "arcee-ai/trinity-large-thinking"
+          },
+          {
+            kind: "exact",
+            value: "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free"
+          }
+        ],
+        thinking: {
+          requiresEffort: true
+        }
+      },
+      {
+        source: "providers/kilo.kdl:23",
+        providers: [
+          "kilo"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "deepseek/deepseek-chat-v3.1"
+          }
+        ],
+        wire: {
+          requiresReasoningContentForAllAssistantTurns: true
+        },
+        thinking: {
+          efforts: [
+            "high",
+            "max"
+          ]
+        }
+      },
+      {
+        source: "providers/kilo.kdl:28",
+        providers: [
+          "kilo"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "deepseek/deepseek-r1"
+          },
+          {
+            kind: "exact",
+            value: "deepseek/deepseek-r1-0528"
+          },
+          {
+            kind: "exact",
+            value: "deepseek/deepseek-v3.1-terminus"
+          },
+          {
+            kind: "exact",
+            value: "deepseek/deepseek-v3.2"
+          },
+          {
+            kind: "exact",
+            value: "deepseek/deepseek-v3.2-exp"
+          },
+          {
+            kind: "exact",
+            value: "deepseek/deepseek-v4-flash"
+          },
+          {
+            kind: "exact",
+            value: "deepseek/deepseek-v4-flash-0731"
+          },
+          {
+            kind: "exact",
+            value: "deepseek/deepseek-v4-flash:discounted"
+          },
+          {
+            kind: "exact",
+            value: "~deepseek/deepseek-v4-flash-latest"
+          }
+        ],
+        wire: {
+          requiresReasoningContentForAllAssistantTurns: true
+        }
+      },
+      {
+        source: "providers/kilo.kdl:35",
+        providers: [
+          "kilo"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "openai/gpt-5.1-codex"
+          },
+          {
+            kind: "exact",
+            value: "openai/gpt-5.1-codex-max"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      },
+      {
+        source: "providers/kilo.kdl:39",
+        providers: [
+          "kilo"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "openai/gpt-5.1-codex-mini"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "medium",
+            "high"
+          ]
+        }
+      },
+      {
+        source: "providers/kilo.kdl:43",
+        providers: [
+          "kilo"
+        ],
+        models: [
+          {
+            kind: "glob",
+            value: "z-ai/glm-4.5*"
+          },
+          {
+            kind: "glob",
+            value: "z-ai/glm-4.7*"
+          },
+          {
+            kind: "glob",
+            value: "~google*"
+          },
+          {
+            kind: "glob",
+            value: "~openai*"
+          },
+          {
+            kind: "exact",
+            value: "z-ai/glm-4.6"
+          },
+          {
+            kind: "exact",
+            value: "z-ai/glm-4.6v"
+          },
+          {
+            kind: "exact",
+            value: "z-ai/glm-5"
+          },
+          {
+            kind: "exact",
+            value: "z-ai/glm-5.1"
+          },
+          {
+            kind: "exact",
+            value: "~moonshotai/kimi-latest"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      },
+      {
+        source: "providers/kilo.kdl:48",
+        providers: [
+          "kilo"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "z-ai/glm-5.2"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "max"
+          ]
+        }
+      },
+      {
+        source: "providers/kilo.kdl:3",
+        providers: [
+          "kilo"
+        ],
+        thinking: {
+          mode: "effort"
+        }
+      },
+      {
+        source: "providers/kimi-code.kdl:7",
+        class: "kimi",
+        providers: [
+          "kimi-code"
+        ],
+        family: "k3",
+        wire: {
+          thinkingFormat: "openai"
+        }
+      },
+      {
+        source: "providers/kimi-code.kdl:4",
+        class: "kimi",
+        providers: [
+          "kimi-code"
+        ],
+        wire: {
+          thinkingFormat: "zai"
+        }
+      },
+      {
+        source: "providers/kimi-code.kdl:20",
+        class: "kimi",
+        providers: [
+          "kimi-code"
+        ],
+        family: "k2.5",
+        catalog: {
+          inputModalities: [
+            "text",
+            "image"
+          ]
+        }
+      },
+      {
+        source: "providers/kimi-code.kdl:24",
+        class: "unknown",
+        providers: [
+          "kimi-code"
+        ],
+        wire: {
+          reasoningContentField: "reasoning_content",
+          supportsDeveloperRole: false,
+          thinkingFormat: "kimi"
+        },
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      },
+      {
+        source: "providers/kimi-code.kdl:31",
+        providers: [
+          "kimi-code"
+        ],
+        models: [
+          {
+            kind: "glob",
+            value: "kimi-for*"
+          }
+        ],
+        wire: {
+          reasoningContentField: "reasoning_content",
+          supportsDeveloperRole: false,
+          thinkingFormat: "zai"
+        },
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      },
+      {
+        source: "providers/kimi-code.kdl:3",
+        providers: [
+          "kimi-code"
+        ],
+        wire: {
+          kimiApiFormat: "anthropic",
+          supportsPromptCacheKey: true
+        },
+        thinking: {
+          mode: "effort"
+        }
+      },
+      {
+        source: "providers/llama.cpp.kdl:3",
+        providers: [
+          "llama.cpp"
+        ],
+        wire: {
+          supportsNamedToolChoice: false
+        }
+      },
+      {
+        source: "providers/lm-studio.kdl:3",
+        providers: [
+          "lm-studio"
+        ],
+        wire: {
+          supportsNamedToolChoice: false
+        }
+      },
+      {
+        source: "providers/meta.kdl:7",
+        class: "unknown",
+        providers: [
+          "meta"
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ],
+          mode: "effort"
+        }
+      },
+      {
+        source: "providers/meta.kdl:3",
+        providers: [
+          "meta"
+        ],
+        wire: {
+          includeEncryptedReasoning: true,
+          supportsReasoningEffort: true,
+          clampOutputToModelMax: true
+        }
+      },
+      {
+        source: "providers/minimax-code-cn.kdl:6",
+        class: "minimax",
+        providers: [
+          "minimax-code-cn"
+        ],
+        thinking: {
+          mode: "effort"
+        }
+      },
+      {
+        source: "providers/minimax-code-cn.kdl:10",
+        providers: [
+          "minimax-code-cn"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "MiniMax-M3"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      },
+      {
+        source: "providers/minimax-code-cn.kdl:3",
+        providers: [
+          "minimax-code-cn"
+        ],
+        priority: 1,
+        wire: {
+          reasoningDeltasMayBeCumulative: true
+        }
+      },
+      {
+        source: "providers/minimax-code.kdl:6",
+        class: "minimax",
+        providers: [
+          "minimax-code"
+        ],
+        thinking: {
+          mode: "effort"
+        }
+      },
+      {
+        source: "providers/minimax-code.kdl:10",
+        providers: [
+          "minimax-code"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "MiniMax-M3"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      },
+      {
+        source: "providers/minimax-code.kdl:3",
+        providers: [
+          "minimax-code"
+        ],
+        priority: 1,
+        wire: {
+          reasoningDeltasMayBeCumulative: true
+        }
+      },
+      {
+        source: "providers/minimax.kdl:3",
+        providers: [
+          "minimax"
+        ],
+        priority: 1,
+        wire: {
+          reasoningDeltasMayBeCumulative: true
+        }
+      },
+      {
+        source: "providers/mistral.kdl:5",
+        class: "unknown",
+        providers: [
+          "mistral"
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      },
+      {
+        source: "providers/mistral.kdl:3",
+        providers: [
+          "mistral"
+        ],
+        thinking: {
+          mode: "effort"
+        }
+      },
+      {
+        source: "providers/moonshot.kdl:7",
+        class: "kimi",
+        providers: [
+          "moonshot"
+        ],
+        family: "k3",
+        wire: {
+          thinkingFormat: "openai"
+        }
+      },
+      {
+        source: "providers/moonshot.kdl:4",
+        class: "kimi",
+        providers: [
+          "moonshot"
+        ],
+        wire: {
+          thinkingFormat: "zai"
+        },
+        thinking: {
+          mode: "effort"
+        }
+      },
+      {
+        source: "providers/moonshot.kdl:15",
+        class: "kimi",
+        providers: [
+          "moonshot"
+        ],
+        family: "k2.5",
+        catalog: {
+          inputModalities: [
+            "text",
+            "image"
+          ]
+        }
+      },
+      {
+        source: "providers/moonshot.kdl:18",
+        class: "kimi",
+        providers: [
+          "moonshot"
+        ],
+        family: "k2.6",
+        catalog: {
+          inputModalities: [
+            "text",
+            "image"
+          ]
+        }
+      },
+      {
+        source: "providers/moonshot.kdl:21",
+        class: "kimi",
+        providers: [
+          "moonshot"
+        ],
+        family: "k2.7-code",
+        catalog: {
+          inputModalities: [
+            "text",
+            "image"
+          ]
+        }
+      },
+      {
+        source: "providers/moonshot.kdl:24",
+        class: "kimi",
+        providers: [
+          "moonshot"
+        ],
+        family: "k3",
+        catalog: {
+          inputModalities: [
+            "text",
+            "image"
+          ]
+        }
+      },
+      {
+        source: "providers/moonshot.kdl:30",
+        providers: [
+          "moonshot"
+        ],
+        models: [
+          {
+            kind: "token",
+            value: "vision"
+          }
+        ],
+        catalog: {
+          inputModalities: [
+            "text",
+            "image"
+          ]
+        }
+      },
+      {
+        source: "providers/moonshot.kdl:33",
+        providers: [
+          "moonshot"
+        ],
+        models: [
+          {
+            kind: "token",
+            value: "vl"
+          }
+        ],
+        catalog: {
+          inputModalities: [
+            "text",
+            "image"
+          ]
+        }
+      },
+      {
+        source: "providers/muse-code.kdl:12",
+        class: "unknown",
+        providers: [
+          "muse-code"
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ],
+          mode: "effort"
+        }
+      },
+      {
+        source: "providers/muse-code.kdl:3",
+        providers: [
+          "muse-code"
+        ],
+        wire: {
+          includeEncryptedReasoning: true,
+          supportsReasoningEffort: true,
+          clampOutputToModelMax: true
+        },
+        catalog: {
+          editPromptVariant: "compact"
+        }
+      },
+      {
+        source: "providers/nanogpt.kdl:5",
+        providers: [
+          "nanogpt"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "moonshotai/kimi-k2.6:thinking"
+          }
+        ],
+        wire: {
+          streamIdleTimeoutMs: 300000
+        }
+      },
+      {
+        source: "providers/nanogpt.kdl:10",
+        class: "anthropic",
+        providers: [
+          "nanogpt"
+        ],
+        revision: [
+          {
+            op: ">=",
+            revision: "4.0.0"
+          },
+          {
+            op: "<",
+            revision: "4.5.0"
+          }
+        ],
+        thinking: {
+          requiresEffort: true
+        }
+      },
+      {
+        source: "providers/nanogpt.kdl:15",
+        class: "glm",
+        providers: [
+          "nanogpt"
+        ],
+        family: "flash",
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      },
+      {
+        source: "providers/nanogpt.kdl:18",
+        class: "glm",
+        providers: [
+          "nanogpt"
+        ],
+        family: "turbo",
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      },
+      {
+        source: "providers/nanogpt.kdl:24",
+        class: "openai",
+        providers: [
+          "nanogpt"
+        ],
+        family: "o-series",
+        revision: [
+          {
+            op: ">=",
+            revision: "4.0.0"
+          },
+          {
+            op: "<",
+            revision: "4.1.0"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      },
+      {
+        source: "providers/nanogpt.kdl:30",
+        providers: [
+          "nanogpt"
+        ],
+        models: [
+          {
+            kind: "glob",
+            value: "*5.2:thinking"
+          },
+          {
+            kind: "glob",
+            value: "*glm-5.2"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "max"
+          ]
+        }
+      },
+      {
+        source: "providers/nanogpt.kdl:34",
+        providers: [
+          "nanogpt"
+        ],
+        models: [
+          {
+            kind: "glob",
+            value: "*glm-5.1"
+          },
+          {
+            kind: "glob",
+            value: "aion-labs/aion-3*"
+          },
+          {
+            kind: "glob",
+            value: "google*latest"
+          },
+          {
+            kind: "glob",
+            value: "holo*"
+          },
+          {
+            kind: "glob",
+            value: "inclusionai*thinking"
+          },
+          {
+            kind: "glob",
+            value: "meta/*"
+          },
+          {
+            kind: "glob",
+            value: "nanogpt*"
+          },
+          {
+            kind: "glob",
+            value: "nex-agi/nex*"
+          },
+          {
+            kind: "glob",
+            value: "nousresearch/hermes-4*"
+          },
+          {
+            kind: "glob",
+            value: "nvidia*b"
+          },
+          {
+            kind: "glob",
+            value: "nvidia*thinking"
+          },
+          {
+            kind: "glob",
+            value: "poolside*"
+          },
+          {
+            kind: "glob",
+            value: "sakana*"
+          },
+          {
+            kind: "glob",
+            value: "sarvam*"
+          },
+          {
+            kind: "glob",
+            value: "tencent/hy*"
+          },
+          {
+            kind: "glob",
+            value: "thinkingmachines*thinking"
+          },
+          {
+            kind: "glob",
+            value: "z-ai/glm-4*"
+          },
+          {
+            kind: "glob",
+            value: "zai-org/glm-4*thinking"
+          },
+          {
+            kind: "glob",
+            value: "zai-org/glm-5-original*"
+          },
+          {
+            kind: "exact",
+            value: "TEE/glm-5-1"
+          },
+          {
+            kind: "exact",
+            value: "aion-labs/aion-2.0"
+          },
+          {
+            kind: "exact",
+            value: "arcee-ai/trinity-large"
+          },
+          {
+            kind: "exact",
+            value: "arcee-ai/trinity-mini"
+          },
+          {
+            kind: "exact",
+            value: "bytedance-seed/seed-2.0-lite"
+          },
+          {
+            kind: "exact",
+            value: "inclusionai/ring-2.6-1t"
+          },
+          {
+            kind: "exact",
+            value: "longcat-2.0:thinking"
+          },
+          {
+            kind: "exact",
+            value: "mercury-2"
+          },
+          {
+            kind: "exact",
+            value: "minimax/minimax-latest"
+          },
+          {
+            kind: "exact",
+            value: "mistralai/devstral-2-123b-instruct-2512"
+          },
+          {
+            kind: "exact",
+            value: "moonshotai/kimi-latest"
+          },
+          {
+            kind: "exact",
+            value: "nvidia/nvidia-nemotron-nano-9b-v2"
+          },
+          {
+            kind: "exact",
+            value: "openai/gpt-chat-latest"
+          },
+          {
+            kind: "exact",
+            value: "openai/gpt-latest"
+          },
+          {
+            kind: "exact",
+            value: "openai/o1"
+          },
+          {
+            kind: "exact",
+            value: "openai/o3"
+          },
+          {
+            kind: "exact",
+            value: "openai/o3-deep-research"
+          },
+          {
+            kind: "exact",
+            value: "openai/o3-pro-2025-06-10"
+          },
+          {
+            kind: "exact",
+            value: "pokee-isaac"
+          },
+          {
+            kind: "exact",
+            value: "sonar-pro"
+          },
+          {
+            kind: "exact",
+            value: "tngtech/tng-r1t-chimera"
+          },
+          {
+            kind: "exact",
+            value: "upstage/solar-pro-3"
+          },
+          {
+            kind: "exact",
+            value: "zai-org/glm-4.7"
+          },
+          {
+            kind: "exact",
+            value: "zai-org/glm-4.7-original"
+          },
+          {
+            kind: "exact",
+            value: "zai-org/glm-5"
+          },
+          {
+            kind: "exact",
+            value: "zai-org/glm-5.1:thinking"
+          },
+          {
+            kind: "exact",
+            value: "zai-org/glm-5:thinking"
+          },
+          {
+            kind: "exact",
+            value: "zai-org/glm-latest"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      },
+      {
+        source: "providers/nanogpt.kdl:48",
+        providers: [
+          "nanogpt"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "Qwen/Qwen3-235B-A22B-Thinking-2507"
+          }
+        ],
+        thinking: {
+          requiresEffort: true
+        }
+      },
+      {
+        source: "providers/nanogpt.kdl:52",
+        providers: [
+          "nanogpt"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "claw"
+          },
+          {
+            kind: "exact",
+            value: "hermes"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      },
+      {
+        source: "providers/nanogpt.kdl:56",
+        providers: [
+          "nanogpt"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "deepseek/deepseek-latest"
+          }
+        ],
+        wire: {
+          requiresReasoningContentForAllAssistantTurns: true
+        },
+        thinking: {
+          efforts: [
+            "high",
+            "max"
+          ]
+        }
+      },
+      {
+        source: "providers/nanogpt.kdl:61",
+        providers: [
+          "nanogpt"
+        ],
+        models: [
+          {
+            kind: "glob",
+            value: "deepseek/deepseek-v4-flash*"
+          },
+          {
+            kind: "exact",
+            value: "deepseek-ai/DeepSeek-R1-0528"
+          },
+          {
+            kind: "exact",
+            value: "deepseek/deepseek-v3.2:thinking"
+          }
+        ],
+        wire: {
+          requiresReasoningContentForAllAssistantTurns: true
+        }
+      },
+      {
+        source: "providers/nanogpt.kdl:66",
+        providers: [
+          "nanogpt"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "linkup-research"
+          }
+        ],
+        thinking: {
+          defaultLevel: "high",
+          efforts: [
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ],
+          requiresEffort: true
+        }
+      },
+      {
+        source: "providers/nanogpt.kdl:72",
+        providers: [
+          "nanogpt"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ],
+          requiresEffort: true
+        }
+      },
+      {
+        source: "providers/nanogpt.kdl:77",
+        providers: [
+          "nanogpt"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "openai/gpt-5.1-codex"
+          },
+          {
+            kind: "exact",
+            value: "openai/gpt-5.1-codex-max"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      },
+      {
+        source: "providers/nanogpt.kdl:81",
+        providers: [
+          "nanogpt"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "openai/gpt-5.1-codex-mini"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "medium",
+            "high"
+          ]
+        }
+      },
+      {
+        source: "providers/nanogpt.kdl:86",
+        providers: [
+          "nanogpt"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "Qwen3.5-27B-Claude-4.6-Opus-Reasoning-Distilled-Derestricted"
+          },
+          {
+            kind: "exact",
+            value: "Qwen3.5-27B-Claude-4.6-Opus-Reasoning-Distilled-Derestricted-Lite"
+          }
+        ],
+        wire: {
+          disableReasoningOnForcedToolChoice: false,
+          supportsStore: false,
+          thinkingFormat: "qwen"
+        }
+      },
+      {
+        source: "providers/nanogpt.kdl:92",
+        providers: [
+          "nanogpt"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "Gemma-4-31B-Claude-4.6-Opus-Reasoning-Distilled"
+          }
+        ],
+        wire: {
+          disableReasoningOnForcedToolChoice: false
+        },
+        thinking: {
+          requiresEffort: true
+        }
+      },
+      {
+        source: "providers/nanogpt.kdl:97",
+        providers: [
+          "nanogpt"
+        ],
+        models: [
+          {
+            kind: "glob",
+            value: "*deepseek-r1-distill*"
+          }
+        ],
+        wire: {
+          streamMarkupHealingPattern: "dsml"
+        }
+      },
+      {
+        source: "providers/nanogpt.kdl:3",
+        providers: [
+          "nanogpt"
+        ],
+        thinking: {
+          mode: "effort"
+        }
+      },
+      {
+        source: "providers/novita.kdl:6",
+        class: "glm",
+        providers: [
+          "novita"
+        ],
+        family: "turbo",
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      },
+      {
+        source: "providers/novita.kdl:10",
+        class: "unknown",
+        providers: [
+          "novita"
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      },
+      {
+        source: "providers/novita.kdl:14",
+        providers: [
+          "novita"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "deepseek/deepseek-r1/community"
+          }
+        ],
+        wire: {
+          requiresReasoningContentForAllAssistantTurns: true
+        },
+        thinking: {
+          efforts: [
+            "high",
+            "max"
+          ]
+        }
+      },
+      {
+        source: "providers/novita.kdl:19",
+        providers: [
+          "novita"
+        ],
+        models: [
+          {
+            kind: "glob",
+            value: "deepseek/deepseek-v3.*"
+          }
+        ],
+        wire: {
+          requiresReasoningContentForAllAssistantTurns: true
+        }
+      },
+      {
+        source: "providers/novita.kdl:23",
+        providers: [
+          "novita"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "qwen/qwen3-235b-a22b-thinking-2507"
+          }
+        ],
+        thinking: {
+          requiresEffort: true
+        }
+      },
+      {
+        source: "providers/novita.kdl:27",
+        providers: [
+          "novita"
+        ],
+        models: [
+          {
+            kind: "glob",
+            value: "zai-org/glm-4*"
+          },
+          {
+            kind: "exact",
+            value: "zai-org/glm-5"
+          },
+          {
+            kind: "exact",
+            value: "zai-org/glm-5.1"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      },
+      {
+        source: "providers/novita.kdl:31",
+        providers: [
+          "novita"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "zai-org/glm-5.2"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "max"
+          ]
+        }
+      },
+      {
+        source: "providers/novita.kdl:3",
+        providers: [
+          "novita"
+        ],
+        thinking: {
+          mode: "effort"
+        }
+      },
+      {
+        source: "providers/nvidia.kdl:5",
+        class: "qwen",
+        providers: [
+          "nvidia"
+        ],
+        wire: {
+          thinkingFormat: "qwen-chat-template"
+        }
+      },
+      {
+        source: "providers/nvidia.kdl:8",
+        class: "unknown",
+        providers: [
+          "nvidia"
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      },
+      {
+        source: "providers/nvidia.kdl:12",
+        providers: [
+          "nvidia"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning"
+          }
+        ],
+        thinking: {
+          requiresEffort: true
+        }
+      },
+      {
+        source: "providers/nvidia.kdl:16",
+        providers: [
+          "nvidia"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "qwen/qwen3-next-80b-a3b-thinking"
+          }
+        ],
+        wire: {
+          thinkingFormat: "qwen-chat-template"
+        }
+      },
+      {
+        source: "providers/nvidia.kdl:20",
+        providers: [
+          "nvidia"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "z-ai/glm-5.1"
+          },
+          {
+            kind: "exact",
+            value: "z-ai/glm4.7"
+          },
+          {
+            kind: "exact",
+            value: "z-ai/glm5"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      },
+      {
+        source: "providers/nvidia.kdl:24",
+        providers: [
+          "nvidia"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "z-ai/glm-5.2"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "max"
+          ]
+        }
+      },
+      {
+        source: "providers/nvidia.kdl:3",
+        providers: [
+          "nvidia"
+        ],
+        thinking: {
+          mode: "effort"
+        }
+      },
+      {
+        source: "providers/ollama-cloud.kdl:5",
+        class: "unknown",
+        providers: [
+          "ollama-cloud"
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      },
+      {
+        source: "providers/ollama-cloud.kdl:9",
+        providers: [
+          "ollama-cloud"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "deepseek-v4-pro:preview"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "low",
+            "high",
+            "max"
+          ]
+        }
+      },
+      {
+        source: "providers/ollama-cloud.kdl:13",
+        providers: [
+          "ollama-cloud"
+        ],
+        models: [
+          {
+            kind: "glob",
+            value: "glm-4*"
+          },
+          {
+            kind: "exact",
+            value: "glm-5"
+          },
+          {
+            kind: "exact",
+            value: "glm-5.1"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      },
+      {
+        source: "providers/ollama-cloud.kdl:17",
+        providers: [
+          "ollama-cloud"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "glm-5.2"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "high",
+            "max"
+          ]
+        }
+      },
+      {
+        source: "providers/ollama-cloud.kdl:3",
+        providers: [
+          "ollama-cloud"
+        ],
+        thinking: {
+          mode: "effort"
+        }
+      },
+      {
+        source: "providers/ollama.kdl:8",
+        providers: [
+          "ollama"
+        ],
+        priority: -1,
+        wire: {
+          emptyLengthFinishIsContextError: true
+        },
+        thinking: {
+          efforts: [
+            "low",
+            "medium",
+            "high",
+            "max"
+          ]
+        }
+      },
+      {
+        source: "providers/openai-codex.kdl:21",
+        providers: [
+          "openai-codex"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "gpt-daybreak-blue-latest"
+          },
+          {
+            kind: "exact",
+            value: "gpt-daybreak-blue-latest-wm"
+          }
+        ],
+        catalog: {
+          costPatch: {
+            input: 5,
+            output: 30,
+            cacheRead: 0.5,
+            cacheWrite: 6.25
+          }
+        }
+      },
+      {
+        source: "providers/openai-codex.kdl:29",
+        providers: [
+          "openai-codex"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "gpt-daybreak-red-latest"
+          },
+          {
+            kind: "exact",
+            value: "gpt-daybreak-red-latest-wm"
+          }
+        ],
+        catalog: {
+          costPatch: {
+            input: 12.5,
+            output: 75,
+            cacheRead: 1.25,
+            cacheWrite: 15.625
+          }
+        }
+      },
+      {
+        source: "providers/openai-codex.kdl:46",
+        providers: [
+          "openai-codex"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "gpt-6-astra"
+          },
+          {
+            kind: "exact",
+            value: "gpt-6-astra-wm"
+          }
+        ],
+        catalog: {
+          costPatch: {
+            input: 10,
+            output: 50,
+            cacheRead: 1,
+            cacheWrite: 0
+          },
+          serviceTierCost: {
+            flex: 0.5,
+            priority: 2.5
+          },
+          limitsPatch: {
+            contextWindow: 272000
+          },
+          maxContextWindow: 922000
+        }
+      },
+      {
+        source: "providers/openai-codex.kdl:63",
+        class: "openai",
+        providers: [
+          "openai-codex"
+        ],
+        revision: [
+          {
+            op: ">=",
+            revision: "5.3.0"
+          },
+          {
+            op: "<",
+            revision: "5.7.0"
+          }
+        ],
+        thinking: {
+          mode: "effort"
+        }
+      },
+      {
+        source: "providers/openai-codex.kdl:68",
+        class: "openai",
+        providers: [
+          "openai-codex"
+        ],
+        revision: [
+          {
+            op: ">=",
+            revision: "5.4.0"
+          }
+        ],
+        wire: {
+          supportsAllTurnsReasoningContext: true
+        }
+      },
+      {
+        source: "providers/openai-codex.kdl:71",
+        class: "openai",
+        providers: [
+          "openai-codex"
+        ],
+        revision: [
+          {
+            op: "<",
+            revision: "5.4.0"
+          }
+        ],
+        wire: {
+          supportsReasoningSummary: false
+        }
+      },
+      {
+        source: "providers/openai-codex.kdl:76",
+        class: "openai",
+        providers: [
+          "openai-codex"
+        ],
+        revision: [
+          {
+            op: "=",
+            revision: "5.5.0"
+          }
+        ],
+        catalog: {
+          serviceTierCost: {
+            flex: 0.5,
+            priority: 2.5
+          }
+        }
+      },
+      {
+        source: "providers/openai-codex.kdl:88",
+        class: "openai",
+        providers: [
+          "openai-codex"
+        ],
+        family: "gpt",
+        revision: [
+          {
+            op: "=",
+            revision: "5.4.0"
+          }
+        ],
+        models: [
+          {
+            kind: "glob",
+            value: "*-mini*"
+          }
+        ],
+        catalog: {
+          priority: 1,
+          limitsPatch: {
+            contextWindow: 272000
+          }
+        }
+      },
+      {
+        source: "providers/openai-codex.kdl:94",
+        class: "openai",
+        providers: [
+          "openai-codex"
+        ],
+        family: "gpt",
+        revision: [
+          {
+            op: "=",
+            revision: "5.4.0"
+          }
+        ],
+        models: [
+          {
+            kind: "glob",
+            value: "*-nano*"
+          }
+        ],
+        catalog: {
+          priority: 2,
+          limitsPatch: {
+            contextWindow: 272000
+          }
+        }
+      },
+      {
+        source: "providers/openai-codex.kdl:86",
+        class: "openai",
+        providers: [
+          "openai-codex"
+        ],
+        family: "gpt",
+        revision: [
+          {
+            op: "=",
+            revision: "5.4.0"
+          }
+        ],
+        catalog: {
+          priority: 0
+        }
+      },
+      {
+        source: "providers/openai-codex.kdl:104",
+        class: "openai",
+        providers: [
+          "openai-codex"
+        ],
+        revision: [
+          {
+            op: ">=",
+            revision: "5.0.0"
+          },
+          {
+            op: "<",
+            revision: "7.0.0"
+          }
+        ],
+        catalog: {
+          applyPatchToolType: "freeform"
+        }
+      },
+      {
+        source: "providers/openai-codex.kdl:110",
+        class: "unknown",
+        providers: [
+          "openai-codex"
+        ],
+        revision: [
+          {
+            op: ">=",
+            revision: "5.4.0"
+          }
+        ],
+        wire: {
+          supportsAllTurnsReasoningContext: true
+        }
+      },
+      {
+        source: "providers/openai-codex.kdl:113",
+        class: "unknown",
+        providers: [
+          "openai-codex"
+        ],
+        revision: [
+          {
+            op: ">=",
+            revision: "5.6.0"
+          }
+        ],
+        wire: {
+          requiresReasoningOffJuiceInstruction: true
+        }
+      },
+      {
+        source: "providers/openai-codex.kdl:119",
+        providers: [
+          "openai-codex"
+        ],
+        models: [
+          {
+            kind: "glob",
+            value: "gpt-5.6-luna*"
+          }
+        ],
+        catalog: {
+          longContext: {
+            inputThreshold: 272000,
+            input: 0.4,
+            output: 1.8,
+            cacheRead: 0.04,
+            cacheWrite: 0.5
+          }
+        }
+      },
+      {
+        source: "providers/openai-codex.kdl:128",
+        providers: [
+          "openai-codex"
+        ],
+        models: [
+          {
+            kind: "glob",
+            value: "gpt-5.6-sol*"
+          },
+          {
+            kind: "exact",
+            value: "gpt-5.6"
+          }
+        ],
+        catalog: {
+          longContext: {
+            inputThreshold: 272000,
+            input: 10,
+            output: 45,
+            cacheRead: 1,
+            cacheWrite: 12.5
+          }
+        }
+      },
+      {
+        source: "providers/openai-codex.kdl:137",
+        providers: [
+          "openai-codex"
+        ],
+        models: [
+          {
+            kind: "glob",
+            value: "gpt-5.6-terra*"
+          }
+        ],
+        catalog: {
+          longContext: {
+            inputThreshold: 272000,
+            input: 4,
+            output: 18,
+            cacheRead: 0.4,
+            cacheWrite: 5
+          }
+        }
+      },
+      {
+        source: "providers/openai-codex.kdl:148",
+        providers: [
+          "openai-codex"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "gpt-5.6-luna"
+          },
+          {
+            kind: "exact",
+            value: "gpt-5.6-sol"
+          },
+          {
+            kind: "exact",
+            value: "gpt-5.6-terra"
+          }
+        ],
+        catalog: {
+          contextWindowFloor: 1e6
+        }
+      },
+      {
+        source: "providers/openai-codex.kdl:3",
+        providers: [
+          "openai-codex"
+        ],
+        wire: {
+          harmonyLeakMitigation: true
+        },
+        catalog: {
+          serviceTierCost: {
+            flex: 0.5,
+            priority: 2
+          },
+          clampContextOverride: true
+        }
+      },
+      {
+        source: "providers/openai.kdl:10",
+        class: "unknown",
+        providers: [
+          "openai"
+        ],
+        revision: [
+          {
+            op: ">=",
+            revision: "5.6.0"
+          },
+          {
+            op: "<",
+            revision: "5.7.0"
+          }
+        ],
+        wire: {
+          reasoningDisableMode: "none-effort"
+        },
+        thinking: {
+          efforts: [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      },
+      {
+        source: "providers/openai.kdl:14",
+        class: "unknown",
+        providers: [
+          "openai"
+        ],
+        revision: [
+          {
+            op: ">=",
+            revision: "5.0.0"
+          },
+          {
+            op: "<",
+            revision: "6.0.0"
+          }
+        ],
+        catalog: {
+          applyPatchToolType: "freeform"
+        }
+      },
+      {
+        source: "providers/openai.kdl:19",
+        providers: [
+          "openai"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "codex-mini-latest"
+          },
+          {
+            kind: "exact",
+            value: "gpt-realtime-2.1"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      },
+      {
+        source: "providers/openai.kdl:23",
+        providers: [
+          "openai"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "gpt-5.1-codex"
+          },
+          {
+            kind: "exact",
+            value: "gpt-5.1-codex-max"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      },
+      {
+        source: "providers/openai.kdl:27",
+        providers: [
+          "openai"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "gpt-5.1-codex-mini"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "medium",
+            "high"
+          ]
+        }
+      },
+      {
+        source: "providers/openai.kdl:31",
+        providers: [
+          "openai"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "gpt-5.6-cyber"
+          }
+        ],
+        wire: {
+          reasoningDisableMode: "none-effort"
+        }
+      },
+      {
+        source: "providers/openai.kdl:39",
+        class: "openai",
+        providers: [
+          "openai"
+        ],
+        family: "gpt",
+        revision: [
+          {
+            op: "=",
+            revision: "5.6.0"
+          }
+        ],
+        wire: {
+          reasoningDisableMode: "none-effort"
+        }
+      },
+      {
+        source: "providers/openai.kdl:43",
+        class: "openai",
+        providers: [
+          "openai"
+        ],
+        revision: [
+          {
+            op: ">=",
+            revision: "5.0.0"
+          },
+          {
+            op: "<",
+            revision: "7.0.0"
+          }
+        ],
+        catalog: {
+          applyPatchToolType: "freeform"
+        }
+      },
+      {
+        source: "providers/openai.kdl:48",
+        providers: [
+          "openai"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "daybreak-blue-latest"
+          },
+          {
+            kind: "exact",
+            value: "gpt-5.6"
+          },
+          {
+            kind: "glob",
+            value: "gpt-5.6-sol*"
+          }
+        ],
+        catalog: {
+          longContext: {
+            inputThreshold: 272000,
+            input: 10,
+            output: 45,
+            cacheRead: 1,
+            cacheWrite: 12.5
+          }
+        }
+      },
+      {
+        source: "providers/openai.kdl:57",
+        providers: [
+          "openai"
+        ],
+        models: [
+          {
+            kind: "glob",
+            value: "gpt-5.6-luna*"
+          }
+        ],
+        catalog: {
+          longContext: {
+            inputThreshold: 272000,
+            input: 0.4,
+            output: 1.8,
+            cacheRead: 0.04,
+            cacheWrite: 0.5
+          }
+        }
+      },
+      {
+        source: "providers/openai.kdl:66",
+        providers: [
+          "openai"
+        ],
+        models: [
+          {
+            kind: "glob",
+            value: "gpt-5.6-terra*"
+          }
+        ],
+        catalog: {
+          longContext: {
+            inputThreshold: 272000,
+            input: 4,
+            output: 18,
+            cacheRead: 0.4,
+            cacheWrite: 5
+          }
+        }
+      },
+      {
+        source: "providers/openai.kdl:79",
+        providers: [
+          "openai"
+        ],
+        models: [
+          {
+            kind: "glob",
+            value: "gpt-6-astra*"
+          }
+        ],
+        catalog: {
+          longContext: {
+            inputThreshold: 272000,
+            input: 20,
+            output: 75,
+            cacheRead: 2,
+            cacheWrite: 25
+          }
+        }
+      },
+      {
+        source: "providers/openai.kdl:90",
+        providers: [
+          "openai"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "daybreak-blue-latest"
+          },
+          {
+            kind: "exact",
+            value: "daybreak-red-latest"
+          }
+        ],
+        wire: {
+          promptCacheBreakpointTtl: "30m",
+          supportsPromptCacheBreakpoints: true,
+          supportsSamplingParams: false
+        }
+      },
+      {
+        source: "providers/openai.kdl:3",
+        providers: [
+          "openai"
+        ],
+        wire: {
+          supportsStrictMode: true,
+          usesOpenAIToolCallIdLimit: true
+        },
+        thinking: {
+          mode: "effort"
+        }
+      },
+      {
+        source: "providers/opencode-go.kdl:10",
+        providers: [
+          "opencode-go"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "deepseek-flash"
+          },
+          {
+            kind: "exact",
+            value: "deepseek-v4.1-flash"
+          }
+        ],
+        wire: {
+          stripImageInput: false
+        },
+        catalog: {
+          inputModalities: [
+            "text",
+            "image"
+          ]
+        }
+      },
+      {
+        source: "providers/opencode-go.kdl:25",
+        class: "deepseek",
+        providers: [
+          "opencode-go"
+        ],
+        family: "flash",
+        wire: {
+          supportsToolChoice: false
+        }
+      },
+      {
+        source: "providers/opencode-go.kdl:23",
+        class: "deepseek",
+        providers: [
+          "opencode-go"
+        ],
+        thinking: {
+          mode: "effort"
+        }
+      },
+      {
+        source: "providers/opencode-go.kdl:30",
+        providers: [
+          "opencode-go"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "deepseek-v4-flash-vision-exp"
+          }
+        ],
+        wire: {
+          supportsToolChoice: true
+        }
+      },
+      {
+        source: "providers/opencode-go.kdl:36",
+        providers: [
+          "opencode-go"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "deepseek-v4-flash"
+          },
+          {
+            kind: "exact",
+            value: "deepseek-v4-pro"
+          }
+        ],
+        wire: {
+          supportsToolChoice: false,
+          maxTokensField: "max_tokens",
+          reasoningContentField: "reasoning_content",
+          requiresReasoningContentForToolCalls: true
+        }
+      },
+      {
+        source: "providers/opencode-go.kdl:42",
+        class: "glm",
+        providers: [
+          "opencode-go"
+        ],
+        thinking: {
+          mode: "effort"
+        }
+      },
+      {
+        source: "providers/opencode-go.kdl:45",
+        class: "kimi",
+        providers: [
+          "opencode-go"
+        ],
+        thinking: {
+          mode: "effort"
+        }
+      },
+      {
+        source: "providers/opencode-go.kdl:49",
+        class: "mimo",
+        providers: [
+          "opencode-go"
+        ],
+        family: "v2",
+        thinking: {
+          mode: "effort"
+        }
+      },
+      {
+        source: "providers/opencode-go.kdl:48",
+        class: "mimo",
+        providers: [
+          "opencode-go"
+        ],
+        wire: {
+          supportsToolChoice: false
+        }
+      },
+      {
+        source: "providers/opencode-go.kdl:56",
+        class: "qwen",
+        providers: [
+          "opencode-go"
+        ],
+        revision: [
+          {
+            op: ">=",
+            revision: "3.5.0"
+          },
+          {
+            op: "<",
+            revision: "3.7.0"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ],
+          mode: "effort"
+        }
+      },
+      {
+        source: "providers/opencode-go.kdl:60",
+        class: "qwen",
+        providers: [
+          "opencode-go"
+        ],
+        revision: [
+          {
+            op: ">=",
+            revision: "3.7.0"
+          },
+          {
+            op: "<",
+            revision: "3.9.0"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ],
+          mode: "effort"
+        }
+      },
+      {
+        source: "providers/opencode-go.kdl:66",
+        providers: [
+          "opencode-go"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "glm-5"
+          },
+          {
+            kind: "exact",
+            value: "glm-5.1"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      },
+      {
+        source: "providers/opencode-go.kdl:71",
+        providers: [
+          "opencode-go"
+        ],
+        models: [
+          {
+            kind: "glob",
+            value: "ox-alpha*"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "low",
+            "high",
+            "max"
+          ],
+          requiresEffort: true
+        }
+      },
+      {
+        source: "providers/opencode-go.kdl:76",
+        providers: [
+          "opencode-go"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "qwen3.8-flash"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ],
+          mode: "budget"
+        }
+      },
+      {
+        source: "providers/opencode-go.kdl:81",
+        providers: [
+          "opencode-go"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "glm-5.2"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "max"
+          ]
+        }
+      },
+      {
+        source: "providers/opencode-go.kdl:85",
+        providers: [
+          "opencode-go"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "gpt-5.6-luna"
+          },
+          {
+            kind: "exact",
+            value: "grok-4.5"
+          },
+          {
+            kind: "exact",
+            value: "minimax-m2.7"
+          },
+          {
+            kind: "exact",
+            value: "minimax-m3"
+          }
+        ],
+        thinking: {
+          mode: "effort"
+        }
+      },
+      {
+        source: "providers/opencode-go.kdl:89",
+        providers: [
+          "opencode-go"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "hy3"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ],
+          mode: "effort"
+        }
+      },
+      {
+        source: "providers/opencode-go.kdl:94",
+        providers: [
+          "opencode-go"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "kimi-k2.7-code"
+          }
+        ],
+        wire: {
+          supportsForcedToolChoice: false
+        }
+      },
+      {
+        source: "providers/opencode-go.kdl:98",
+        providers: [
+          "opencode-go"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "minimax-m2.5"
+          }
+        ],
+        thinking: {
+          effortMap: {
+            low: "adaptive",
+            medium: "adaptive",
+            high: "adaptive"
+          },
+          mode: "anthropic-adaptive"
+        }
+      },
+      {
+        source: "providers/opencode-go.kdl:3",
+        providers: [
+          "opencode-go"
+        ],
+        wire: {
+          whenThinking: {
+            requiresReasoningContentForToolCalls: true,
+            allowsSyntheticReasoningContentForToolCalls: false,
+            reasoningContentField: "reasoning_content"
+          }
+        },
+        catalog: {
+          longUsageLimitFallback: true
+        }
+      },
+      {
+        source: "providers/opencode-zen.kdl:16",
+        class: "anthropic",
+        providers: [
+          "opencode-zen"
+        ],
+        revision: [
+          {
+            op: ">=",
+            revision: "4.0.0"
+          },
+          {
+            op: "<",
+            revision: "4.6.0"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      },
+      {
+        source: "providers/opencode-zen.kdl:20",
+        class: "deepseek",
+        providers: [
+          "opencode-zen"
+        ],
+        thinking: {
+          mode: "effort"
+        }
+      },
+      {
+        source: "providers/opencode-zen.kdl:23",
+        class: "glm",
+        providers: [
+          "opencode-zen"
+        ],
+        thinking: {
+          mode: "effort"
+        }
+      },
+      {
+        source: "providers/opencode-zen.kdl:26",
+        class: "kimi",
+        providers: [
+          "opencode-zen"
+        ],
+        thinking: {
+          mode: "effort"
+        }
+      },
+      {
+        source: "providers/opencode-zen.kdl:30",
+        class: "mimo",
+        providers: [
+          "opencode-zen"
+        ],
+        family: "v2",
+        thinking: {
+          mode: "effort"
+        }
+      },
+      {
+        source: "providers/opencode-zen.kdl:35",
+        class: "minimax",
+        providers: [
+          "opencode-zen"
+        ],
+        family: "m3",
+        thinking: {
+          mode: "effort"
+        }
+      },
+      {
+        source: "providers/opencode-zen.kdl:40",
+        class: "openai",
+        providers: [
+          "opencode-zen"
+        ],
+        revision: [
+          {
+            op: ">=",
+            revision: "5.0.0"
+          },
+          {
+            op: "<",
+            revision: "5.7.0"
+          }
+        ],
+        thinking: {
+          mode: "effort"
+        }
+      },
+      {
+        source: "providers/opencode-zen.kdl:44",
+        class: "unknown",
+        providers: [
+          "opencode-zen"
+        ],
+        thinking: {
+          mode: "effort"
+        }
+      },
+      {
+        source: "providers/opencode-zen.kdl:48",
+        class: "xai",
+        providers: [
+          "opencode-zen"
+        ],
+        family: "grok",
+        thinking: {
+          mode: "effort"
+        }
+      },
+      {
+        source: "providers/opencode-zen.kdl:53",
+        providers: [
+          "opencode-zen"
+        ],
+        models: [
+          {
+            kind: "glob",
+            value: "*plus"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ],
+          mode: "budget"
+        }
+      },
+      {
+        source: "providers/opencode-zen.kdl:58",
+        providers: [
+          "opencode-zen"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "big-pickle"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "high",
+            "max"
+          ]
+        }
+      },
+      {
+        source: "providers/opencode-zen.kdl:62",
+        providers: [
+          "opencode-zen"
+        ],
+        models: [
+          {
+            kind: "glob",
+            value: "glm-4*"
+          },
+          {
+            kind: "glob",
+            value: "hy*"
+          },
+          {
+            kind: "glob",
+            value: "ling-3*"
+          },
+          {
+            kind: "glob",
+            value: "nemotron*"
+          },
+          {
+            kind: "exact",
+            value: "glm-5"
+          },
+          {
+            kind: "exact",
+            value: "glm-5.1"
+          },
+          {
+            kind: "exact",
+            value: "laguna-s-2.1-free"
+          },
+          {
+            kind: "exact",
+            value: "longcat-2.0-free"
+          },
+          {
+            kind: "exact",
+            value: "north-mini-code-free"
+          },
+          {
+            kind: "exact",
+            value: "ring-2.6-1t-free"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      },
+      {
+        source: "providers/opencode-zen.kdl:67",
+        providers: [
+          "opencode-zen"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "glm-5.2"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "max"
+          ]
+        }
+      },
+      {
+        source: "providers/opencode-zen.kdl:71",
+        providers: [
+          "opencode-zen"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "gpt-5.1-codex"
+          },
+          {
+            kind: "exact",
+            value: "gpt-5.1-codex-max"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      },
+      {
+        source: "providers/opencode-zen.kdl:75",
+        providers: [
+          "opencode-zen"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "gpt-5.1-codex-mini"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "medium",
+            "high"
+          ]
+        }
+      },
+      {
+        source: "providers/opencode-zen.kdl:79",
+        providers: [
+          "opencode-zen"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "minimax-m2.1"
+          },
+          {
+            kind: "exact",
+            value: "minimax-m2.5"
+          },
+          {
+            kind: "exact",
+            value: "minimax-m2.7"
+          }
+        ],
+        thinking: {
+          mode: "effort"
+        }
+      },
+      {
+        source: "providers/opencode-zen.kdl:84",
+        providers: [
+          "opencode-zen"
+        ],
+        models: [
+          {
+            kind: "glob",
+            value: "ox-alpha*"
+          },
+          {
+            kind: "exact",
+            value: "x-preview-f-free"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "low",
+            "high",
+            "max"
+          ],
+          requiresEffort: true
+        }
+      },
+      {
+        source: "providers/opencode-zen.kdl:89",
+        providers: [
+          "opencode-zen"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "minimax-m2.5-free"
+          }
+        ],
+        thinking: {
+          effortMap: {
+            low: "adaptive",
+            medium: "adaptive",
+            high: "adaptive"
+          },
+          mode: "anthropic-adaptive"
+        }
+      },
+      {
+        source: "providers/opencode-zen.kdl:99",
+        providers: [
+          "opencode-zen"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "qwen3.6-plus-free"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ],
+          mode: "effort"
+        }
+      },
+      {
+        source: "providers/opencode-zen.kdl:3",
+        providers: [
+          "opencode-zen"
+        ],
+        wire: {
+          whenThinking: {
+            requiresReasoningContentForToolCalls: true,
+            allowsSyntheticReasoningContentForToolCalls: false,
+            reasoningContentField: "reasoning_content"
+          },
+          supportsContextManagement: false
+        }
+      },
+      {
+        source: "providers/openrouter.kdl:5",
+        providers: [
+          "openrouter"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "deepseek/deepseek-v4.1-flash"
+          }
+        ],
+        wire: {
+          stripImageInput: false
+        }
+      },
+      {
+        source: "providers/openrouter.kdl:14",
+        class: "anthropic",
+        providers: [
+          "openrouter"
+        ],
+        wire: {
+          retryWithoutStrictOnGrammarError: true
+        }
+      },
+      {
+        source: "providers/openrouter.kdl:21",
+        class: "minimax",
+        providers: [
+          "openrouter"
+        ],
+        family: "m3",
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      },
+      {
+        source: "providers/openrouter.kdl:26",
+        class: "openai",
+        providers: [
+          "openrouter"
+        ],
+        family: "o-series",
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      },
+      {
+        source: "providers/openrouter.kdl:31",
+        class: "stepfun",
+        providers: [
+          "openrouter"
+        ],
+        family: "step",
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      },
+      {
+        source: "providers/openrouter.kdl:35",
+        class: "unknown",
+        providers: [
+          "openrouter"
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      },
+      {
+        source: "providers/openrouter.kdl:39",
+        providers: [
+          "openrouter"
+        ],
+        models: [
+          {
+            kind: "glob",
+            value: "*thinking-2507"
+          },
+          {
+            kind: "glob",
+            value: "*thinking:free"
+          },
+          {
+            kind: "exact",
+            value: "arcee-ai/trinity-large-thinking"
+          },
+          {
+            kind: "exact",
+            value: "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free"
+          }
+        ],
+        thinking: {
+          requiresEffort: true
+        }
+      },
+      {
+        source: "providers/openrouter.kdl:44",
+        providers: [
+          "openrouter"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "deepseek/deepseek-chat-v3.1"
+          },
+          {
+            kind: "exact",
+            value: "deepseek/deepseek-v4-pro"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "high"
+          ]
+        }
+      },
+      {
+        source: "providers/openrouter.kdl:48",
+        providers: [
+          "openrouter"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "openai/gpt-5.1-codex-mini"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "medium",
+            "high"
+          ]
+        }
+      },
+      {
+        source: "providers/openrouter.kdl:52",
+        providers: [
+          "openrouter"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "openai/o1:batch"
+          },
+          {
+            kind: "exact",
+            value: "openai/o3:batch"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ],
+          requiresEffort: true
+        }
+      },
+      {
+        source: "providers/openrouter.kdl:57",
+        providers: [
+          "openrouter"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "qwen/qwen3-coder"
+          }
+        ],
+        wire: {
+          thinkingFormat: "openrouter"
+        }
+      },
+      {
+        source: "providers/openrouter.kdl:61",
+        providers: [
+          "openrouter"
+        ],
+        models: [
+          {
+            kind: "glob",
+            value: "z*5"
+          },
+          {
+            kind: "glob",
+            value: "z-ai/glm-4.6*"
+          },
+          {
+            kind: "glob",
+            value: "z-ai/glm-4.7*"
+          },
+          {
+            kind: "exact",
+            value: "amazon/nova-2-lite-v1"
+          },
+          {
+            kind: "exact",
+            value: "baidu/ernie-4.5-vl-28b-a3b"
+          },
+          {
+            kind: "exact",
+            value: "cohere/north-mini-code:free"
+          },
+          {
+            kind: "exact",
+            value: "minimax/minimax-m1"
+          },
+          {
+            kind: "exact",
+            value: "nvidia/llama-3.3-nemotron-super-49b-v1.5"
+          },
+          {
+            kind: "exact",
+            value: "openai/gpt-5.1-codex"
+          },
+          {
+            kind: "exact",
+            value: "openai/gpt-5.1-codex-max"
+          },
+          {
+            kind: "exact",
+            value: "openai/gpt-chat-latest"
+          },
+          {
+            kind: "exact",
+            value: "z-ai/glm-4.5v"
+          },
+          {
+            kind: "exact",
+            value: "z-ai/glm-5.1"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      },
+      {
+        source: "providers/openrouter.kdl:67",
+        providers: [
+          "openrouter"
+        ],
+        models: [
+          {
+            kind: "glob",
+            value: "z-ai/glm-5.2*"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      },
+      {
+        source: "providers/openrouter.kdl:3",
+        providers: [
+          "openrouter"
+        ],
+        wire: {
+          wireModelIdMode: "openrouter",
+          supportsStrictMode: true,
+          thinkingFormat: "openrouter"
+        },
+        thinking: {
+          mode: "effort"
+        }
+      },
+      {
+        source: "providers/qianfan.kdl:5",
+        providers: [
+          "qianfan"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "deepseek-v3.2"
+          }
+        ],
+        thinking: {
+          mode: "effort"
+        }
+      },
+      {
+        source: "providers/sakana.kdl:6",
+        class: "unknown",
+        providers: [
+          "sakana"
+        ],
+        thinking: {
+          efforts: [
+            "high",
+            "max"
+          ],
+          mode: "effort"
+        }
+      },
+      {
+        source: "providers/sakana.kdl:3",
+        providers: [
+          "sakana"
+        ],
+        wire: {
+          includeEncryptedReasoning: false,
+          streamIdleTimeoutMs: 0
+        }
+      },
+      {
+        source: "providers/synthetic.kdl:5",
+        class: "unknown",
+        providers: [
+          "synthetic"
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      },
+      {
+        source: "providers/synthetic.kdl:9",
+        providers: [
+          "synthetic"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "hf:zai-org/GLM-4.7-Flash"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      },
+      {
+        source: "providers/synthetic.kdl:13",
+        providers: [
+          "synthetic"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "hf:zai-org/GLM-5.2"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "max"
+          ]
+        }
+      },
+      {
+        source: "providers/synthetic.kdl:3",
+        providers: [
+          "synthetic"
+        ],
+        thinking: {
+          mode: "effort"
+        }
+      },
+      {
+        source: "providers/together.kdl:7",
+        class: "unknown",
+        providers: [
+          "together"
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      },
+      {
+        source: "providers/together.kdl:11",
+        providers: [
+          "together"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "deepseek-ai/DeepSeek-V3-1"
+          }
+        ],
+        wire: {
+          requiresReasoningContentForAllAssistantTurns: true
+        }
+      },
+      {
+        source: "providers/together.kdl:15",
+        providers: [
+          "together"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "zai-org/GLM-4.7"
+          },
+          {
+            kind: "exact",
+            value: "zai-org/GLM-5"
+          },
+          {
+            kind: "exact",
+            value: "zai-org/GLM-5.1"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      },
+      {
+        source: "providers/together.kdl:19",
+        providers: [
+          "together"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "zai-org/GLM-5.2"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "max"
+          ]
+        }
+      },
+      {
+        source: "providers/together.kdl:3",
+        providers: [
+          "together"
+        ],
+        wire: {
+          supportsStrictMode: true
+        },
+        thinking: {
+          mode: "effort"
+        }
+      },
+      {
+        source: "providers/umans.kdl:7",
+        providers: [
+          "umans"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "umans-coder"
+          },
+          {
+            kind: "exact",
+            value: "umans-kimi-k2.7"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ],
+          mode: "budget",
+          requiresEffort: true
+        }
+      },
+      {
+        source: "providers/umans.kdl:13",
+        providers: [
+          "umans"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "umans-deepseek-v4-flash-0731"
+          }
+        ],
+        wire: {
+          escapeBuiltinToolNames: true,
+          requiresReasoningContentForAllAssistantTurns: true
+        },
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      },
+      {
+        source: "providers/umans.kdl:19",
+        providers: [
+          "umans"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "umans-flash"
+          },
+          {
+            kind: "exact",
+            value: "umans-kimi-k3"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ],
+          mode: "budget"
+        }
+      },
+      {
+        source: "providers/umans.kdl:24",
+        providers: [
+          "umans"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "umans-glm-5.2"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "high",
+            "max"
+          ],
+          mode: "anthropic-budget-effort"
+        }
+      },
+      {
+        source: "providers/umans.kdl:3",
+        providers: [
+          "umans"
+        ],
+        wire: {
+          escapeBuiltinToolNames: true
+        }
+      },
+      {
+        source: "providers/venice.kdl:4",
+        class: "qwen",
+        providers: [
+          "venice"
+        ],
+        wire: {
+          thinkingFormat: "openai"
+        }
+      },
+      {
+        source: "providers/venice.kdl:11",
+        class: "gemini",
+        providers: [
+          "venice"
+        ],
+        revision: [
+          {
+            op: ">=",
+            revision: "3.0.0"
+          },
+          {
+            op: "<",
+            revision: "3.1.0"
+          }
+        ],
+        thinking: {
+          requiresEffort: true
+        }
+      },
+      {
+        source: "providers/venice.kdl:14",
+        class: "gemini",
+        providers: [
+          "venice"
+        ],
+        revision: [
+          {
+            op: ">=",
+            revision: "3.1.0"
+          },
+          {
+            op: "<",
+            revision: "3.8.0"
+          }
+        ],
+        priority: 1,
+        thinking: {
+          requiresEffort: false,
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      },
+      {
+        source: "providers/venice.kdl:19",
+        class: "unknown",
+        providers: [
+          "venice"
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      },
+      {
+        source: "providers/venice.kdl:23",
+        providers: [
+          "venice"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "arcee-trinity-large-thinking"
+          }
+        ],
+        thinking: {
+          requiresEffort: true
+        }
+      },
+      {
+        source: "providers/venice.kdl:27",
+        providers: [
+          "venice"
+        ],
+        models: [
+          {
+            kind: "glob",
+            value: "deepseek-v4-flash*"
+          }
+        ],
+        wire: {
+          requiresReasoningContentForAllAssistantTurns: true
+        }
+      },
+      {
+        source: "providers/venice.kdl:31",
+        providers: [
+          "venice"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "gemini-3-flash-preview"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      },
+      {
+        source: "providers/venice.kdl:35",
+        providers: [
+          "venice"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "gemini-3-pro-preview"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "low",
+            "high"
+          ]
+        }
+      },
+      {
+        source: "providers/venice.kdl:39",
+        providers: [
+          "venice"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "kimi-k2-thinking"
+          }
+        ],
+        thinking: {
+          requiresEffort: true
+        }
+      },
+      {
+        source: "providers/venice.kdl:43",
+        providers: [
+          "venice"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "qwen3-235b"
+          }
+        ],
+        wire: {
+          thinkingFormat: "qwen"
+        }
+      },
+      {
+        source: "providers/venice.kdl:3",
+        providers: [
+          "venice"
+        ],
+        wire: {
+          reasoningDisableMode: "venice-disable-thinking"
+        },
+        thinking: {
+          mode: "effort"
+        }
+      },
+      {
+        source: "providers/vercel-ai-gateway.kdl:6",
+        providers: [
+          "vercel-ai-gateway"
+        ],
+        models: [
+          {
+            kind: "glob",
+            value: "deepseek/*"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      },
+      {
+        source: "providers/vercel-ai-gateway.kdl:10",
+        class: "anthropic",
+        providers: [
+          "vercel-ai-gateway"
+        ],
+        revision: [
+          {
+            op: ">=",
+            revision: "3.7.0"
+          },
+          {
+            op: "<",
+            revision: "4.6.0"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      },
+      {
+        source: "providers/vercel-ai-gateway.kdl:15",
+        class: "gemini",
+        providers: [
+          "vercel-ai-gateway"
+        ],
+        revision: [
+          {
+            op: ">=",
+            revision: "3.0.0"
+          },
+          {
+            op: "<",
+            revision: "3.7.0"
+          }
+        ],
+        thinking: {
+          mode: "budget"
+        }
+      },
+      {
+        source: "providers/vercel-ai-gateway.kdl:20",
+        class: "mimo",
+        providers: [
+          "vercel-ai-gateway"
+        ],
+        family: "v2",
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ],
+          mode: "budget"
+        }
+      },
+      {
+        source: "providers/vercel-ai-gateway.kdl:26",
+        class: "stepfun",
+        providers: [
+          "vercel-ai-gateway"
+        ],
+        family: "step",
+        thinking: {
+          mode: "budget"
+        }
+      },
+      {
+        source: "providers/vercel-ai-gateway.kdl:30",
+        class: "unknown",
+        providers: [
+          "vercel-ai-gateway"
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ],
+          mode: "budget"
+        }
+      },
+      {
+        source: "providers/vercel-ai-gateway.kdl:35",
+        class: "xai",
+        providers: [
+          "vercel-ai-gateway"
+        ],
+        family: "grok",
+        thinking: {
+          mode: "budget"
+        }
+      },
+      {
+        source: "providers/vercel-ai-gateway.kdl:40",
+        providers: [
+          "vercel-ai-gateway"
+        ],
+        models: [
+          {
+            kind: "glob",
+            value: "*fast-reasoning"
+          },
+          {
+            kind: "glob",
+            value: "alibaba*thinking"
+          },
+          {
+            kind: "glob",
+            value: "meituan/longcat-flash-thinking*"
+          },
+          {
+            kind: "glob",
+            value: "*grok-4.20-reasoning*"
+          },
+          {
+            kind: "exact",
+            value: "arcee-ai/trinity-large-thinking"
+          },
+          {
+            kind: "glob",
+            value: "openai/gpt-5.1-thinking*"
+          }
+        ],
+        thinking: {
+          requiresEffort: true
+        }
+      },
+      {
+        source: "providers/vercel-ai-gateway.kdl:45",
+        providers: [
+          "vercel-ai-gateway"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "alibaba/qwen3-max"
+          }
+        ],
+        wire: {
+          replayUnsignedThinking: false
+        }
+      },
+      {
+        source: "providers/vercel-ai-gateway.kdl:49",
+        providers: [
+          "vercel-ai-gateway"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "amazon/nova-2-lite"
+          }
+        ],
+        thinking: {
+          mode: "budget"
+        }
+      },
+      {
+        source: "providers/vercel-ai-gateway.kdl:53",
+        providers: [
+          "vercel-ai-gateway"
+        ],
+        models: [
+          {
+            kind: "glob",
+            value: "deepseek/deepseek-v3.1*"
+          },
+          {
+            kind: "exact",
+            value: "deepseek/deepseek-v3.2"
+          }
+        ],
+        wire: {
+          requiresReasoningContentForAllAssistantTurns: true
+        }
+      },
+      {
+        source: "providers/vercel-ai-gateway.kdl:57",
+        providers: [
+          "vercel-ai-gateway"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "deepseek/deepseek-v3.2-thinking"
+          }
+        ],
+        wire: {
+          requiresReasoningContentForAllAssistantTurns: true
+        },
+        thinking: {
+          requiresEffort: true
+        }
+      },
+      {
+        source: "providers/vercel-ai-gateway.kdl:62",
+        providers: [
+          "vercel-ai-gateway"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "openai/codex-mini"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      },
+      {
+        source: "providers/vercel-ai-gateway.kdl:66",
+        providers: [
+          "vercel-ai-gateway"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "openai/gpt-5.1-codex"
+          },
+          {
+            kind: "exact",
+            value: "openai/gpt-5.1-codex-max"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      },
+      {
+        source: "providers/vercel-ai-gateway.kdl:70",
+        providers: [
+          "vercel-ai-gateway"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "openai/gpt-5.1-codex-mini"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "medium",
+            "high"
+          ]
+        }
+      },
+      {
+        source: "providers/vllm.kdl:4",
+        class: "qwen",
+        providers: [
+          "vllm"
+        ],
+        wire: {
+          thinkingFormat: "qwen-chat-template"
+        }
+      },
+      {
+        source: "providers/wafer-serverless.kdl:5",
+        class: "glm",
+        providers: [
+          "wafer-serverless"
+        ],
+        wire: {
+          reasoningContentField: "reasoning_content"
+        }
+      },
+      {
+        source: "providers/wafer-serverless.kdl:8",
+        class: "kimi",
+        providers: [
+          "wafer-serverless"
+        ],
+        wire: {
+          reasoningContentField: "reasoning_content",
+          thinkingFormat: "zai"
+        }
+      },
+      {
+        source: "providers/wafer-serverless.kdl:13",
+        class: "qwen",
+        providers: [
+          "wafer-serverless"
+        ],
+        revision: [
+          {
+            op: ">=",
+            revision: "3.6.35"
+          },
+          {
+            op: "<",
+            revision: "3.8.0"
+          }
+        ],
+        wire: {
+          reasoningContentField: "reasoning_content"
+        }
+      },
+      {
+        source: "providers/wafer-serverless.kdl:18",
+        providers: [
+          "wafer-serverless"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "DeepSeek-V4-Flash-0731-Fast"
+          },
+          {
+            kind: "exact",
+            value: "DeepSeek-V4-Pro"
+          }
+        ],
+        wire: {
+          reasoningContentField: "reasoning_content",
+          supportsDeveloperRole: false
+        }
+      },
+      {
+        source: "providers/wafer-serverless.kdl:23",
+        providers: [
+          "wafer-serverless"
+        ],
+        models: [
+          {
+            kind: "glob",
+            value: "glm-*"
+          }
+        ],
+        wire: {
+          thinkingFormat: "zai"
+        },
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      },
+      {
+        source: "providers/wafer-serverless.kdl:28",
+        providers: [
+          "wafer-serverless"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "GLM-5.2"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "high",
+            "max"
+          ]
+        }
+      },
+      {
+        source: "providers/wafer-serverless.kdl:32",
+        providers: [
+          "wafer-serverless"
+        ],
+        models: [
+          {
+            kind: "glob",
+            value: "glm5*"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      },
+      {
+        source: "providers/wafer-serverless.kdl:3",
+        providers: [
+          "wafer-serverless"
+        ],
+        thinking: {
+          mode: "effort"
+        }
+      },
+      {
+        source: "providers/xai-oauth.kdl:23",
+        class: "xai",
+        providers: [
+          "xai-oauth"
+        ],
+        family: "grok",
+        revision: [
+          {
+            op: ">=",
+            revision: "0.1.0"
+          },
+          {
+            op: "<",
+            revision: "4.3.0"
+          }
+        ],
+        wire: {
+          omitReasoningEffort: true
+        }
+      },
+      {
+        source: "providers/xai-oauth.kdl:26",
+        class: "xai",
+        providers: [
+          "xai-oauth"
+        ],
+        family: "grok",
+        revision: [
+          {
+            op: ">=",
+            revision: "4.3.0"
+          },
+          {
+            op: "<",
+            revision: "4.20.0"
+          }
+        ],
+        wire: {
+          omitReasoningEffort: false,
+          supportsReasoningEffort: true
+        }
+      },
+      {
+        source: "providers/xai-oauth.kdl:10",
+        class: "xai",
+        providers: [
+          "xai-oauth"
+        ],
+        family: "grok",
+        wire: {
+          filterReasoningHistory: false,
+          includeEncryptedReasoning: true,
+          reasoningEffortMap: {
+            minimal: "low",
+            xhigh: "high",
+            max: "high"
+          },
+          supportsImageDetailOriginal: false,
+          supportsReasoningSummary: false
+        },
+        thinking: {
+          mode: "effort"
+        }
+      },
+      {
+        source: "providers/xai-oauth.kdl:33",
+        providers: [
+          "xai-oauth"
+        ],
+        models: [
+          {
+            kind: "glob",
+            value: "*reasoning"
+          },
+          {
+            kind: "exact",
+            value: "grok-build"
+          }
+        ],
+        wire: {
+          omitReasoningEffort: true,
+          supportsReasoningEffort: false
+        }
+      },
+      {
+        source: "providers/xai-oauth.kdl:38",
+        providers: [
+          "xai-oauth"
+        ],
+        models: [
+          {
+            kind: "glob",
+            value: "grok-4.6*"
+          },
+          {
+            kind: "glob",
+            value: "grok-4.20-multi-agent*"
+          }
+        ],
+        priority: 1,
+        wire: {
+          reasoningEffortMap: {
+            minimal: "low"
+          }
+        }
+      },
+      {
+        source: "providers/xai-oauth.kdl:44",
+        providers: [
+          "xai-oauth"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "grok-4.20-multi-agent-0309"
+          }
+        ],
+        wire: {
+          omitReasoningEffort: false,
+          supportsReasoningEffort: true
+        }
+      },
+      {
+        source: "providers/xai-oauth.kdl:3",
+        providers: [
+          "xai-oauth"
+        ],
+        wire: {
+          promptCacheSessionHeader: "x-grok-conv-id",
+          rejectRootObjectUnion: true
+        }
+      },
+      {
+        source: "providers/xai.kdl:10",
+        class: "xai",
+        providers: [
+          "xai"
+        ],
+        family: "grok",
+        wire: {
+          filterReasoningHistory: false,
+          includeEncryptedReasoning: true,
+          reasoningEffortMap: {
+            minimal: "low",
+            xhigh: "high",
+            max: "high"
+          },
+          supportsReasoningSummary: false
+        },
+        thinking: {
+          mode: "effort"
+        }
+      },
+      {
+        source: "providers/xai.kdl:30",
+        providers: [
+          "xai"
+        ],
+        models: [
+          {
+            kind: "glob",
+            value: "grok-3-mini*"
+          },
+          {
+            kind: "glob",
+            value: "grok-4.20-multi-agent*"
+          },
+          {
+            kind: "glob",
+            value: "grok-4.3*"
+          },
+          {
+            kind: "glob",
+            value: "grok-4.5*"
+          },
+          {
+            kind: "glob",
+            value: "grok-4.6*"
+          }
+        ],
+        wire: {
+          supportsReasoningEffort: true,
+          omitReasoningEffort: false
+        }
+      },
+      {
+        source: "providers/xai.kdl:34",
+        providers: [
+          "xai"
+        ],
+        models: [
+          {
+            kind: "glob",
+            value: "grok-4.20-multi-agent*"
+          },
+          {
+            kind: "glob",
+            value: "grok-4.6*"
+          }
+        ],
+        priority: 1,
+        wire: {
+          reasoningEffortMap: {
+            minimal: "low"
+          }
+        }
+      },
+      {
+        source: "providers/xai.kdl:41",
+        providers: [
+          "xai"
+        ],
+        models: [
+          {
+            kind: "glob",
+            value: "*reasoning"
+          },
+          {
+            kind: "glob",
+            value: "grok-build*"
+          },
+          {
+            kind: "glob",
+            value: "grok-code-fast*"
+          },
+          {
+            kind: "glob",
+            value: "*composer*"
+          }
+        ],
+        wire: {
+          omitReasoningEffort: true,
+          supportsReasoningEffort: false
+        }
+      },
+      {
+        source: "providers/xai.kdl:47",
+        providers: [
+          "xai"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "grok-4.20-0309-reasoning"
+          },
+          {
+            kind: "exact",
+            value: "grok-4.20-beta-latest-reasoning"
+          }
+        ],
+        thinking: {
+          requiresEffort: true
+        }
+      },
+      {
+        source: "providers/xai.kdl:3",
+        providers: [
+          "xai"
+        ],
+        wire: {
+          promptCacheSessionHeader: "x-grok-conv-id",
+          rejectRootObjectUnion: true
+        }
+      },
+      {
+        source: "providers/xiaomi-token-plan-ams.kdl:5",
+        class: "mimo",
+        providers: [
+          "xiaomi-token-plan-ams"
+        ],
+        family: "v2",
+        thinking: {
+          mode: "effort"
+        }
+      },
+      {
+        source: "providers/xiaomi-token-plan-cn.kdl:5",
+        class: "mimo",
+        providers: [
+          "xiaomi-token-plan-cn"
+        ],
+        family: "v2",
+        thinking: {
+          mode: "effort"
+        }
+      },
+      {
+        source: "providers/xiaomi-token-plan-sgp.kdl:5",
+        class: "mimo",
+        providers: [
+          "xiaomi-token-plan-sgp"
+        ],
+        family: "v2",
+        thinking: {
+          mode: "effort"
+        }
+      },
+      {
+        source: "providers/xiaomi.kdl:5",
+        class: "mimo",
+        providers: [
+          "xiaomi"
+        ],
+        family: "v2",
+        wire: {
+          allowsSyntheticReasoningContentForToolCalls: false,
+          reasoningContentField: "reasoning_content",
+          requiresReasoningContentForToolCalls: true,
+          supportsStore: false,
+          thinkingFormat: "zai"
+        },
+        thinking: {
+          mode: "effort"
+        }
+      },
+      {
+        source: "providers/xiaomi.kdl:15",
+        providers: [
+          "xiaomi"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "mimo-v2.5"
+          }
+        ],
+        wire: {
+          allowsSyntheticReasoningContentForToolCalls: false,
+          reasoningContentField: "reasoning_content",
+          requiresReasoningContentForToolCalls: true,
+          supportsStore: false,
+          thinkingFormat: "zai"
+        }
+      },
+      {
+        source: "providers/yolo-auto.kdl:6",
+        providers: [
+          "yolo-auto"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "deepseek-flash-v4"
+          }
+        ],
+        wire: {
+          disableReasoningOnToolChoice: true,
+          maxTokensField: "max_completion_tokens",
+          requiresReasoningContentForAllAssistantTurns: true,
+          requiresReasoningContentForToolCalls: true,
+          supportsReasoningEffort: true,
+          thinkingFormat: "chat-template"
+        },
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          mode: "effort"
+        }
+      },
+      {
+        source: "providers/yolo-auto.kdl:3",
+        providers: [
+          "yolo-auto"
+        ],
+        wire: {
+          supportsDeveloperRole: false,
+          supportsStore: false
+        }
+      },
+      {
+        source: "providers/zai.kdl:7",
+        class: "glm",
+        providers: [
+          "zai"
+        ],
+        family: "flash",
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ],
+          mode: "budget"
+        }
+      },
+      {
+        source: "providers/zai.kdl:11",
+        class: "glm",
+        providers: [
+          "zai"
+        ],
+        family: "turbo",
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ],
+          mode: "budget"
+        }
+      },
+      {
+        source: "providers/zai.kdl:17",
+        providers: [
+          "zai"
+        ],
+        models: [
+          {
+            kind: "glob",
+            value: "*5"
+          },
+          {
+            kind: "glob",
+            value: "*v"
+          },
+          {
+            kind: "exact",
+            value: "glm-4.5-air"
+          },
+          {
+            kind: "exact",
+            value: "glm-4.6"
+          },
+          {
+            kind: "exact",
+            value: "glm-4.7"
+          },
+          {
+            kind: "exact",
+            value: "glm-5.1"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ],
+          mode: "budget"
+        }
+      },
+      {
+        source: "providers/zai.kdl:22",
+        providers: [
+          "zai"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "glm-5.2"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "high",
+            "max"
+          ],
+          mode: "anthropic-budget-effort"
+        }
+      },
+      {
+        source: "providers/zai.kdl:32",
+        providers: [
+          "zai"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "glm-5.3-flash"
+          }
+        ],
+        wire: {
+          clampOutputToModelMax: true
+        },
+        thinking: {
+          mode: "anthropic-budget-effort"
+        }
+      },
+      {
+        source: "providers/zai.kdl:3",
+        providers: [
+          "zai"
+        ],
+        wire: {
+          requiresToolResultId: true
+        }
+      },
+      {
+        source: "providers/zenmux.kdl:7",
+        class: "anthropic",
+        providers: [
+          "zenmux"
+        ],
+        revision: [
+          {
+            op: ">=",
+            revision: "3.7.0"
+          },
+          {
+            op: "<",
+            revision: "4.6.0"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      },
+      {
+        source: "providers/zenmux.kdl:12",
+        class: "baidu",
+        providers: [
+          "zenmux"
+        ],
+        family: "ernie",
+        thinking: {
+          mode: "effort"
+        }
+      },
+      {
+        source: "providers/zenmux.kdl:17",
+        class: "bytedance",
+        providers: [
+          "zenmux"
+        ],
+        family: "doubao",
+        thinking: {
+          mode: "effort"
+        }
+      },
+      {
+        source: "providers/zenmux.kdl:21",
+        class: "deepseek",
+        providers: [
+          "zenmux"
+        ],
+        thinking: {
+          mode: "effort"
+        }
+      },
+      {
+        source: "providers/zenmux.kdl:25",
+        class: "gemini",
+        providers: [
+          "zenmux"
+        ],
+        revision: [
+          {
+            op: ">=",
+            revision: "2.5.0"
+          },
+          {
+            op: "<",
+            revision: "3.7.0"
+          }
+        ],
+        thinking: {
+          mode: "effort"
+        }
+      },
+      {
+        source: "providers/zenmux.kdl:31",
+        class: "glm",
+        providers: [
+          "zenmux"
+        ],
+        family: "flash",
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      },
+      {
+        source: "providers/zenmux.kdl:34",
+        class: "glm",
+        providers: [
+          "zenmux"
+        ],
+        family: "turbo",
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      },
+      {
+        source: "providers/zenmux.kdl:29",
+        class: "glm",
+        providers: [
+          "zenmux"
+        ],
+        thinking: {
+          mode: "effort"
+        }
+      },
+      {
+        source: "providers/zenmux.kdl:38",
+        class: "kimi",
+        providers: [
+          "zenmux"
+        ],
+        thinking: {
+          mode: "effort"
+        }
+      },
+      {
+        source: "providers/zenmux.kdl:42",
+        class: "mimo",
+        providers: [
+          "zenmux"
+        ],
+        family: "v2",
+        thinking: {
+          mode: "effort"
+        }
+      },
+      {
+        source: "providers/zenmux.kdl:46",
+        class: "minimax",
+        providers: [
+          "zenmux"
+        ],
+        thinking: {
+          mode: "effort"
+        }
+      },
+      {
+        source: "providers/zenmux.kdl:50",
+        class: "openai",
+        providers: [
+          "zenmux"
+        ],
+        revision: [
+          {
+            op: ">=",
+            revision: "4.0.0"
+          },
+          {
+            op: "<",
+            revision: "5.7.0"
+          }
+        ],
+        thinking: {
+          mode: "effort"
+        }
+      },
+      {
+        source: "providers/zenmux.kdl:55",
+        class: "qwen",
+        providers: [
+          "zenmux"
+        ],
+        revision: [
+          {
+            op: ">=",
+            revision: "3.0.0"
+          },
+          {
+            op: "<",
+            revision: "3.236.0"
+          }
+        ],
+        thinking: {
+          mode: "effort"
+        }
+      },
+      {
+        source: "providers/zenmux.kdl:60",
+        class: "stepfun",
+        providers: [
+          "zenmux"
+        ],
+        family: "step",
+        thinking: {
+          mode: "effort"
+        }
+      },
+      {
+        source: "providers/zenmux.kdl:64",
+        class: "unknown",
+        providers: [
+          "zenmux"
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ],
+          mode: "effort"
+        }
+      },
+      {
+        source: "providers/zenmux.kdl:69",
+        class: "xai",
+        providers: [
+          "zenmux"
+        ],
+        family: "grok",
+        thinking: {
+          mode: "effort"
+        }
+      },
+      {
+        source: "providers/zenmux.kdl:74",
+        providers: [
+          "zenmux"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "baidu/ernie-5.0-thinking-preview"
+          },
+          {
+            kind: "exact",
+            value: "tencent/hunyuan-2.0-thinking"
+          }
+        ],
+        thinking: {
+          requiresEffort: true
+        }
+      },
+      {
+        source: "providers/zenmux.kdl:78",
+        providers: [
+          "zenmux"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "deepseek/deepseek-chat-v3.1"
+          }
+        ],
+        wire: {
+          requiresReasoningContentForAllAssistantTurns: true
+        },
+        thinking: {
+          efforts: [
+            "high",
+            "max"
+          ]
+        }
+      },
+      {
+        source: "providers/zenmux.kdl:83",
+        providers: [
+          "zenmux"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "deepseek/deepseek-reasoner"
+          }
+        ],
+        wire: {
+          requiresReasoningContentForAllAssistantTurns: true
+        },
+        thinking: {
+          efforts: [
+            "high",
+            "max"
+          ],
+          requiresEffort: true
+        }
+      },
+      {
+        source: "providers/zenmux.kdl:89",
+        providers: [
+          "zenmux"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "google/gemma-4-26b-a4b-it"
+          }
+        ],
+        thinking: {
+          mode: "effort"
+        }
+      },
+      {
+        source: "providers/zenmux.kdl:93",
+        providers: [
+          "zenmux"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "openai/gpt-5.1-codex"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      },
+      {
+        source: "providers/zenmux.kdl:97",
+        providers: [
+          "zenmux"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "openai/gpt-5.1-codex-mini"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "medium",
+            "high"
+          ]
+        }
+      },
+      {
+        source: "providers/zenmux.kdl:101",
+        providers: [
+          "zenmux"
+        ],
+        models: [
+          {
+            kind: "glob",
+            value: "z*5"
+          },
+          {
+            kind: "exact",
+            value: "z-ai/glm-4.5-air"
+          },
+          {
+            kind: "exact",
+            value: "z-ai/glm-4.6"
+          },
+          {
+            kind: "exact",
+            value: "z-ai/glm-4.6v"
+          },
+          {
+            kind: "exact",
+            value: "z-ai/glm-4.7"
+          },
+          {
+            kind: "exact",
+            value: "z-ai/glm-5.1"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      },
+      {
+        source: "providers/zenmux.kdl:105",
+        providers: [
+          "zenmux"
+        ],
+        models: [
+          {
+            kind: "glob",
+            value: "z-ai/glm-5.2*"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "max"
+          ]
+        }
+      },
+      {
+        source: "providers/zenmux.kdl:3",
+        providers: [
+          "zenmux"
+        ],
+        wire: {
+          supportsStrictMode: true
+        }
+      },
+      {
+        source: "providers/zhipu-coding-plan.kdl:10",
+        class: "glm",
+        providers: [
+          "zhipu-coding-plan"
+        ],
+        family: "vision",
+        catalog: {
+          inputModalities: [
+            "text",
+            "image"
+          ]
+        }
+      },
+      {
+        source: "providers/zhipu-coding-plan.kdl:14",
+        class: "glm",
+        providers: [
+          "zhipu-coding-plan"
+        ],
+        family: "flash",
+        revision: [
+          {
+            op: ">=",
+            revision: "5.3.0"
+          }
+        ],
+        catalog: {
+          inputModalities: [
+            "text",
+            "image"
+          ]
+        }
+      },
+      {
+        source: "providers/zhipu-coding-plan.kdl:18",
+        class: "glm",
+        providers: [
+          "zhipu-coding-plan"
+        ],
+        family: "turbo",
+        wire: {
+          reasoningContentField: "reasoning_content",
+          supportsDeveloperRole: false,
+          thinkingFormat: "zai"
+        },
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      },
+      {
+        source: "providers/zhipu-coding-plan.kdl:6",
+        class: "glm",
+        providers: [
+          "zhipu-coding-plan"
+        ],
+        thinking: {
+          mode: "effort"
+        }
+      },
+      {
+        source: "providers/zhipu-coding-plan.kdl:26",
+        providers: [
+          "zhipu-coding-plan"
+        ],
+        models: [
+          {
+            kind: "glob",
+            value: "*5"
+          },
+          {
+            kind: "exact",
+            value: "glm-4.6"
+          }
+        ],
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      },
+      {
+        source: "providers/zhipu-coding-plan.kdl:30",
+        providers: [
+          "zhipu-coding-plan"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "glm-4.5-air"
+          }
+        ],
+        wire: {
+          reasoningContentField: "reasoning_content",
+          supportsDeveloperRole: false,
+          thinkingFormat: "zai"
+        }
+      },
+      {
+        source: "providers/zhipu-coding-plan.kdl:36",
+        providers: [
+          "zhipu-coding-plan"
+        ],
+        models: [
+          {
+            kind: "exact",
+            value: "glm-4.6v"
+          },
+          {
+            kind: "exact",
+            value: "glm-4.7"
+          },
+          {
+            kind: "exact",
+            value: "glm-5.1"
+          }
+        ],
+        wire: {
+          reasoningContentField: "reasoning_content",
+          supportsDeveloperRole: false,
+          thinkingFormat: "zai"
+        },
+        thinking: {
+          efforts: [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      },
+      {
+        source: "providers/zhipu-coding-plan.kdl:43",
+        providers: [
+          "zhipu-coding-plan"
+        ],
+        models: [
+          {
+            kind: "glob",
+            value: "glm-5.2*"
+          }
+        ],
+        wire: {
+          reasoningContentField: "reasoning_content",
+          supportsDeveloperRole: false,
+          thinkingFormat: "zai"
+        },
+        thinking: {
+          efforts: [
+            "high",
+            "max"
+          ]
+        }
+      },
+      {
+        source: "providers/zhipu-coding-plan.kdl:3",
+        providers: [
+          "zhipu-coding-plan"
+        ],
+        wire: {
+          thinkingFormat: "zai"
+        }
+      }
+    ]
+  },
+  behavior: {
+    modelOperations: [
+      {
+        provider: "openai",
+        models: {
+          exact: [
+            "o3"
+          ],
+          prefix: [
+            "gpt-",
+            "o3-"
+          ]
+        },
+        operations: [
+          "generate_image"
+        ]
+      },
+      {
+        provider: "openai-codex",
+        models: {
+          exact: [
+            "o3"
+          ],
+          prefix: [
+            "gpt-",
+            "o3-"
+          ]
+        },
+        operations: [
+          "generate_image"
+        ]
+      }
+    ],
+    cursorParameters: [
+      {
+        model: "composer-2.5",
+        id: "fast",
+        value: "false"
+      }
+    ],
+    quotaTiers: [
+      {
+        provider: "google-gemini-cli",
+        tiers: [
+          {
+            label: "3-Flash",
+            models: [
+              "gemini-3-flash-preview",
+              "gemini-3-flash",
+              "gemini-3.5-flash"
+            ]
+          },
+          {
+            label: "Flash",
+            models: [
+              "gemini-2.5-flash",
+              "gemini-2.5-flash-lite",
+              "gemini-2.0-flash",
+              "gemini-1.5-flash"
+            ]
+          },
+          {
+            label: "Pro",
+            models: [
+              "gemini-2.5-pro",
+              "gemini-3-pro-preview",
+              "gemini-3.1-pro-preview",
+              "gemini-3-pro",
+              "gemini-3.1-pro",
+              "gemini-pro-agent",
+              "gemini-1.5-pro"
+            ]
+          }
+        ],
+        fallbacks: [
+          {
+            label: "Flash",
+            substring: "flash"
+          },
+          {
+            label: "Pro",
+            substring: "pro"
+          }
+        ]
+      },
+      {
+        provider: "google-antigravity",
+        tiers: [
+          {
+            label: "anthropic",
+            models: [
+              "claude-opus-4-6"
+            ]
+          },
+          {
+            label: "google",
+            models: [
+              "gemini-3-pro",
+              "gemma-3",
+              "tab_flash_lite_preview",
+              "tab_jump_flash_lite_preview"
+            ]
+          },
+          {
+            label: "openai",
+            models: [
+              "gpt-oss-120b",
+              "openai/gpt-oss-120b"
+            ]
+          }
+        ],
+        fallbacks: [
+          {
+            label: "anthropic",
+            substring: "claude-"
+          },
+          {
+            label: "google",
+            substring: "gemini-"
+          },
+          {
+            label: "google",
+            substring: "gemma-"
+          },
+          {
+            label: "google",
+            substring: "tab_"
+          },
+          {
+            label: "openai",
+            substring: "gpt-"
+          },
+          {
+            label: "openai",
+            substring: "openai/"
+          }
+        ]
+      },
+      {
+        provider: "openai-codex",
+        tiers: [
+          {
+            label: "spark",
+            models: [
+              "gpt-5.3-codex-spark"
+            ]
+          },
+          {
+            label: "chat",
+            models: [
+              "gpt-5.3-codex"
+            ]
+          }
+        ],
+        fallbacks: [
+          {
+            label: "spark",
+            substring: "-spark"
+          },
+          {
+            label: "chat",
+            substring: "gpt-"
+          }
+        ]
+      }
+    ],
+    hostedDefaults: [
+      {
+        provider: "kimi-search",
+        model: "kimi-for-coding"
+      },
+      {
+        provider: "zai-search",
+        model: "glm-4.7"
+      },
+      {
+        provider: "synthetic-search",
+        model: "auto"
+      }
+    ],
+    apiRoutes: [
+      {
+        provider: "cloudflare-ai-gateway",
+        routes: [
+          {
+            api: "anthropic-messages",
+            match: {
+              prefix: [
+                "anthropic/"
+              ]
+            },
+            stripPrefix: true
+          },
+          {
+            api: "openai-completions",
+            match: {
+              prefix: [
+                "openai/"
+              ]
+            },
+            stripPrefix: true
+          },
+          {
+            api: "openai-completions",
+            match: {
+              prefix: [
+                "workers-ai/"
+              ]
+            },
+            stripPrefix: false
+          }
+        ]
+      },
+      {
+        provider: "gitlab-duo",
+        routes: [
+          {
+            api: "anthropic-messages",
+            match: {
+              prefix: [
+                "duo-chat-opus-",
+                "duo-chat-sonnet-",
+                "duo-chat-haiku-",
+                "claude-opus-",
+                "claude-sonnet-",
+                "claude-haiku-"
+              ]
+            }
+          },
+          {
+            api: "openai-responses",
+            match: {
+              exact: [
+                "duo-chat-gpt-5-codex",
+                "duo-chat-gpt-5-2-codex",
+                "gpt-5-codex",
+                "gpt-5.2-codex"
+              ]
+            }
+          }
+        ],
+        default: "openai-completions"
+      },
+      {
+        provider: "github-copilot",
+        routes: [
+          {
+            api: "anthropic-messages",
+            match: {
+              glob: [
+                "claude-haiku-*",
+                "claude-sonnet-*",
+                "claude-opus-*",
+                "claude-fable-*",
+                "claude-mythos-*"
+              ]
+            }
+          },
+          {
+            api: "openai-responses",
+            match: {
+              exact: [
+                "grok-4.5",
+                "grok-4.6"
+              ],
+              prefix: [
+                "gpt-5",
+                "gpt-6",
+                "oswe",
+                "mai-"
+              ]
+            }
+          }
+        ],
+        default: "openai-completions"
+      },
+      {
+        provider: "commandcode",
+        routes: [
+          {
+            api: "anthropic-messages",
+            match: {
+              prefix: [
+                "claude-"
+              ]
+            }
+          }
+        ],
+        default: "openai-completions"
+      },
+      {
+        provider: "zenmux",
+        routes: [
+          {
+            api: "anthropic-messages",
+            match: {
+              prefix: [
+                "anthropic/"
+              ]
+            }
+          }
+        ],
+        default: "openai-completions"
+      },
+      {
+        provider: "zai",
+        routes: [
+          {
+            api: "openai-completions",
+            match: {
+              exact: [
+                "glm-5.3-flash"
+              ]
+            }
+          }
+        ],
+        default: "anthropic-messages"
+      },
+      {
+        provider: "opencode-zen",
+        routes: [
+          {
+            api: "openai-responses",
+            match: {
+              prefix: [
+                "muse-spark-"
+              ],
+              exact: [
+                "muse-spark-1.3-contributor-free"
+              ]
+            }
+          },
+          {
+            api: "openai-completions",
+            match: {
+              exact: [
+                "minimax-m3",
+                "minimax-m3-free"
+              ]
+            }
+          }
+        ]
+      },
+      {
+        provider: "opencode-go",
+        routes: [
+          {
+            api: "openai-responses",
+            match: {
+              prefix: [
+                "muse-spark-"
+              ],
+              exact: [
+                "deepseek-v4-flash",
+                "muse-spark-1.2",
+                "muse-spark-1.2-contributor",
+                "muse-spark-1.3",
+                "muse-spark-1.3-contributor"
+              ]
+            }
+          },
+          {
+            api: "openai-completions",
+            match: {
+              exact: [
+                "minimax-m2.7",
+                "minimax-m3",
+                "minimax-m3-free",
+                "qwen3.5-plus",
+                "qwen3.6-plus"
+              ]
+            }
+          }
+        ]
+      }
+    ],
+    modelLimits: [
+      {
+        provider: "github-copilot",
+        limits: [
+          {
+            model: "claude-opus-4.6",
+            context: 168000,
+            maxTokens: 32000
+          },
+          {
+            model: "gpt-5.2",
+            context: 272000,
+            maxTokens: 128000
+          },
+          {
+            model: "gpt-5.4",
+            context: 272000,
+            maxTokens: 128000
+          },
+          {
+            model: "gpt-5.4-mini",
+            context: 272000,
+            maxTokens: 128000
+          },
+          {
+            model: "grok-code-fast-1",
+            context: 192000,
+            maxTokens: 64000
+          }
+        ]
+      },
+      {
+        provider: "moonshot",
+        limits: [
+          {
+            model: "kimi-k3",
+            context: 1048576,
+            maxTokens: 131072
+          }
+        ]
+      },
+      {
+        provider: "kimi-code",
+        limits: [
+          {
+            model: "k3",
+            maxTokens: 131072
+          },
+          {
+            model: "k3-256k",
+            maxTokens: 131072
+          },
+          {
+            model: "kimi-for-coding",
+            maxTokens: 32768
+          },
+          {
+            model: "kimi-for-coding-highspeed",
+            maxTokens: 32768
+          }
+        ]
+      },
+      {
+        provider: "alibaba-token-plan",
+        limits: [
+          {
+            model: "qwen3.6-plus",
+            context: 1e6,
+            maxTokens: 65536
+          },
+          {
+            model: "qwen3.8-max",
+            context: 1e6,
+            maxTokens: 131072
+          },
+          {
+            model: "deepseek-v4-flash",
+            context: 1e6,
+            maxTokens: 384000
+          },
+          {
+            model: "deepseek-v4-flash-0731",
+            context: 1e6,
+            maxTokens: 384000
+          },
+          {
+            model: "deepseek-v4-pro-0813",
+            context: 1e6,
+            maxTokens: 384000
+          },
+          {
+            model: "deepseek-v3.2",
+            context: 131072,
+            maxTokens: 65536
+          },
+          {
+            model: "glm-5.1",
+            context: 202752,
+            maxTokens: 128000
+          },
+          {
+            model: "glm-5",
+            context: 202752,
+            maxTokens: 16384
+          },
+          {
+            model: "kimi-k2.7-code",
+            context: 262144,
+            maxTokens: 262144
+          },
+          {
+            model: "kimi-k2.6",
+            context: 262144,
+            maxTokens: 262144
+          },
+          {
+            model: "kimi-k2.5",
+            context: 262144,
+            maxTokens: 98304
+          },
+          {
+            model: "minimax-m2.5",
+            context: 196608,
+            maxTokens: 32768
+          }
+        ]
+      }
+    ],
+    excludeModels: [
+      {
+        provider: "amazon-bedrock",
+        match: {
+          exact: [
+            "jp.anthropic.claude-opus-5",
+            "openai.gpt-5.4",
+            "openai.gpt-5.5",
+            "openai.gpt-5.6-luna",
+            "openai.gpt-5.6-sol",
+            "openai.gpt-5.6-terra"
+          ]
+        }
+      },
+      {
+        provider: "zai",
+        match: {
+          glob: [
+            "*[1m]"
+          ]
+        }
+      },
+      {
+        provider: "anthropic",
+        match: {
+          prefix: [
+            "claude-3-5-haiku",
+            "claude-3-7-sonnet"
+          ],
+          exact: [
+            "claude-3-opus-20240229",
+            "claude-3-sonnet-20240229"
+          ]
+        }
+      },
+      {
+        provider: "fireworks",
+        match: {
+          prefix: [
+            "accounts/fireworks/"
+          ]
+        }
+      },
+      {
+        provider: "firepass",
+        match: {
+          prefix: [
+            "accounts/fireworks/"
+          ]
+        }
+      },
+      {
+        provider: "xiaomi",
+        match: {
+          substring: [
+            "-tts",
+            "-asr"
+          ]
+        }
+      },
+      {
+        provider: "xiaomi-token-plan-ams",
+        match: {
+          substring: [
+            "-tts",
+            "-asr"
+          ]
+        }
+      },
+      {
+        provider: "xiaomi-token-plan-cn",
+        match: {
+          substring: [
+            "-tts",
+            "-asr"
+          ]
+        }
+      },
+      {
+        provider: "xiaomi-token-plan-sgp",
+        match: {
+          substring: [
+            "-tts",
+            "-asr"
+          ]
+        }
+      },
+      {
+        provider: "xai-oauth",
+        match: {
+          prefix: [
+            "grok-imagine-",
+            "grok-stt-",
+            "grok-voice-"
+          ]
+        }
+      },
+      {
+        provider: "meta",
+        match: {
+          prefix: [
+            "muse-image-",
+            "muse-voice-"
+          ]
+        }
+      },
+      {
+        provider: "muse-code",
+        match: {
+          prefix: [
+            "muse-image-",
+            "muse-voice-"
+          ]
+        }
+      },
+      {
+        provider: "nanogpt",
+        match: {
+          substring: [
+            "embedding",
+            "image",
+            "vision",
+            "audio",
+            "speech",
+            "transcribe",
+            "moderation",
+            "realtime",
+            "whisper",
+            "tts"
+          ]
+        }
+      },
+      {
+        provider: "aimlapi",
+        match: {
+          token: [
+            "audio",
+            "embed",
+            "embedding",
+            "embeddings",
+            "i2i",
+            "i2v",
+            "image",
+            "speech",
+            "t2i",
+            "t2v",
+            "tts",
+            "video"
+          ],
+          substring: [
+            "dall-e",
+            "dalle",
+            "flux",
+            "imagen",
+            "sora",
+            "veo",
+            "whisper"
+          ]
+        }
+      },
+      {
+        provider: "siliconflow",
+        match: {
+          substring: [
+            "embedding",
+            "reranker",
+            "bge-",
+            "bce-",
+            "stable-diffusion",
+            "image",
+            "flux",
+            "kolors",
+            "sensevoice",
+            "cosyvoice",
+            "fish-speech",
+            "indextts",
+            "sovits",
+            "whisper",
+            "hunyuanvideo",
+            "wan2",
+            "ltx-video",
+            "speech",
+            "moderator",
+            "tts"
+          ]
+        }
+      },
+      {
+        provider: "alibaba-token-plan",
+        match: {
+          prefix: [
+            "fun-asr",
+            "happyhorse-",
+            "qwen-audio-",
+            "qwen-image-",
+            "text-embedding-",
+            "wan2.7-"
+          ]
+        }
+      },
+      {
+        provider: "amazon-bedrock",
+        match: {
+          prefix: [
+            "ai21.jamba",
+            "amazon.titan-text-express",
+            "mistral.mistral-7b-instruct-v0"
+          ]
+        }
+      }
+    ],
+    retiredProviders: [
+      "wafer-pass",
+      "wandb",
+      "opencode"
+    ],
+    planRequirements: [
+      {
+        provider: "openai-codex",
+        tiers: [
+          {
+            tier: "pro",
+            match: {
+              substring: [
+                "-spark"
+              ]
+            }
+          },
+          {
+            tier: "paid",
+            match: {
+              exact: [
+                "gpt-5.6",
+                "gpt-5.6-sol",
+                "gpt-5.6-sol-pro",
+                "gpt-5.6-luna",
+                "gpt-5.6-luna-pro"
+              ],
+              glob: [
+                "*/gpt-5.6",
+                "*/gpt-5.6-sol",
+                "*/gpt-5.6-sol-pro",
+                "*/gpt-5.6-luna",
+                "*/gpt-5.6-luna-pro"
+              ]
+            }
+          }
+        ]
+      }
+    ],
+    pricingPeers: [
+      {
+        provider: "google-antigravity",
+        peers: [
+          "google",
+          "google-vertex",
+          "anthropic"
+        ],
+        aliases: [
+          {
+            model: "gemini-3-flash",
+            peerId: "gemini-3-flash-preview"
+          },
+          {
+            model: "gemini-3-pro",
+            peerId: "gemini-3-pro-preview"
+          },
+          {
+            model: "gemini-3.1-pro",
+            peerId: "gemini-3.1-pro-preview"
+          },
+          {
+            model: "claude-opus-4-5",
+            peerId: "claude-opus-4-5@20251101"
+          },
+          {
+            model: "claude-opus-4-6",
+            peerId: "claude-opus-4-6@default"
+          },
+          {
+            model: "claude-sonnet-4-5",
+            peerId: "claude-sonnet-4-5@20250929"
+          },
+          {
+            model: "claude-sonnet-4-6",
+            peerId: "claude-sonnet-4-6@default"
+          }
+        ]
+      },
+      {
+        provider: "xai-oauth",
+        peers: [
+          "xai"
+        ],
+        aliases: [
+          {
+            model: "grok-4.20-multi-agent-0309",
+            peerId: "grok-4.20-multi-agent-beta-latest"
+          }
+        ]
+      }
+    ],
+    openaiResponsesHeuristic: {
+      includePrefixes: [
+        "gpt-",
+        "o1",
+        "o3",
+        "o4",
+        "chatgpt"
+      ],
+      excludePrefixes: [
+        "text-embedding",
+        "whisper-",
+        "tts-",
+        "omni-moderation",
+        "omni-transcribe",
+        "omni-speech",
+        "gpt-image-",
+        "gpt-realtime"
+      ],
+      excludeSubstrings: [
+        "embedding"
+      ]
+    },
+    cursorEffort: {
+      familyMarker: "gpt-",
+      tiers: [
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ]
+    }
+  },
+  auth: {
+    providers: [
+      {
+        id: "openai-codex",
+        apiKeyFormat: "bearer",
+        name: "ChatGPT Plus/Pro (Codex Subscription)",
+        login: {
+          kind: "oauth-code",
+          scopes: [
+            "openid",
+            "profile",
+            "email",
+            "offline_access",
+            "api.connectors.read",
+            "api.connectors.invoke"
+          ],
+          scopeSeparator: " ",
+          pkce: true,
+          state: "hex",
+          standardAuthorizeParams: true,
+          authorizeParams: {
+            id_token_add_organizations: "true",
+            codex_cli_simplified_flow: "true",
+            originator: "omp"
+          },
+          clientId: {
+            value: "app_EMoamEEZ73f0CkXaXp7hrann"
+          },
+          authorizeUrl: {
+            value: "https://auth.openai.com/oauth/authorize"
+          },
+          instructions: "A browser window should open. Complete login to finish.",
+          callback: {
+            port: 1455,
+            path: "/auth/callback",
+            hostname: "localhost",
+            portFallback: false,
+            manualOnly: false,
+            nativeScheme: false,
+            redirectUri: {
+              value: "http://localhost:1455/auth/callback"
+            }
+          },
+          token: {
+            url: {
+              value: "https://auth.openai.com/oauth/token"
+            },
+            body: "form",
+            standard: true,
+            params: {},
+            headers: {},
+            timeoutMs: 15000
+          },
+          afterExchange: "openai-codex-profile",
+          credential: {
+            access: {
+              path: "access_token"
+            },
+            refresh: {
+              path: "refresh_token"
+            },
+            expires: {
+              mode: "seconds",
+              path: "expires_in",
+              skewMs: 0
+            }
+          }
+        },
+        refresh: {
+          kind: "request",
+          require: [],
+          token: {
+            url: {
+              value: "https://auth.openai.com/oauth/token"
+            },
+            body: "form",
+            standard: true,
+            params: {},
+            headers: {},
+            timeoutMs: 15000
+          },
+          afterRefresh: "openai-codex-profile",
+          credential: {
+            access: {
+              path: "access_token"
+            },
+            refresh: {
+              path: "refresh_token"
+            },
+            expires: {
+              mode: "seconds",
+              path: "expires_in",
+              skewMs: 0
+            }
+          }
+        },
+        callbackPort: 1455,
+        pasteCode: true
+      },
+      {
+        id: "anthropic",
+        apiKeyFormat: "bearer",
+        name: "Anthropic (Claude Pro/Max)",
+        env: {
+          hook: "anthropic-foundry"
+        },
+        login: {
+          kind: "oauth-code",
+          scopes: [
+            "org:create_api_key",
+            "user:profile",
+            "user:inference",
+            "user:sessions:claude_code",
+            "user:mcp_servers",
+            "user:file_upload"
+          ],
+          scopeSeparator: " ",
+          pkce: true,
+          state: "hex",
+          standardAuthorizeParams: true,
+          authorizeParams: {
+            code: "true"
+          },
+          clientId: {
+            value: "OWQxYzI1MGEtZTYxYi00NGQ5LTg4ZWQtNTk0NGQxOTYyZjVl",
+            encoding: "base64"
+          },
+          authorizeUrl: {
+            value: "https://claude.ai/oauth/authorize"
+          },
+          instructions: "Complete login in your browser. If the browser cannot reach this machine, paste the final redirect URL or authorization code when prompted.",
+          callback: {
+            port: 54545,
+            path: "/callback",
+            hostname: "localhost",
+            portFallback: true,
+            manualOnly: false,
+            nativeScheme: false
+          },
+          token: {
+            url: {
+              value: "https://api.anthropic.com/v1/oauth/token"
+            },
+            body: "json",
+            standard: true,
+            params: {
+              state: "{state}"
+            },
+            headers: {}
+          },
+          afterExchange: "anthropic-identity",
+          credential: {
+            access: {
+              path: "access_token"
+            },
+            refresh: {
+              path: "refresh_token"
+            },
+            expires: {
+              mode: "seconds",
+              path: "expires_in",
+              skewMs: 300000
+            },
+            accountId: {
+              path: "account.uuid"
+            },
+            email: {
+              path: "account.email_address"
+            },
+            orgId: {
+              path: "organization.uuid"
+            },
+            orgName: {
+              path: "organization.name"
+            }
+          }
+        },
+        refresh: {
+          kind: "request",
+          require: [],
+          token: {
+            url: {
+              value: "https://api.anthropic.com/v1/oauth/token"
+            },
+            body: "json",
+            standard: true,
+            params: {},
+            headers: {
+              "anthropic-beta": "oauth-2025-04-20",
+              "User-Agent": "anthropic-sdk-typescript/{claude_code_sdk_version} userOAuthProvider"
+            }
+          },
+          afterRefresh: "anthropic-identity",
+          credential: {
+            access: {
+              path: "access_token"
+            },
+            refresh: {
+              path: "refresh_token"
+            },
+            expires: {
+              mode: "seconds",
+              path: "expires_in",
+              skewMs: 300000
+            },
+            accountId: {
+              path: "account.uuid"
+            },
+            email: {
+              path: "account.email_address"
+            }
+          }
+        },
+        callbackPort: 54545,
+        pasteCode: true
+      },
+      {
+        id: "zai",
+        apiKeyFormat: "bearer",
+        name: "Z.AI (GLM Coding Plan)",
+        login: {
+          kind: "api-key",
+          authUrl: "https://z.ai/manage-apikey/apikey-list",
+          instructions: "Copy your API key from the dashboard",
+          prompt: "Paste your Z.AI API key",
+          placeholder: "sk-...",
+          validate: {
+            kind: "chat-completions",
+            label: "Z.AI",
+            baseUrl: "https://api.z.ai/api/coding/paas/v4",
+            model: "glm-5.2"
+          }
+        }
+      },
+      {
+        id: "zai-coding-plan",
+        apiKeyFormat: "bearer",
+        name: "Z.AI (GLM Coding Plan \xB7 Sign in)",
+        login: {
+          kind: "oauth-code",
+          scopes: [],
+          scopeSeparator: " ",
+          pkce: false,
+          state: "hex",
+          standardAuthorizeParams: true,
+          authorizeParams: {},
+          clientId: {
+            value: "client_P8X5CMWmlaRO9gyO-KSqtg",
+            env: [
+              "ZAI_OAUTH_CLIENT_ID"
+            ]
+          },
+          authorizeUrl: {
+            value: "https://chat.z.ai/api/oauth/authorize",
+            env: [
+              "ZAI_OAUTH_AUTHORIZE_URL"
+            ]
+          },
+          callback: {
+            port: 0,
+            path: "/callback",
+            hostname: "localhost",
+            portFallback: true,
+            manualOnly: true,
+            nativeScheme: true,
+            redirectUri: {
+              value: "zcode://zai-auth/callback",
+              env: [
+                "ZAI_OAUTH_REDIRECT_URI"
+              ]
+            }
+          },
+          instructions: "Complete Z.ai login in your browser. On supported local desktops, omp captures the zcode:// callback and restores its previous handler automatically. You can also paste the final redirect URL or authorization code when prompted.",
+          token: {
+            url: {
+              value: "https://zcode.z.ai/api/v1/oauth/token",
+              env: [
+                "ZAI_OAUTH_TOKEN_URL"
+              ]
+            },
+            body: "json",
+            standard: false,
+            params: {
+              provider: "zai",
+              code: "{code}",
+              redirect_uri: "{redirect_uri}",
+              state: "{state}"
+            },
+            headers: {}
+          },
+          afterExchange: "zai-mint-key",
+          credential: {
+            access: {
+              path: "data.zai.access_token"
+            },
+            refresh: {
+              path: "refresh_token"
+            },
+            expires: {
+              mode: "never"
+            },
+            email: {
+              path: "data.user.email"
+            },
+            accountId: {
+              path: "data.user.id"
+            }
+          }
+        },
+        storeAs: "zai",
+        refresh: {
+          kind: "none"
+        },
+        callbackPort: 0,
+        pasteCode: true
+      },
+      {
+        id: "kimi-code",
+        apiKeyFormat: "bearer",
+        name: "Kimi Code",
+        login: {
+          kind: "device-code",
+          scopes: [],
+          scopeSeparator: " ",
+          clientId: {
+            value: "17e5f671-d194-4dfb-9706-5516cb48c098"
+          },
+          baseUrl: {
+            value: "https://auth.kimi.com",
+            env: [
+              "KIMI_CODE_OAUTH_HOST",
+              "KIMI_OAUTH_HOST"
+            ]
+          },
+          headersHook: "kimi-fingerprint",
+          device: {
+            url: {
+              value: "{base}/api/oauth/device_authorization"
+            },
+            body: "form",
+            standard: true,
+            params: {},
+            headers: {}
+          },
+          token: {
+            url: {
+              value: "{base}/api/oauth/token"
+            },
+            body: "form",
+            standard: true,
+            params: {},
+            headers: {}
+          },
+          response: {
+            userCode: "user_code",
+            deviceCode: "device_code",
+            verificationUri: "verification_uri",
+            verificationUriComplete: "verification_uri_complete",
+            interval: "interval",
+            expiresIn: "expires_in"
+          },
+          instructions: "Enter code: {user_code}",
+          credential: {
+            access: {
+              path: "access_token"
+            },
+            refresh: {
+              path: "refresh_token"
+            },
+            expires: {
+              mode: "seconds",
+              path: "expires_in",
+              skewMs: 300000
+            },
+            accountId: {
+              claim: [
+                "user_id",
+                "sub"
+              ]
+            }
+          }
+        },
+        refresh: {
+          kind: "request",
+          require: [],
+          token: {
+            url: {
+              value: "{base}/api/oauth/token"
+            },
+            body: "form",
+            standard: true,
+            params: {},
+            headers: {}
+          },
+          credential: {
+            access: {
+              path: "access_token"
+            },
+            refresh: {
+              path: "refresh_token"
+            },
+            expires: {
+              mode: "seconds",
+              path: "expires_in",
+              skewMs: 300000
+            },
+            accountId: {
+              claim: [
+                "user_id",
+                "sub"
+              ]
+            }
+          },
+          headersHook: "kimi-fingerprint"
+        }
+      },
+      {
+        id: "openrouter",
+        apiKeyFormat: "bearer",
+        name: "OpenRouter",
+        login: {
+          kind: "oauth-code",
+          scopes: [],
+          scopeSeparator: " ",
+          pkce: true,
+          state: "none",
+          standardAuthorizeParams: false,
+          authorizeParams: {
+            callback_url: "{redirect_uri}",
+            code_challenge: "{code_challenge}",
+            code_challenge_method: "S256"
+          },
+          authorizeUrl: {
+            value: "https://openrouter.ai/auth"
+          },
+          callback: {
+            port: 54549,
+            path: "/callback",
+            hostname: "localhost",
+            portFallback: true,
+            manualOnly: false,
+            nativeScheme: false
+          },
+          token: {
+            url: {
+              value: "https://openrouter.ai/api/v1/auth/keys"
+            },
+            body: "json",
+            standard: false,
+            params: {
+              code: "{code}",
+              code_verifier: "{code_verifier}",
+              code_challenge_method: "S256"
+            },
+            headers: {}
+          },
+          pasteKey: {
+            prefix: "sk-or-",
+            validateUrl: "https://openrouter.ai/api/v1/auth/key"
+          },
+          credential: {
+            access: {
+              path: "key"
+            },
+            refresh: {
+              path: "refresh_token"
+            },
+            expires: {
+              mode: "never"
+            }
+          }
+        },
+        result: "api-key",
+        refresh: {
+          kind: "none"
+        },
+        callbackPort: 54549,
+        pasteCode: true
+      },
+      {
+        id: "github-copilot",
+        apiKeyFormat: "structured",
+        name: "GitHub Copilot",
+        login: {
+          kind: "custom",
+          hook: "github-copilot"
+        },
+        refresh: {
+          kind: "hook",
+          hook: "github-copilot"
+        }
+      },
+      {
+        id: "cursor",
+        apiKeyFormat: "bearer",
+        name: "Cursor (Claude, GPT, etc.)",
+        login: {
+          kind: "custom",
+          hook: "cursor"
+        },
+        refresh: {
+          kind: "hook",
+          hook: "cursor"
+        }
+      },
+      {
+        id: "devin",
+        apiKeyFormat: "bearer",
+        name: "Devin",
+        login: {
+          kind: "oauth-code",
+          scopes: [],
+          scopeSeparator: " ",
+          pkce: true,
+          state: "uuid",
+          standardAuthorizeParams: true,
+          authorizeParams: {
+            prompt: "select_account"
+          },
+          authorizeUrl: {
+            value: "https://app.devin.ai/auth/cli/continue"
+          },
+          instructions: "Sign in to Devin in your browser.",
+          callback: {
+            port: 59653,
+            path: "/callback",
+            hostname: "127.0.0.1",
+            portFallback: true,
+            manualOnly: false,
+            nativeScheme: false
+          },
+          token: {
+            url: {
+              value: "https://api.devin.ai/auth/cli/token"
+            },
+            body: "json",
+            standard: false,
+            params: {
+              code: "{code}",
+              code_verifier: "{code_verifier}"
+            },
+            headers: {
+              Accept: "application/json"
+            }
+          },
+          credential: {
+            access: {
+              path: "token"
+            },
+            refresh: {
+              path: "token"
+            },
+            expires: {
+              mode: "jwt",
+              skewMs: 300000,
+              fallbackMs: 31536000000
+            },
+            apiEndpoint: {
+              literal: "https://api.devin.ai"
+            },
+            enterpriseUrl: {
+              literal: "https://app.devin.ai"
+            }
+          }
+        },
+        refresh: {
+          kind: "none"
+        },
+        callbackPort: 59653,
+        pasteCode: true
+      },
+      {
+        id: "google-antigravity",
+        apiKeyFormat: "structured",
+        name: "Antigravity (Gemini 3, Claude, GPT-OSS)",
+        login: {
+          kind: "oauth-code",
+          scopes: [
+            "https://www.googleapis.com/auth/cloud-platform",
+            "https://www.googleapis.com/auth/userinfo.email",
+            "https://www.googleapis.com/auth/userinfo.profile",
+            "https://www.googleapis.com/auth/cclog",
+            "https://www.googleapis.com/auth/experimentsandconfigs"
+          ],
+          scopeSeparator: " ",
+          pkce: false,
+          state: "hex",
+          standardAuthorizeParams: true,
+          authorizeParams: {
+            access_type: "offline",
+            prompt: "consent"
+          },
+          clientId: {
+            value: "MTA3MTAwNjA2MDU5MS10bWhzc2luMmgyMWxjcmUyMzV2dG9sb2poNGc0MDNlcC5hcHBzLmdvb2dsZXVzZXJjb250ZW50LmNvbQ==",
+            encoding: "base64"
+          },
+          clientSecret: {
+            value: "R09DU1BYLUs1OEZXUjQ4NkxkTEoxbUxCOHNYQzR6NnFEQWY=",
+            encoding: "base64"
+          },
+          authorizeUrl: {
+            value: "https://accounts.google.com/o/oauth2/v2/auth"
+          },
+          instructions: "Complete the sign-in in your browser.",
+          callback: {
+            port: 51121,
+            path: "/oauth-callback",
+            hostname: "127.0.0.1",
+            portFallback: true,
+            manualOnly: false,
+            nativeScheme: false
+          },
+          token: {
+            url: {
+              value: "https://oauth2.googleapis.com/token"
+            },
+            body: "form",
+            standard: true,
+            params: {},
+            headers: {}
+          },
+          userinfo: {
+            url: "https://www.googleapis.com/oauth2/v1/userinfo?alt=json",
+            email: "email"
+          },
+          afterExchange: "google-antigravity-project",
+          credential: {
+            access: {
+              path: "access_token"
+            },
+            refresh: {
+              path: "refresh_token"
+            },
+            expires: {
+              mode: "seconds",
+              path: "expires_in",
+              skewMs: 300000
+            }
+          }
+        },
+        refresh: {
+          kind: "request",
+          require: [
+            "projectId"
+          ],
+          afterRefresh: "google-antigravity-project",
+          token: {
+            url: {
+              value: "https://oauth2.googleapis.com/token"
+            },
+            body: "form",
+            standard: true,
+            params: {},
+            headers: {}
+          },
+          credential: {
+            access: {
+              path: "access_token"
+            },
+            refresh: {
+              path: "refresh_token"
+            },
+            expires: {
+              mode: "seconds",
+              path: "expires_in",
+              skewMs: 300000
+            }
+          }
+        },
+        callbackPort: 51121,
+        pasteCode: true
+      },
+      {
+        id: "google-gemini-cli",
+        apiKeyFormat: "structured",
+        name: "Google Cloud Code Assist (Gemini CLI)",
+        login: {
+          kind: "oauth-code",
+          scopes: [
+            "https://www.googleapis.com/auth/cloud-platform",
+            "https://www.googleapis.com/auth/userinfo.email",
+            "https://www.googleapis.com/auth/userinfo.profile"
+          ],
+          scopeSeparator: " ",
+          pkce: false,
+          state: "hex",
+          standardAuthorizeParams: true,
+          authorizeParams: {
+            access_type: "offline",
+            prompt: "consent"
+          },
+          clientId: {
+            value: "NjgxMjU1ODA5Mzk1LW9vOGZ0Mm9wcmRybnA5ZTNhcWY2YXYzaG1kaWIxMzVqLmFwcHMuZ29vZ2xldXNlcmNvbnRlbnQuY29t",
+            encoding: "base64"
+          },
+          clientSecret: {
+            value: "R09DU1BYLTR1SGdNUG0tMW83U2stZ2VWNkN1NWNsWEZzeGw=",
+            encoding: "base64"
+          },
+          authorizeUrl: {
+            value: "https://accounts.google.com/o/oauth2/v2/auth"
+          },
+          instructions: "Complete the sign-in in your browser.",
+          callback: {
+            port: 8085,
+            path: "/oauth2callback",
+            hostname: "127.0.0.1",
+            portFallback: true,
+            manualOnly: false,
+            nativeScheme: false
+          },
+          token: {
+            url: {
+              value: "https://oauth2.googleapis.com/token"
+            },
+            body: "form",
+            standard: true,
+            params: {},
+            headers: {}
+          },
+          userinfo: {
+            url: "https://www.googleapis.com/oauth2/v1/userinfo?alt=json",
+            email: "email"
+          },
+          afterExchange: "google-gemini-cli-project",
+          credential: {
+            access: {
+              path: "access_token"
+            },
+            refresh: {
+              path: "refresh_token"
+            },
+            expires: {
+              mode: "seconds",
+              path: "expires_in",
+              skewMs: 300000
+            }
+          }
+        },
+        refresh: {
+          kind: "request",
+          require: [
+            "projectId"
+          ],
+          afterRefresh: "google-gemini-cli-project",
+          token: {
+            url: {
+              value: "https://oauth2.googleapis.com/token"
+            },
+            body: "form",
+            standard: true,
+            params: {},
+            headers: {}
+          },
+          credential: {
+            access: {
+              path: "access_token"
+            },
+            refresh: {
+              path: "refresh_token"
+            },
+            expires: {
+              mode: "seconds",
+              path: "expires_in",
+              skewMs: 300000
+            }
+          }
+        },
+        callbackPort: 8085,
+        pasteCode: true
+      },
+      {
+        id: "openai-codex-device",
+        apiKeyFormat: "bearer",
+        name: "ChatGPT Plus/Pro (Codex, headless/device)",
+        login: {
+          kind: "custom",
+          hook: "openai-codex-device"
+        },
+        storeAs: "openai-codex",
+        refresh: {
+          kind: "request",
+          require: [],
+          token: {
+            url: {
+              value: "https://auth.openai.com/oauth/token"
+            },
+            body: "form",
+            standard: false,
+            params: {
+              grant_type: "refresh_token",
+              refresh_token: "{refresh_token}",
+              client_id: "app_EMoamEEZ73f0CkXaXp7hrann"
+            },
+            headers: {},
+            timeoutMs: 15000
+          },
+          afterRefresh: "openai-codex-profile",
+          credential: {
+            access: {
+              path: "access_token"
+            },
+            refresh: {
+              path: "refresh_token"
+            },
+            expires: {
+              mode: "seconds",
+              path: "expires_in",
+              skewMs: 0
+            }
+          }
+        }
+      },
+      {
+        id: "xai",
+        apiKeyFormat: "bearer",
+        name: "xAI API",
+        login: {
+          kind: "api-key",
+          authUrl: "https://console.x.ai/team/default/api-keys",
+          instructions: "Create or copy your API key from the xAI Console",
+          prompt: "Paste your xAI API key",
+          placeholder: "xai-...",
+          validate: {
+            kind: "models-endpoint",
+            label: "xAI",
+            url: "https://api.x.ai/v1/models"
+          }
+        }
+      },
+      {
+        id: "xai-oauth",
+        apiKeyFormat: "bearer",
+        name: "xAI Grok OAuth (SuperGrok or X Premium+)",
+        login: {
+          kind: "device-code",
+          scopes: [
+            "openid",
+            "profile",
+            "email",
+            "offline_access",
+            "grok-cli:access",
+            "api:access"
+          ],
+          scopeSeparator: " ",
+          clientId: {
+            value: "b1a00492-073a-47ea-816f-4c329264a828"
+          },
+          device: {
+            url: {
+              value: "https://auth.x.ai/oauth2/device/code"
+            },
+            body: "form",
+            standard: true,
+            params: {},
+            headers: {
+              Accept: "application/json"
+            }
+          },
+          token: {
+            url: {
+              hook: "xai-token-endpoint"
+            },
+            body: "form",
+            standard: true,
+            params: {},
+            headers: {
+              Accept: "application/json"
+            }
+          },
+          response: {
+            userCode: "user_code",
+            deviceCode: "device_code",
+            verificationUri: "verification_uri",
+            verificationUriComplete: "verification_uri_complete",
+            interval: "interval",
+            expiresIn: "expires_in"
+          },
+          instructions: "Enter code: {user_code}",
+          userinfo: {
+            url: "https://auth.x.ai/oauth2/userinfo",
+            email: "email",
+            accountId: "sub"
+          },
+          credential: {
+            access: {
+              path: "access_token"
+            },
+            refresh: {
+              path: "refresh_token"
+            },
+            expires: {
+              mode: "seconds",
+              path: "expires_in",
+              skewMs: 300000
+            },
+            accountId: {
+              claim: [
+                "sub"
+              ]
+            }
+          }
+        },
+        refresh: {
+          kind: "request",
+          require: [],
+          userinfo: {
+            url: "https://auth.x.ai/oauth2/userinfo",
+            email: "email",
+            accountId: "sub"
+          },
+          token: {
+            url: {
+              hook: "xai-token-endpoint"
+            },
+            body: "form",
+            standard: true,
+            params: {},
+            headers: {}
+          },
+          credential: {
+            access: {
+              path: "access_token"
+            },
+            refresh: {
+              path: "refresh_token"
+            },
+            expires: {
+              mode: "seconds",
+              path: "expires_in",
+              skewMs: 300000
+            },
+            accountId: {
+              claim: [
+                "sub"
+              ]
+            }
+          }
+        }
+      },
+      {
+        id: "gitlab-duo",
+        apiKeyFormat: "bearer",
+        name: "GitLab Duo Non-Agentic",
+        env: {
+          vars: [
+            "GITLAB_TOKEN"
+          ]
+        },
+        login: {
+          kind: "oauth-code",
+          scopes: [
+            "api"
+          ],
+          scopeSeparator: " ",
+          pkce: true,
+          state: "hex",
+          standardAuthorizeParams: true,
+          authorizeParams: {},
+          clientId: {
+            value: "da4edff2e6ebd2bc3208611e2768bc1c1dd7be791dc5ff26ca34ca9ee44f7d4b",
+            env: [
+              "GITLAB_CLIENT_ID"
+            ]
+          },
+          authorizeUrl: {
+            value: "https://gitlab.com/oauth/authorize"
+          },
+          instructions: 'Complete GitLab login in browser. If GitLab responds with "The redirect URI included is not valid", register your own GitLab OAuth application and set GITLAB_CLIENT_ID + GITLAB_REDIRECT_URI, or use a Personal Access Token via GITLAB_TOKEN.',
+          callback: {
+            port: 8080,
+            path: "/callback",
+            hostname: "localhost",
+            portFallback: true,
+            manualOnly: false,
+            nativeScheme: false,
+            redirectUri: {
+              env: [
+                "GITLAB_REDIRECT_URI"
+              ]
+            }
+          },
+          token: {
+            url: {
+              value: "https://gitlab.com/oauth/token"
+            },
+            body: "form",
+            standard: true,
+            params: {},
+            headers: {}
+          },
+          afterExchange: "gitlab-duo-clear-cache",
+          credential: {
+            access: {
+              path: "access_token"
+            },
+            refresh: {
+              path: "refresh_token"
+            },
+            expires: {
+              mode: "seconds",
+              path: "expires_in",
+              skewMs: 300000,
+              fromPath: "created_at"
+            }
+          }
+        },
+        refresh: {
+          kind: "request",
+          require: [],
+          afterRefresh: "gitlab-duo-clear-cache",
+          token: {
+            url: {
+              value: "https://gitlab.com/oauth/token"
+            },
+            body: "form",
+            standard: true,
+            params: {},
+            headers: {}
+          },
+          credential: {
+            access: {
+              path: "access_token"
+            },
+            refresh: {
+              path: "refresh_token"
+            },
+            expires: {
+              mode: "seconds",
+              path: "expires_in",
+              skewMs: 300000,
+              fromPath: "created_at"
+            }
+          }
+        },
+        callbackPort: 8080,
+        pasteCode: true
+      },
+      {
+        id: "gitlab-duo-agent",
+        apiKeyFormat: "bearer",
+        name: "GitLab Duo Agent",
+        env: {
+          vars: [
+            "GITLAB_TOKEN"
+          ]
+        },
+        login: {
+          kind: "oauth-code",
+          scopes: [
+            "api"
+          ],
+          scopeSeparator: " ",
+          pkce: true,
+          state: "hex",
+          standardAuthorizeParams: true,
+          authorizeParams: {},
+          clientId: {
+            value: "36f2a70cddeb5a0889d4fd8295c241b7e9848e89cf9e599d0eed2d8e5350fbf5"
+          },
+          authorizeUrl: {
+            value: "https://gitlab.com/oauth/authorize"
+          },
+          instructions: "Complete GitLab login in your browser. This uses GitLab's official VS Code OAuth application. If the redirect opens VS Code instead of returning to OMP, copy the full vscode://gitlab.gitlab-workflow/authentication?... callback URL from VS Code/browser and paste it back into OMP.",
+          callback: {
+            port: 0,
+            path: "/callback",
+            hostname: "localhost",
+            portFallback: true,
+            manualOnly: true,
+            nativeScheme: false,
+            redirectUri: {
+              value: "vscode://gitlab.gitlab-workflow/authentication"
+            }
+          },
+          token: {
+            url: {
+              value: "https://gitlab.com/oauth/token"
+            },
+            body: "form",
+            standard: true,
+            params: {},
+            headers: {}
+          },
+          credential: {
+            access: {
+              path: "access_token"
+            },
+            refresh: {
+              path: "refresh_token"
+            },
+            expires: {
+              mode: "seconds",
+              path: "expires_in",
+              skewMs: 300000,
+              fromPath: "created_at"
+            }
+          }
+        },
+        refresh: {
+          kind: "request",
+          require: [],
+          token: {
+            url: {
+              value: "https://gitlab.com/oauth/token"
+            },
+            body: "form",
+            standard: true,
+            params: {
+              redirect_uri: "{redirect_uri}"
+            },
+            headers: {}
+          },
+          credential: {
+            access: {
+              path: "access_token"
+            },
+            refresh: {
+              path: "refresh_token"
+            },
+            expires: {
+              mode: "seconds",
+              path: "expires_in",
+              skewMs: 300000,
+              fromPath: "created_at"
+            }
+          }
+        },
+        callbackPort: 0,
+        pasteCode: true
+      },
+      {
+        id: "alibaba-coding-plan",
+        apiKeyFormat: "structured",
+        name: "Alibaba Coding Plan",
+        login: {
+          kind: "custom",
+          hook: "alibaba-coding-plan"
+        }
+      },
+      {
+        id: "alibaba-token-plan",
+        apiKeyFormat: "bearer",
+        name: "QwenCloud Token Plan",
+        login: {
+          kind: "custom",
+          hook: "alibaba-token-plan"
+        }
+      },
+      {
+        id: "aiand",
+        apiKeyFormat: "bearer",
+        name: "ai&",
+        login: {
+          kind: "api-key",
+          authUrl: "https://console.aiand.com/api-keys",
+          instructions: "Copy your API key from the ai& console",
+          prompt: "Paste your ai& API key",
+          placeholder: "sk-...",
+          validate: {
+            kind: "models-endpoint",
+            label: "ai&",
+            url: "https://api.aiand.com/v1/models"
+          }
+        }
+      },
+      {
+        id: "abliteration",
+        apiKeyFormat: "bearer",
+        name: "Abliteration",
+        login: {
+          kind: "api-key",
+          authUrl: "https://abliteration.ai/console",
+          instructions: "Copy your API key from the Abliteration console",
+          prompt: "Paste your Abliteration API key",
+          placeholder: "ak_...",
+          validate: {
+            kind: "models-endpoint",
+            url: "https://api.abliteration.ai/v1/models"
+          }
+        }
+      },
+      {
+        id: "zhipu-coding-plan",
+        apiKeyFormat: "bearer",
+        name: "Zhipu Coding Plan (\u667A\u8C31)",
+        login: {
+          kind: "api-key",
+          authUrl: "https://bigmodel.cn/coding-plan/personal/overview",
+          instructions: "Copy your API key from the Coding Plan dashboard",
+          prompt: "Paste your Zhipu API key",
+          placeholder: "<id>.<secret>",
+          validate: {
+            kind: "chat-completions",
+            label: "Zhipu",
+            baseUrl: "https://open.bigmodel.cn/api/coding/paas/v4",
+            model: "glm-5.1"
+          }
+        }
+      },
+      {
+        id: "umans",
+        apiKeyFormat: "bearer",
+        name: "Umans AI Coding Plan",
+        login: {
+          kind: "api-key",
+          authUrl: "https://app.umans.ai/billing",
+          instructions: "Create or copy your Umans API key from Dashboard \u2192 API Keys.",
+          prompt: "Paste your Umans API key",
+          placeholder: "sk-...",
+          validate: {
+            kind: "anthropic-messages",
+            baseUrl: "https://api.code.umans.ai",
+            model: "umans-coder"
+          }
+        }
+      },
+      {
+        id: "qwen-portal",
+        apiKeyFormat: "bearer",
+        name: "Qwen Portal",
+        login: {
+          kind: "api-key",
+          authUrl: "https://chat.qwen.ai",
+          instructions: "Copy your Qwen OAuth token or API key",
+          prompt: "Paste your Qwen OAuth token or API key",
+          placeholder: "sk-...",
+          validate: {
+            kind: "chat-completions",
+            label: "qwen-portal",
+            baseUrl: "https://portal.qwen.ai/v1",
+            model: "coder-model"
+          }
+        }
+      },
+      {
+        id: "sakana",
+        apiKeyFormat: "bearer",
+        name: "Sakana AI",
+        login: {
+          kind: "api-key",
+          authUrl: "https://console.sakana.ai/api-keys",
+          instructions: "Copy your API key from the Sakana AI console",
+          prompt: "Paste your Sakana AI API key",
+          placeholder: "sk-...",
+          validate: {
+            kind: "models-endpoint",
+            url: "https://api.sakana.ai/v1/models"
+          }
+        }
+      },
+      {
+        id: "minimax-code",
+        apiKeyFormat: "bearer",
+        name: "MiniMax Token Plan (International)",
+        login: {
+          kind: "api-key",
+          authUrl: "https://platform.minimax.io/subscribe/token-plan",
+          instructions: "Subscribe to Token Plan and copy your API key",
+          prompt: "Paste your MiniMax Token Plan API key",
+          placeholder: "sk-...",
+          validate: {
+            kind: "chat-completions",
+            label: "MiniMax Token Plan",
+            baseUrl: "https://api.minimax.io/v1",
+            model: "MiniMax-M3"
+          }
+        }
+      },
+      {
+        id: "minimax-code-cn",
+        apiKeyFormat: "bearer",
+        name: "MiniMax Token Plan (China)",
+        login: {
+          kind: "api-key",
+          authUrl: "https://platform.minimaxi.com/subscribe/token-plan",
+          instructions: "Subscribe to Token Plan and copy your API key",
+          prompt: "Paste your MiniMax Token Plan API key",
+          placeholder: "sk-...",
+          validate: {
+            kind: "chat-completions",
+            baseUrl: "https://api.minimaxi.com/v1",
+            model: "MiniMax-M3"
+          }
+        }
+      },
+      {
+        id: "xiaomi",
+        apiKeyFormat: "bearer",
+        name: "Xiaomi MiMo",
+        login: {
+          kind: "custom",
+          hook: "xiaomi"
+        }
+      },
+      {
+        id: "xiaomi-token-plan-sgp",
+        apiKeyFormat: "bearer",
+        name: "Xiaomi Token Plan (Singapore)",
+        login: {
+          kind: "api-key",
+          authUrl: "https://platform.xiaomimimo.com/console/plan-manage",
+          instructions: "Copy your token-plan API key for the Singapore region",
+          prompt: "Paste your Xiaomi Token Plan Singapore API key (tp-...)",
+          placeholder: "tp-...",
+          validate: {
+            kind: "chat-completions",
+            label: "xiaomi",
+            baseUrl: "https://token-plan-sgp.xiaomimimo.com/v1",
+            model: "mimo-v2.5"
+          }
+        }
+      },
+      {
+        id: "xiaomi-token-plan-ams",
+        apiKeyFormat: "bearer",
+        name: "Xiaomi Token Plan (Europe)",
+        login: {
+          kind: "api-key",
+          authUrl: "https://platform.xiaomimimo.com/console/plan-manage",
+          instructions: "Copy your token-plan API key for the Europe region",
+          prompt: "Paste your Xiaomi Token Plan Europe API key (tp-...)",
+          placeholder: "tp-...",
+          validate: {
+            kind: "chat-completions",
+            label: "xiaomi",
+            baseUrl: "https://token-plan-ams.xiaomimimo.com/v1",
+            model: "mimo-v2.5"
+          }
+        }
+      },
+      {
+        id: "xiaomi-token-plan-cn",
+        apiKeyFormat: "bearer",
+        name: "Xiaomi Token Plan (China)",
+        login: {
+          kind: "api-key",
+          authUrl: "https://platform.xiaomimimo.com/console/plan-manage",
+          instructions: "Copy your token-plan API key for the China region",
+          prompt: "Paste your Xiaomi Token Plan China API key (tp-...)",
+          placeholder: "tp-...",
+          validate: {
+            kind: "chat-completions",
+            label: "xiaomi",
+            baseUrl: "https://token-plan-cn.xiaomimimo.com/v1",
+            model: "mimo-v2.5"
+          }
+        }
+      },
+      {
+        id: "firepass",
+        apiKeyFormat: "bearer",
+        name: "Fire Pass (Fireworks subscription)",
+        login: {
+          kind: "api-key",
+          authUrl: "https://app.fireworks.ai/settings/users/api-keys",
+          instructions: "Create a dedicated Fire Pass API key in the Fireworks dashboard",
+          prompt: "Paste your Fire Pass API key",
+          placeholder: "fpk_...",
+          validate: {
+            kind: "chat-completions",
+            label: "Fire Pass",
+            baseUrl: "https://api.fireworks.ai/inference/v1",
+            model: "accounts/fireworks/routers/glm-5p2-fast"
+          }
+        }
+      },
+      {
+        id: "cline-pass",
+        apiKeyFormat: "bearer",
+        name: "ClinePass",
+        login: {
+          kind: "api-key",
+          authUrl: "https://app.cline.bot/dashboard/account",
+          instructions: "Create an API key in the Cline dashboard under Settings \u2192 API Keys",
+          prompt: "Paste your Cline API key",
+          placeholder: "sk_...",
+          validate: {
+            kind: "models-endpoint",
+            label: "ClinePass",
+            url: "https://api.cline.bot/api/v1/users/me",
+            headersHook: "cline-pass-client"
+          }
+        }
+      },
+      {
+        id: "commandcode",
+        apiKeyFormat: "bearer",
+        name: "Command Code",
+        env: {
+          vars: [
+            "COMMAND_CODE_API_KEY",
+            "COMMANDCODE_API_KEY"
+          ]
+        },
+        login: {
+          kind: "api-key",
+          authUrl: "https://commandcode.ai/studio",
+          instructions: "Create or copy a Provider API key from Command Code Studio",
+          prompt: "Paste your Command Code API key",
+          placeholder: "user_..."
+        }
+      },
+      {
+        id: "charm-hyper",
+        apiKeyFormat: "bearer",
+        name: "Charm Hyper",
+        env: {
+          vars: [
+            "CHARM_HYPER_API_KEY",
+            "HYPER_API_KEY"
+          ]
+        },
+        login: {
+          kind: "api-key",
+          authUrl: "https://hyper.charm.land/",
+          instructions: "Create or copy an API key from the Charm Hyper dashboard",
+          prompt: "Paste your Charm Hyper API key",
+          placeholder: "sk-hyper-...",
+          normalize: "strip-bearer",
+          validate: {
+            kind: "models-endpoint",
+            label: "Charm Hyper",
+            url: "https://hyper.charm.land/v1/credits"
+          }
+        }
+      },
+      {
+        id: "deepseek",
+        apiKeyFormat: "bearer",
+        name: "DeepSeek",
+        login: {
+          kind: "api-key",
+          authUrl: "https://platform.deepseek.com/api_keys",
+          instructions: "Create or copy your API key from the DeepSeek dashboard",
+          prompt: "Paste your DeepSeek API key",
+          placeholder: "sk-...",
+          normalize: "strip-bearer",
+          validate: {
+            kind: "models-endpoint",
+            label: "deepseek",
+            url: "https://api.deepseek.com/v1/models"
+          }
+        }
+      },
+      {
+        id: "muse-code",
+        apiKeyFormat: "bearer",
+        name: "Muse Code (Subscription)",
+        expiry: "jwt-or-never",
+        login: {
+          kind: "device-code",
+          scopes: [],
+          scopeSeparator: " ",
+          clientId: {
+            value: "1031625952748946"
+          },
+          device: {
+            url: {
+              value: "https://auth.meta.com/oidc/device/authorization/"
+            },
+            body: "form",
+            standard: true,
+            params: {},
+            headers: {
+              Accept: "application/json",
+              "x-api-version": "1.0.0"
+            }
+          },
+          token: {
+            url: {
+              value: "https://auth.meta.com/oidc/device/token/"
+            },
+            body: "form",
+            standard: true,
+            params: {},
+            headers: {
+              Accept: "application/json",
+              "x-api-version": "1.0.0"
+            }
+          },
+          response: {
+            userCode: "user_code",
+            deviceCode: "device_code",
+            verificationUri: "verification_uri",
+            verificationUriComplete: "verification_uri_complete",
+            interval: "interval",
+            expiresIn: "expires_in"
+          },
+          instructions: "Enter code: {user_code}",
+          afterExchange: "muse-code-key",
+          credential: {
+            access: {
+              path: "access_token"
+            },
+            refresh: {
+              path: "refresh_token"
+            },
+            expires: {
+              mode: "never"
+            }
+          }
+        },
+        refresh: {
+          kind: "none"
+        }
+      },
+      {
+        id: "meta",
+        apiKeyFormat: "bearer",
+        name: "Meta Model API",
+        login: {
+          kind: "api-key",
+          authUrl: "https://developer.meta.com/ai/",
+          instructions: "Create or copy your key from the Meta Model API dashboard",
+          prompt: "Paste your Meta Model API key",
+          placeholder: "Model API key",
+          validate: {
+            kind: "models-endpoint",
+            url: "https://api.meta.ai/v1/models"
+          }
+        }
+      },
+      {
+        id: "moonshot",
+        apiKeyFormat: "bearer",
+        name: "Moonshot (Kimi API)",
+        login: {
+          kind: "api-key",
+          authUrl: "https://platform.moonshot.ai/console/api-keys",
+          instructions: "Copy your API key from the Moonshot dashboard",
+          prompt: "Paste your Moonshot API key",
+          placeholder: "sk-...",
+          validate: {
+            kind: "models-endpoint",
+            label: "moonshot",
+            url: "https://api.moonshot.ai/v1/models",
+            baseUrlEnv: "MOONSHOT_BASE_URL"
+          }
+        }
+      },
+      {
+        id: "cerebras",
+        apiKeyFormat: "bearer",
+        name: "Cerebras",
+        login: {
+          kind: "api-key",
+          authUrl: "https://cloud.cerebras.ai/platform/",
+          instructions: "Copy your API key from the Cerebras dashboard",
+          prompt: "Paste your Cerebras API key",
+          placeholder: "csk-...",
+          validate: {
+            kind: "chat-completions",
+            label: "Cerebras",
+            baseUrl: "https://api.cerebras.ai/v1",
+            model: "gpt-oss-120b"
+          }
+        }
+      },
+      {
+        id: "baseten",
+        apiKeyFormat: "bearer",
+        name: "Baseten",
+        login: {
+          kind: "api-key",
+          authUrl: "https://app.baseten.co/settings/api_keys",
+          instructions: "Copy your API key from the Baseten dashboard",
+          prompt: "Paste your Baseten API key",
+          placeholder: "bt_...",
+          validate: {
+            kind: "models-endpoint",
+            label: "Baseten",
+            url: "https://inference.baseten.co/v1/models"
+          }
+        }
+      },
+      {
+        id: "fireworks",
+        apiKeyFormat: "bearer",
+        name: "Fireworks",
+        login: {
+          kind: "api-key",
+          authUrl: "https://app.fireworks.ai/settings/users/api-keys",
+          instructions: "Create or copy your Fireworks API key",
+          prompt: "Paste your Fireworks API key",
+          placeholder: "fw_...",
+          validate: {
+            kind: "models-endpoint",
+            label: "Fireworks",
+            url: "https://api.fireworks.ai/v1/accounts/fireworks/models?filter=supports_serverless%3Dtrue&pageSize=1"
+          }
+        }
+      },
+      {
+        id: "together",
+        apiKeyFormat: "bearer",
+        name: "Together",
+        login: {
+          kind: "api-key",
+          authUrl: "https://api.together.xyz/settings/api-keys",
+          instructions: "Copy your API key from the Together dashboard",
+          prompt: "Paste your Together API key",
+          placeholder: "sk-...",
+          validate: {
+            kind: "models-endpoint",
+            label: "together",
+            url: "https://api.together.xyz/v1/models"
+          }
+        }
+      },
+      {
+        id: "nvidia",
+        apiKeyFormat: "bearer",
+        name: "NVIDIA",
+        login: {
+          kind: "api-key",
+          authUrl: "https://org.ngc.nvidia.com/setup/personal-keys",
+          instructions: "Copy your API key from NVIDIA NGC Personal Keys",
+          prompt: "Paste your NVIDIA API key",
+          placeholder: "nvapi-...",
+          validate: {
+            kind: "chat-completions",
+            label: "nvidia",
+            optional: true,
+            baseUrl: "https://integrate.api.nvidia.com/v1",
+            model: "nvidia/llama-3.1-nemotron-70b-instruct"
+          }
+        }
+      },
+      {
+        id: "novita",
+        apiKeyFormat: "bearer",
+        name: "Novita",
+        login: {
+          kind: "api-key",
+          authUrl: "https://novita.ai/settings/key-management",
+          instructions: "Create or copy your API key from the Novita dashboard",
+          prompt: "Paste your Novita API key",
+          placeholder: "sk_...",
+          validate: {
+            kind: "chat-completions",
+            baseUrl: "https://api.novita.ai/openai/v1",
+            model: "moonshotai/kimi-k2.7-code"
+          }
+        }
+      },
+      {
+        id: "deepinfra",
+        apiKeyFormat: "bearer",
+        name: "DeepInfra",
+        login: {
+          kind: "api-key",
+          authUrl: "https://deepinfra.com/dash/api_keys",
+          instructions: "Create or copy your API key from the DeepInfra dashboard",
+          prompt: "Paste your DeepInfra API key",
+          placeholder: "...",
+          validate: {
+            kind: "chat-completions",
+            label: "DeepInfra",
+            baseUrl: "https://api.deepinfra.com/v1/openai",
+            model: "deepseek-ai/DeepSeek-V4-Flash-0731"
+          }
+        }
+      },
+      {
+        id: "huggingface",
+        apiKeyFormat: "bearer",
+        name: "Hugging Face Inference",
+        login: {
+          kind: "api-key",
+          authUrl: "https://huggingface.co/settings/tokens/new?ownUserPermissions=inference.serverless.write&tokenType=fineGrained",
+          instructions: "Create/copy a token with Make calls to Inference Providers permission (usable as HUGGINGFACE_HUB_TOKEN or HF_TOKEN)",
+          prompt: "Paste your Hugging Face token (HUGGINGFACE_HUB_TOKEN / HF_TOKEN)",
+          placeholder: "hf_...",
+          validate: {
+            kind: "chat-completions",
+            label: "Hugging Face",
+            baseUrl: "https://router.huggingface.co/v1",
+            model: "openai/gpt-oss-120b"
+          }
+        }
+      },
+      {
+        id: "perplexity",
+        apiKeyFormat: "bearer",
+        name: "Perplexity (Pro/Max)",
+        env: {
+          vars: [
+            "PERPLEXITY_API_KEY"
+          ]
+        },
+        login: {
+          kind: "custom",
+          hook: "perplexity"
+        },
+        expiry: "jwt-or-never",
+        refresh: {
+          kind: "none"
+        }
+      },
+      {
+        id: "qianfan",
+        apiKeyFormat: "bearer",
+        name: "Qianfan",
+        login: {
+          kind: "api-key",
+          authUrl: "https://console.bce.baidu.com/qianfan/ais/console/apiKey",
+          instructions: "Copy your Qianfan API key from the console",
+          prompt: "Paste your Qianfan API key",
+          placeholder: "bce-v3/ALTAK-...",
+          validate: {
+            kind: "chat-completions",
+            label: "qianfan",
+            baseUrl: "https://qianfan.baidubce.com/v2",
+            model: "deepseek-v3.2",
+            tolerateModelDenied: true
+          }
+        }
+      },
+      {
+        id: "venice",
+        apiKeyFormat: "bearer",
+        name: "Venice",
+        login: {
+          kind: "api-key",
+          authUrl: "https://venice.ai/settings/api",
+          instructions: "Copy your API key from the Venice dashboard",
+          prompt: "Paste your Venice API key",
+          placeholder: "vapi_...",
+          validate: {
+            kind: "chat-completions",
+            baseUrl: "https://api.venice.ai/api/v1",
+            model: "qwen3-4b"
+          }
+        }
+      },
+      {
+        id: "siliconflow",
+        apiKeyFormat: "bearer",
+        name: "SiliconFlow",
+        login: {
+          kind: "api-key",
+          authUrl: "https://cloud.siliconflow.com/account/ak",
+          instructions: "Create or copy your API key from the SiliconFlow console",
+          prompt: "Paste your SiliconFlow API key",
+          placeholder: "sk-...",
+          validate: {
+            kind: "models-endpoint",
+            label: "siliconflow",
+            url: "https://api.siliconflow.com/v1/models"
+          }
+        }
+      },
+      {
+        id: "siliconflow-cn",
+        apiKeyFormat: "bearer",
+        name: "SiliconFlow (China)",
+        login: {
+          kind: "api-key",
+          authUrl: "https://cloud.siliconflow.cn/account/ak",
+          instructions: "Create or copy your API key from the SiliconFlow console",
+          prompt: "Paste your SiliconFlow API key",
+          placeholder: "sk-...",
+          validate: {
+            kind: "models-endpoint",
+            label: "siliconflow-cn",
+            url: "https://api.siliconflow.cn/v1/models"
+          }
+        }
+      },
+      {
+        id: "synthetic",
+        apiKeyFormat: "bearer",
+        name: "Synthetic",
+        login: {
+          kind: "api-key",
+          authUrl: "https://dev.synthetic.new/docs/api/overview",
+          instructions: "Copy your API key from the Synthetic dashboard",
+          prompt: "Paste your Synthetic API key",
+          placeholder: "sk-...",
+          validate: {
+            kind: "models-endpoint",
+            url: "https://api.synthetic.new/openai/v1/models"
+          }
+        }
+      },
+      {
+        id: "nanogpt",
+        apiKeyFormat: "bearer",
+        name: "NanoGPT",
+        login: {
+          kind: "api-key",
+          authUrl: "https://nano-gpt.com/api",
+          instructions: "Create or copy your NanoGPT API key",
+          prompt: "Paste your NanoGPT API key",
+          placeholder: "sk-...",
+          validate: {
+            kind: "models-endpoint",
+            url: "https://nano-gpt.com/api/v1/models"
+          }
+        }
+      },
+      {
+        id: "wafer-serverless",
+        apiKeyFormat: "bearer",
+        name: "Wafer Serverless (pay-as-you-go)",
+        login: {
+          kind: "api-key",
+          authUrl: "https://app.wafer.ai/usage",
+          instructions: "Create or copy your Wafer Serverless API key from the Wafer dashboard",
+          prompt: "Paste your Wafer Serverless API key",
+          placeholder: "wfr_...",
+          validate: {
+            kind: "models-endpoint",
+            label: "Wafer Serverless",
+            url: "https://pass.wafer.ai/v1/models"
+          }
+        }
+      },
+      {
+        id: "coreweave",
+        apiKeyFormat: "bearer",
+        name: "CoreWeave Serverless Inference",
+        login: {
+          kind: "api-key",
+          authUrl: "https://wandb.ai/settings",
+          instructions: "Create or select a CoreWeave Serverless Inference project, add export COREWEAVE_PROJECT=<team>/<project> to your shell startup file (for example ~/.zshrc, ~/.bashrc, or your shell's profile/rc file) for the OpenAI-Project header, then copy your API key from account settings",
+          prompt: "Paste your CoreWeave Serverless Inference API key",
+          placeholder: "api-key",
+          validate: {
+            kind: "models-endpoint",
+            label: "CoreWeave Serverless Inference",
+            url: "https://api.inference.wandb.ai/v1/models",
+            headersHook: "coreweave-project"
+          }
+        }
+      },
+      {
+        id: "vercel-ai-gateway",
+        apiKeyFormat: "bearer",
+        name: "Vercel AI Gateway",
+        login: {
+          kind: "api-key",
+          authUrl: "https://vercel.com/d?to=%2F%5Bteam%5D%2F%7E%2Fai-gateway%2Fapi-keys&title=AI+Gateway+API+Keys",
+          instructions: "Copy your Vercel AI Gateway API key from the Vercel dashboard",
+          prompt: "Paste your Vercel AI Gateway API key",
+          placeholder: "vck_..."
+        }
+      },
+      {
+        id: "cloudflare-ai-gateway",
+        apiKeyFormat: "bearer",
+        name: "Cloudflare AI Gateway",
+        login: {
+          kind: "custom",
+          hook: "cloudflare-ai-gateway"
+        }
+      },
+      {
+        id: "litellm",
+        apiKeyFormat: "bearer",
+        name: "LiteLLM",
+        login: {
+          kind: "api-key",
+          authUrl: "https://docs.litellm.ai/docs/proxy/deploy",
+          instructions: "Run LiteLLM proxy (default http://localhost:4000/v1; set LITELLM_BASE_URL to customize it), then copy your master key or virtual key",
+          prompt: "Paste your LiteLLM API key (master key or virtual key)",
+          placeholder: "sk-..."
+        }
+      },
+      {
+        id: "kilo",
+        apiKeyFormat: "bearer",
+        name: "Kilo Gateway",
+        login: {
+          kind: "custom",
+          hook: "kilo"
+        }
+      },
+      {
+        id: "zenmux",
+        apiKeyFormat: "bearer",
+        name: "ZenMux",
+        login: {
+          kind: "api-key",
+          authUrl: "https://zenmux.ai/settings/keys",
+          instructions: "Create or copy your ZenMux API key",
+          prompt: "Paste your ZenMux API key",
+          placeholder: "sk-...",
+          validate: {
+            kind: "models-endpoint",
+            url: "https://zenmux.ai/api/v1/models"
+          }
+        }
+      },
+      {
+        id: "opencode-zen",
+        apiKeyFormat: "bearer",
+        name: "OpenCode Zen",
+        login: {
+          kind: "api-key",
+          authUrl: "https://opencode.ai/auth",
+          instructions: "Log in to the OpenCode Zen console and copy your OpenCode Zen API key",
+          prompt: "Paste your OpenCode Zen API key",
+          placeholder: "sk-..."
+        }
+      },
+      {
+        id: "opencode-go",
+        apiKeyFormat: "bearer",
+        name: "OpenCode Go",
+        login: {
+          kind: "api-key",
+          authUrl: "https://opencode.ai/auth",
+          instructions: "Log in to the OpenCode Zen console and copy your OpenCode Go API key",
+          prompt: "Paste your OpenCode Go API key",
+          placeholder: "sk-..."
+        }
+      },
+      {
+        id: "yolo-auto",
+        apiKeyFormat: "bearer",
+        name: "Yolo-Auto",
+        login: {
+          kind: "api-key",
+          authUrl: "https://yolo-auto.com/app",
+          instructions: "Create or copy your Yolo-Auto API key (yolo_...)",
+          prompt: "Paste your Yolo-Auto API key",
+          placeholder: "yolo_...",
+          validate: {
+            kind: "models-endpoint",
+            label: "Yolo-Auto",
+            url: "https://yolo-auto.com/v1/models"
+          }
+        }
+      },
+      {
+        id: "tavily",
+        apiKeyFormat: "bearer",
+        name: "Tavily",
+        env: {
+          vars: [
+            "TAVILY_API_KEY"
+          ]
+        },
+        login: {
+          kind: "api-key",
+          authUrl: "https://app.tavily.com/home",
+          instructions: "Copy your Tavily API key from the API Keys page.",
+          prompt: "Paste your Tavily API key",
+          placeholder: "tvly-..."
+        }
+      },
+      {
+        id: "kagi",
+        apiKeyFormat: "bearer",
+        name: "Kagi",
+        env: {
+          vars: [
+            "KAGI_API_KEY"
+          ]
+        },
+        login: {
+          kind: "api-key",
+          authUrl: "https://kagi.com/settings/api",
+          instructions: "Copy your Kagi Search API key from Kagi API settings. Search API access is beta-only; if unavailable, email support@kagi.com.",
+          prompt: "Paste your Kagi API key",
+          placeholder: "KG_..."
+        }
+      },
+      {
+        id: "exa",
+        apiKeyFormat: "bearer",
+        name: "Exa",
+        env: {
+          vars: [
+            "EXA_API_KEY"
+          ]
+        },
+        login: {
+          kind: "api-key",
+          authUrl: "https://dashboard.exa.ai/api-keys",
+          instructions: "Create or copy your API key from the Exa dashboard.",
+          prompt: "Paste your Exa API key",
+          placeholder: "API key"
+        }
+      },
+      {
+        id: "parallel",
+        apiKeyFormat: "bearer",
+        name: "Parallel",
+        env: {
+          vars: [
+            "PARALLEL_API_KEY"
+          ]
+        },
+        login: {
+          kind: "api-key",
+          authUrl: "https://platform.parallel.ai/settings?tab=api-keys",
+          instructions: "Copy your Parallel API key from the Parallel settings page.",
+          prompt: "Paste your Parallel API key",
+          placeholder: "sk_..."
+        }
+      },
+      {
+        id: "ollama",
+        apiKeyFormat: "bearer",
+        name: "Ollama (Local OpenAI-compatible)",
+        login: {
+          kind: "api-key",
+          authUrl: "https://github.com/ollama/ollama/blob/main/docs/api.md",
+          instructions: "Optional: paste an Ollama API key/token for authenticated hosts. Leave empty for local no-auth mode.",
+          prompt: "Paste your Ollama API key/token (optional)",
+          placeholder: "ollama-local",
+          emptyFallback: ""
+        }
+      },
+      {
+        id: "ollama-cloud",
+        apiKeyFormat: "bearer",
+        name: "Ollama Cloud",
+        login: {
+          kind: "api-key",
+          authUrl: "https://ollama.com/settings/keys",
+          instructions: "Create an Ollama Cloud API key, then paste it here.",
+          prompt: "Paste your Ollama Cloud API key",
+          placeholder: "ollama-cloud-api-key"
+        }
+      },
+      {
+        id: "lm-studio",
+        apiKeyFormat: "bearer",
+        name: "LM Studio (Local OpenAI-compatible)",
+        login: {
+          kind: "api-key",
+          prompt: "Optional: Paste LM Studio API key (to customize endpoint URL, set LM_STUDIO_BASE_URL env var)",
+          placeholder: "lm-studio-local",
+          emptyFallback: "lm-studio-local"
+        }
+      },
+      {
+        id: "llama.cpp",
+        apiKeyFormat: "bearer",
+        name: "llama.cpp (Local OpenAI-compatible)",
+        env: {
+          vars: [
+            "LLAMA_CPP_API_KEY"
+          ]
+        },
+        login: {
+          kind: "api-key",
+          authUrl: "https://github.com/ggml-org/llama.cpp#quick-start",
+          instructions: "Paste your llama.cpp API key if your server requires auth. Leave empty for local no-auth mode (default base URL: http://127.0.0.1:8080; set LLAMA_CPP_BASE_URL to customize).",
+          prompt: "Paste your llama.cpp API key (optional for local no-auth)",
+          placeholder: "llama-cpp-local",
+          emptyFallback: "llama-cpp-local"
+        }
+      },
+      {
+        id: "vllm",
+        apiKeyFormat: "bearer",
+        name: "vLLM (Local OpenAI-compatible)",
+        login: {
+          kind: "api-key",
+          authUrl: "https://docs.vllm.ai/en/latest/serving/openai_compatible_server.html",
+          instructions: "Paste your vLLM API key if your server requires auth. Leave empty for local no-auth mode (default base URL: http://127.0.0.1:8000/v1).",
+          prompt: "Paste your vLLM API key (optional for local no-auth)",
+          placeholder: "vllm-local",
+          emptyFallback: "vllm-local"
+        }
+      },
+      {
+        id: "gmi-cloud",
+        apiKeyFormat: "bearer",
+        name: "GMI Cloud",
+        login: {
+          kind: "api-key",
+          authUrl: "https://console.gmicloud.ai",
+          instructions: "Create or copy your GMI Cloud API key",
+          prompt: "Paste your GMI Cloud API key",
+          placeholder: "eyJ...",
+          validate: {
+            kind: "models-endpoint",
+            label: "GMI Cloud",
+            url: "https://api.gmi-serving.com/v1/models"
+          }
+        }
+      },
+      {
+        id: "aimlapi",
+        apiKeyFormat: "bearer",
+        name: "AIML API"
+      },
+      {
+        id: "amazon-bedrock",
+        apiKeyFormat: "bearer",
+        name: "Amazon Bedrock",
+        env: {
+          hook: "aws-bedrock"
+        }
+      },
+      {
+        id: "azure",
+        apiKeyFormat: "bearer",
+        name: "Azure OpenAI"
+      },
+      {
+        id: "bedrock-mantle",
+        apiKeyFormat: "bearer",
+        name: "Amazon Bedrock Mantle",
+        env: {
+          hook: "aws-bedrock-mantle"
+        },
+        allowsMissingApiKey: true
+      },
+      {
+        id: "google",
+        apiKeyFormat: "bearer",
+        name: "Google Gemini"
+      },
+      {
+        id: "google-vertex",
+        apiKeyFormat: "bearer",
+        name: "Google Vertex AI",
+        env: {
+          hook: "google-vertex-adc"
+        }
+      },
+      {
+        id: "groq",
+        apiKeyFormat: "bearer",
+        name: "Groq"
+      },
+      {
+        id: "minimax",
+        apiKeyFormat: "bearer",
+        name: "MiniMax"
+      },
+      {
+        id: "mistral",
+        apiKeyFormat: "bearer",
+        name: "Mistral"
+      },
+      {
+        id: "openai",
+        apiKeyFormat: "bearer",
+        name: "OpenAI"
+      }
+    ]
+  }
+};
+
+// work/omp-personal-router/node_modules/@oh-my-pi/pi-catalog/src/compat/cascade.ts
+class AmbiguousOverlapError extends Error {
+  provider;
+  model;
+  axis;
+  first;
+  second;
+  constructor(provider, model, axis, first, second) {
+    super(`ambiguous overlap for \`${provider}/${model}\` on axis \`${axis}\`: rules \`${first}\` and \`${second}\` tie; add an explicit priority`);
+    this.provider = provider;
+    this.model = model;
+    this.axis = axis;
+    this.first = first;
+    this.second = second;
+    this.name = "AmbiguousOverlapError";
+  }
+}
+function globMatch(pattern, value) {
+  const segments = pattern.split("*");
+  if (segments.length === 1)
+    return value === pattern;
+  const head = segments[0];
+  if (!value.startsWith(head))
+    return false;
+  let remainder = value.slice(head.length);
+  for (let i = 1;i < segments.length - 1; i++) {
+    const segment = segments[i];
+    if (!segment)
+      continue;
+    const found = remainder.indexOf(segment);
+    if (found === -1)
+      return false;
+    remainder = remainder.slice(found + segment.length);
+  }
+  const last = segments[segments.length - 1];
+  return last === "" || remainder.endsWith(last);
+}
+var ruleIndex;
+function buildRuleIndex(cascade) {
+  return cascade.rules.map((compiled) => {
+    const revision = compiled.revision?.map((term) => {
+      const parsed = parseRevision(term.revision);
+      if (!parsed)
+        throw new Error(`invalid compiled revision term in ${compiled.source}`);
+      return { op: term.op, revision: parsed };
+    });
+    const dimensions = Number(compiled.class !== undefined) + Number(compiled.providers !== undefined) + Number(compiled.apis !== undefined) + Number(compiled.family !== undefined) + Number(compiled.revision !== undefined) + Number(compiled.models !== undefined);
+    return {
+      compiled,
+      revision,
+      priority: compiled.priority ?? 0,
+      dimensions,
+      hasExactEffortsRule: compiled.thinking !== undefined && "efforts" in compiled.thinking
+    };
+  });
+}
+function getRuleIndex() {
+  ruleIndex ??= buildRuleIndex(rules_default.cascade);
+  return ruleIndex;
+}
+function selectorMatches(selector, model, modelLower) {
+  switch (selector.kind) {
+    case "exact":
+      return selector.value === model;
+    case "glob":
+      return globMatch(selector.value, modelLower);
+    case "token": {
+      for (const part of modelLower.split(/[^a-z0-9]+/)) {
+        if (part === selector.value)
+          return true;
+      }
+      return false;
+    }
+  }
+}
+function rankRule(rule, target, revision, modelLower) {
+  const { compiled } = rule;
+  if (compiled.class !== undefined && compiled.class !== target.class)
+    return;
+  if (compiled.providers !== undefined && !compiled.providers.includes(target.provider))
+    return;
+  if (compiled.apis !== undefined && !compiled.apis.includes(target.api))
+    return;
+  if (compiled.family !== undefined && compiled.family !== target.family)
+    return;
+  if (rule.revision !== undefined && (!revision || !revisionSatisfies(revision, rule.revision)))
+    return;
+  let exactness = 0;
+  if (compiled.models !== undefined) {
+    let best = -1;
+    for (const selector of compiled.models) {
+      if (!selectorMatches(selector, target.model, modelLower))
+        continue;
+      const value = selector.kind === "exact" ? 2 : 1;
+      if (value > best)
+        best = value;
+    }
+    if (best < 0)
+      return;
+    exactness = best;
+  }
+  return [exactness, rule.dimensions, rule.priority];
+}
+function rankCompare(a, b) {
+  return a[0] - b[0] || a[1] - b[1] || a[2] - b[2];
+}
+function contest(winners, axes, rank, rule, target) {
+  if (!axes)
+    return;
+  for (const axis in axes) {
+    const held = winners[axis];
+    if (held) {
+      const order = rankCompare(held.rank, rank);
+      if (order === 0) {
+        throw new AmbiguousOverlapError(target.provider, target.model, axis, held.rule.compiled.source, rule.compiled.source);
+      }
+      if (order > 0)
+        continue;
+    }
+    winners[axis] = { rank, rule };
+  }
+}
+function collect(winners, pick) {
+  const out = {};
+  for (const axis in winners) {
+    out[axis] = pick(winners[axis].rule.compiled)?.[axis];
+  }
+  return out;
+}
+function resolveCascade(target) {
+  return resolveOverIndex(getRuleIndex(), target);
+}
+function resolveOverIndex(index, target) {
+  const modelLower = target.model.toLowerCase();
+  const revision = target.revision === undefined ? undefined : parseRevision(target.revision);
+  const wire2 = {};
+  const thinking = {};
+  const catalog = {};
+  let reasoning = target.reasoning;
+  if (!reasoning) {
+    for (const rule of index) {
+      if (!rule.hasExactEffortsRule)
+        continue;
+      const rank = rankRule(rule, target, revision, modelLower);
+      if (rank && rank[0] === 2) {
+        reasoning = true;
+        break;
+      }
+    }
+  }
+  for (const rule of index) {
+    const rank = rankRule(rule, target, revision, modelLower);
+    if (!rank)
+      continue;
+    contest(wire2, rule.compiled.wire, rank, rule, target);
+    contest(catalog, rule.compiled.catalog, rank, rule, target);
+    if (reasoning)
+      contest(thinking, rule.compiled.thinking, rank, rule, target);
+  }
+  return {
+    wire: collect(wire2, (rule) => rule.wire),
+    thinking: collect(thinking, (rule) => rule.thinking),
+    catalog: collect(catalog, (rule) => rule.catalog)
+  };
+}
+
+// work/omp-personal-router/node_modules/@oh-my-pi/pi-catalog/src/compat/taxonomy.ts
+class AmbiguousIdentityError extends Error {
+  model;
+  first;
+  second;
+  constructor(model, first, second, kind) {
+    super(`ambiguous ${kind} for \`${model}\`: \`${first}\` and \`${second}\` tie`);
+    this.model = model;
+    this.first = first;
+    this.second = second;
+    this.name = "AmbiguousIdentityError";
+  }
+}
+var MATCHER_RANK = {
+  exact: 4,
+  bounded: 3,
+  namespace: 2,
+  prefix: 1,
+  glob: 0
+};
+function bareOf(id) {
+  const slash = id.lastIndexOf("/");
+  return slash === -1 ? id : id.slice(slash + 1);
+}
+function boundedMatch(value, token) {
+  if (value === token)
+    return true;
+  if (!value.startsWith(token))
+    return false;
+  const next = value.charCodeAt(token.length);
+  return next === 45 || next === 95 || next === 46 || next === 58 || next >= 48 && next <= 57;
+}
+function matcherMatches(matcher, lower, bare) {
+  switch (matcher.kind) {
+    case "exact":
+      return bare === matcher.token;
+    case "bounded":
+      return boundedMatch(bare, matcher.token);
+    case "namespace": {
+      const parts = matcher.bounded ? lower.split(/[/.:]/) : lower.split("/");
+      for (const part of parts) {
+        if (!part)
+          continue;
+        if (matcher.bounded ? boundedMatch(part, matcher.token) : part === matcher.token)
+          return true;
+      }
+      return false;
+    }
+    case "prefix":
+      return bare.startsWith(matcher.token);
+    case "glob":
+      return globMatch(matcher.token, bare);
+  }
+}
+function nonWildcardBytes(glob) {
+  let count = 0;
+  for (let i = 0;i < glob.length; i++) {
+    if (glob[i] !== "*")
+      count++;
+  }
+  return count;
+}
+function rankFamilies(cls, subject) {
+  let winner;
+  let tied;
+  for (const family of cls.families) {
+    if (!globMatch(family.glob, subject))
+      continue;
+    const rank = [family.priority, nonWildcardBytes(family.glob)];
+    if (winner && winner.rank[0] === rank[0] && winner.rank[1] === rank[1] && winner.id !== family.id) {
+      tied = [winner.id, family.id];
+    } else if (!winner || winner.rank[0] < rank[0] || winner.rank[0] === rank[0] && winner.rank[1] < rank[1]) {
+      winner = { rank, id: family.id };
+      tied = undefined;
+    }
+  }
+  return { winner, tied };
+}
+function stripClassNamespace(cls, bare) {
+  const separator = bare.search(/[.:]/);
+  if (separator <= 0 || separator === bare.length - 1)
+    return;
+  const namespace = bare.slice(0, separator);
+  if (!cls.matchers.some((matcher) => matcher.token === namespace))
+    return;
+  return bare.slice(separator + 1);
+}
+function classifyFamily(cls, bare, model, lenient) {
+  const initial = rankFamilies(cls, bare);
+  const tied = initial.tied;
+  if (!tied)
+    return initial.winner?.id;
+  const scoped = stripClassNamespace(cls, bare);
+  if (scoped !== undefined) {
+    const rescored = rankFamilies(cls, scoped);
+    if (rescored.winner && !rescored.tied)
+      return rescored.winner.id;
+  }
+  if (lenient)
+    return;
+  throw new AmbiguousIdentityError(model, tied[0], tied[1], "family");
+}
+function extractRevision(cls, bare) {
+  if (cls.skipBare.includes(bare))
+    return;
+  for (const rule of cls.revisionPrefixes) {
+    let tail;
+    if (rule.anywhere) {
+      const start = bare.indexOf(rule.prefix);
+      if (start !== -1)
+        tail = bare.slice(start + rule.prefix.length);
+    } else if (bare.startsWith(rule.prefix)) {
+      tail = bare.slice(rule.prefix.length);
+    }
+    if (tail === undefined)
+      continue;
+    const digit = tail.search(/[0-9]/);
+    if (digit === -1)
+      return;
+    const revision = parseRevisionPrefix(tail.slice(digit));
+    return revision ? formatRevision(revision) : undefined;
+  }
+  return;
+}
+function classifyRanks(model, lenient) {
+  const lower = model.trim().toLowerCase();
+  const bare = bareOf(lower);
+  let winner;
+  let tied;
+  for (const cls of rules_default.taxonomy.classes) {
+    for (const matcher of cls.matchers) {
+      if (!matcherMatches(matcher, lower, bare))
+        continue;
+      const rank = [MATCHER_RANK[matcher.kind], matcher.token.length];
+      if (winner && winner.rank[0] === rank[0] && winner.rank[1] === rank[1] && winner.cls.id !== cls.id) {
+        tied = [winner.cls.id, cls.id];
+      } else if (!winner || winner.rank[0] < rank[0] || winner.rank[0] === rank[0] && winner.rank[1] < rank[1]) {
+        winner = { rank, cls };
+        tied = undefined;
+      }
+    }
+  }
+  if (tied) {
+    if (lenient)
+      return { class: "unknown" };
+    throw new AmbiguousIdentityError(lower, tied[0], tied[1], "class");
+  }
+  if (!winner)
+    return { class: "unknown" };
+  const ranks = { class: winner.cls.id };
+  const family = classifyFamily(winner.cls, bare, lower, lenient);
+  if (family !== undefined)
+    ranks.family = family;
+  const revision = extractRevision(winner.cls, bare);
+  if (revision !== undefined)
+    ranks.revision = revision;
+  return ranks;
+}
+function ranksInClass(classId, model, lenient) {
+  const cls = rules_default.taxonomy.classes.find((candidate) => candidate.id === classId);
+  if (!cls)
+    return {};
+  const lower = model.trim().toLowerCase();
+  const bare = bareOf(lower);
+  const out = {};
+  const family = classifyFamily(cls, bare, lower, lenient);
+  if (family !== undefined)
+    out.family = family;
+  const revision = extractRevision(cls, bare);
+  if (revision !== undefined)
+    out.revision = revision;
+  return out;
+}
+function findIdentityOverride(provider, bareModel, observedAtMs) {
+  const lowerModel = bareModel.toLowerCase();
+  const lowerProvider = provider.toLowerCase();
+  let agnostic;
+  for (const cls of rules_default.taxonomy.classes) {
+    for (const override of cls.overrides) {
+      if (override.model.toLowerCase() !== lowerModel)
+        continue;
+      if (override.expiresAtMs !== undefined && observedAtMs !== undefined && observedAtMs >= override.expiresAtMs) {
+        continue;
+      }
+      if (override.provider !== undefined) {
+        if (override.provider.toLowerCase() === lowerProvider)
+          return override;
+      } else {
+        agnostic ??= override;
+      }
+    }
+  }
+  return agnostic;
+}
+function collapseVariantId(provider, model) {
+  const { collapse } = rules_default.taxonomy;
+  const lower = model.toLowerCase();
+  for (const family of collapse.effortFamilies) {
+    if (family.provider === provider.toLowerCase() && family.aliases.includes(lower)) {
+      return { logicalId: family.logical, thinkingVariant: false };
+    }
+  }
+  const bare = bareOf(lower);
+  let winner;
+  for (const rule of collapse.suffixes) {
+    if (!lower.endsWith(rule.suffix))
+      continue;
+    if (rule.exceptBarePrefix !== undefined && bare.startsWith(rule.exceptBarePrefix))
+      continue;
+    if (!winner || rule.suffix.length > winner.suffix.length)
+      winner = rule;
+  }
+  if (winner) {
+    const collapsed = {
+      logicalId: model.slice(0, model.length - winner.suffix.length),
+      thinkingVariant: winner.thinking === true
+    };
+    if (winner.effort !== undefined)
+      collapsed.effort = winner.effort;
+    return collapsed;
+  }
+  for (const lane of collapse.lanes) {
+    if (!lane.providers.some((candidate) => candidate === provider.toLowerCase()) || !lower.endsWith(lane.suffix)) {
+      continue;
+    }
+    const trimmed = lower.slice(0, lower.length - lane.suffix.length);
+    const trimmedBare = bareOf(trimmed);
+    if (lane.barePrefix !== undefined && !trimmedBare.startsWith(lane.barePrefix))
+      continue;
+    let effortRule;
+    for (const rule of collapse.suffixes) {
+      if (rule.effort === undefined || !trimmed.endsWith(rule.suffix))
+        continue;
+      if (rule.exceptBarePrefix !== undefined && trimmedBare.startsWith(rule.exceptBarePrefix))
+        continue;
+      if (!effortRule || rule.suffix.length > effortRule.suffix.length)
+        effortRule = rule;
+    }
+    if (!effortRule)
+      continue;
+    const base = model.slice(0, trimmed.length - effortRule.suffix.length);
+    if (!base || base.endsWith("/"))
+      continue;
+    return {
+      logicalId: `${base}${model.slice(trimmed.length)}`,
+      effort: effortRule.effort,
+      thinkingVariant: false
+    };
+  }
+  return { logicalId: model, thinkingVariant: false };
+}
+function stripThinkingVariantSuffix(model) {
+  const lower = model.toLowerCase();
+  for (const token of rules_default.taxonomy.collapse.pairTokens) {
+    const needle = `-${token}`;
+    let searchFrom = 0;
+    while (searchFrom < lower.length) {
+      const index = lower.indexOf(needle, searchFrom);
+      if (index === -1)
+        break;
+      const end = index + needle.length;
+      const next = lower.charCodeAt(end);
+      const followedByTokenCharacter = next >= 48 && next <= 57 || next >= 97 && next <= 122;
+      let wordStart = index;
+      while (wordStart > 0) {
+        const code = lower.charCodeAt(wordStart - 1);
+        if (!(code >= 48 && code <= 57 || code >= 97 && code <= 122))
+          break;
+        wordStart--;
+      }
+      const preceding = lower.slice(wordStart, index);
+      if (!followedByTokenCharacter && preceding !== "non" && preceding !== "no") {
+        const stripped = model.slice(0, index) + model.slice(end);
+        return stripped.length > 0 ? stripped : undefined;
+      }
+      searchFrom = index + 1;
+    }
+  }
+  return;
+}
+function classifyModel(provider, modelId, opts) {
+  const lenient = opts?.lenient === true;
+  const trimmed = modelId.trim();
+  const bare = bareOf(trimmed);
+  const override = findIdentityOverride(provider, bare, opts?.observedAtMs);
+  if (override) {
+    const logical = override.logical ?? trimmed;
+    const cls = override.class ?? classifyRanks(logical, lenient).class;
+    const inferred = ranksInClass(cls, logical, lenient);
+    const identity2 = { class: cls };
+    const family = override.family ?? inferred.family;
+    if (family !== undefined)
+      identity2.family = family;
+    const revision = override.revision ?? inferred.revision;
+    if (revision !== undefined)
+      identity2.revision = revision;
+    if (override.effort !== undefined)
+      identity2.effort = override.effort;
+    if (override.thinkingVariant)
+      identity2.thinkingVariant = true;
+    if (logical !== trimmed)
+      identity2.logicalId = logical;
+    return identity2;
+  }
+  const collapsed = trimmed.length === modelId.length ? collapseVariantId(provider, trimmed) : { logicalId: trimmed, thinkingVariant: false };
+  const ranks = classifyRanks(collapsed.logicalId, lenient);
+  const identity = { class: ranks.class };
+  if (ranks.family !== undefined)
+    identity.family = ranks.family;
+  if (ranks.revision !== undefined)
+    identity.revision = ranks.revision;
+  if (collapsed.effort !== undefined)
+    identity.effort = collapsed.effort;
+  if (collapsed.thinkingVariant)
+    identity.thinkingVariant = true;
+  if (collapsed.logicalId !== trimmed)
+    identity.logicalId = collapsed.logicalId;
+  return identity;
+}
+
+// work/omp-personal-router/node_modules/@oh-my-pi/pi-catalog/src/compat/resolve.ts
+class IdentityFacts {
+  identity;
+  revision;
+  constructor(identity) {
+    this.identity = identity;
+    this.revision = identity.revision === undefined ? undefined : parseRevision(identity.revision);
+  }
+  is(cls) {
+    return this.identity.class === cls;
+  }
+  family(...families) {
+    return this.identity.family !== undefined && families.includes(this.identity.family);
+  }
+  revGte(min) {
+    if (!this.revision)
+      return false;
+    const bound = parseRevision(min);
+    return bound !== undefined && compareRevision(this.revision, bound) >= 0;
+  }
+  revMajor() {
+    return this.revision?.[0];
+  }
+  get kimiMandatoryThinking() {
+    return this.is("kimi") && this.family("k2.7-code", "k3");
+  }
+  anthropicAdaptiveGenAtLeast(opusMin) {
+    if (!this.is("anthropic"))
+      return false;
+    if (this.family("opus"))
+      return this.revGte(opusMin);
+    if (this.family("sonnet", "fable", "mythos"))
+      return this.revGte("5");
+    return false;
+  }
+}
+function resolveIdentity(spec) {
+  return classifyModel(spec.provider, spec.id);
+}
+var keyRecords;
+function getKeyRecords() {
+  if (!keyRecords) {
+    keyRecords = {};
+    for (const directive in AXES) {
+      const axis = AXES[directive];
+      if (axis.set === "wire" && axis.records) {
+        keyRecords[axis.key] = { records: axis.records };
+      }
+    }
+  }
+  return keyRecords;
+}
+function applyWireAxes(compat, wire2, api) {
+  const records = API_COMPAT_RECORDS[api];
+  if (!records)
+    return;
+  const info = getKeyRecords();
+  for (const key in wire2) {
+    const meta = info[key];
+    if (!meta?.records.some((record) => records.includes(record)))
+      continue;
+    Reflect.set(compat, key, wire2[key]);
+  }
+}
+function overlayEffortMapAxis(compat, axes, specCompat) {
+  const axisMap = effortRecord(axes.wire.reasoningEffortMap);
+  if (axisMap && specCompat?.reasoningEffortMap) {
+    compat.reasoningEffortMap = { ...axisMap, ...specCompat.reasoningEffortMap };
+  }
+}
+function effortList(value) {
+  if (!Array.isArray(value) || value.length === 0)
+    return;
+  const out = [];
+  for (const entry of value) {
+    const effort = THINKING_EFFORTS.find((candidate) => candidate === entry);
+    if (effort === undefined)
+      return;
+    out.push(effort);
+  }
+  return out;
+}
+function effortValue(value) {
+  return THINKING_EFFORTS.find((candidate) => candidate === value);
+}
+function objectPayload(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value) ? value : undefined;
+}
+function effortRecord(value) {
+  if (typeof value !== "object" || value === null)
+    return;
+  const out = {};
+  let any = false;
+  for (const key in value) {
+    const effort = effortValue(key);
+    const mapped = Reflect.get(value, key);
+    if (effort === undefined || typeof mapped !== "string")
+      continue;
+    out[effort] = mapped;
+    any = true;
+  }
+  return any ? out : undefined;
+}
+function effortNumberRecord(value) {
+  if (typeof value !== "object" || value === null)
+    return;
+  const out = {};
+  let any = false;
+  for (const key in value) {
+    const effort = effortValue(key);
+    const mapped = Reflect.get(value, key);
+    if (effort === undefined || typeof mapped !== "number")
+      continue;
+    out[effort] = mapped;
+    any = true;
+  }
+  return any ? out : undefined;
+}
+function thinkingMode(value) {
+  switch (value) {
+    case "effort":
+    case "budget":
+    case "google-level":
+    case "anthropic-adaptive":
+    case "anthropic-budget-effort":
+      return value;
+    default:
+      return;
+  }
+}
+var GLM_CODING_PLAN_STREAM_IDLE_TIMEOUT_MS = 600000;
+var LOCAL_OPENAI_COMPAT_STREAM_IDLE_TIMEOUT_MS = 300000;
+var LOCAL_OPENAI_COMPAT_PROVIDERS = {
+  "llama.cpp": true,
+  "lm-studio": true,
+  vllm: true,
+  ollama: true
+};
+var PROXY_OPENAI_COMPAT_PROVIDERS = { litellm: true };
+function hasLocalLoopbackBaseUrl(baseUrl) {
+  if (!baseUrl)
+    return false;
+  let hostname;
+  try {
+    hostname = new URL(baseUrl).hostname.toLowerCase();
+  } catch {
+    return false;
+  }
+  if (hostname === "localhost" || hostname === "127.0.0.1" || hostname === "0.0.0.0" || hostname === "::1" || hostname === "[::1]") {
+    return true;
+  }
+  if (hostname.startsWith("10."))
+    return true;
+  if (hostname.startsWith("192.168."))
+    return true;
+  if (/^172\.(1[6-9]|2[0-9]|3[01])\./.test(hostname))
+    return true;
+  if (hostname.endsWith(".local"))
+    return true;
+  return false;
+}
+function resolveReasoningDisableMode(thinkingFormat) {
+  switch (thinkingFormat) {
+    case "openrouter":
+      return "openrouter-enabled-false";
+    case "zai":
+    case "kimi":
+      return "zai-thinking-disabled";
+    case "qwen":
+      return "qwen-enable-thinking-false";
+    case "qwen-chat-template":
+      return "qwen-template-false";
+    case "chat-template":
+      return "chat-template-thinking-false";
+    default:
+      return "lowest-effort";
+  }
+}
+function isOfficialOpenAIEndpoint(provider, baseUrl) {
+  if (provider !== "openai")
+    return false;
+  if (!baseUrl)
+    return true;
+  try {
+    return new URL(baseUrl).hostname === "api.openai.com";
+  } catch {
+    return false;
+  }
+}
+function detectOpenAI(spec, facts) {
+  const provider = spec.provider;
+  const baseUrl = spec.baseUrl;
+  const hostModel = { provider, baseUrl };
+  const isZai = modelMatchesHost(hostModel, "zai");
+  const isZhipu = modelMatchesHost(hostModel, "zhipu");
+  const isMoonshotNative = modelMatchesHost(hostModel, "moonshotNative");
+  const isXiaomiHost = modelMatchesHost(hostModel, "xiaomi");
+  const isDirectDeepseekApi = modelMatchesHost(hostModel, "deepseekDirect");
+  const isDeepseekFamily = modelMatchesHost(hostModel, "deepseekFamily") || facts.is("deepseek");
+  const isDeepseekReasoning = isDeepseekFamily && Boolean(spec.reasoning);
+  const isLocalOpenAICompatBackend = PROXY_OPENAI_COMPAT_PROVIDERS[provider] !== true && (LOCAL_OPENAI_COMPAT_PROVIDERS[provider] === true || hasLocalLoopbackBaseUrl(baseUrl));
+  return {
+    facts,
+    isClinePass: provider === "cline-pass",
+    isZai,
+    isZhipu,
+    isMoonshotNative,
+    isOpenCodeHost: modelMatchesHost(hostModel, "opencode"),
+    isOpenCodeProvider: provider === "opencode-go" || provider === "opencode-zen",
+    isDirectDeepseekApi,
+    isDeepseekReasoning,
+    isDirectDeepseekReasoning: isDirectDeepseekApi && isDeepseekReasoning,
+    isVenice: modelMatchesHost(hostModel, "venice"),
+    requiresEnabledThinking: isMoonshotNative && facts.is("kimi") && facts.family("k2.7-code"),
+    isXiaomiMimo: isXiaomiHost && facts.is("mimo"),
+    isLocalOpenAICompatBackend,
+    isLocalServingBackend: isLocalOpenAICompatBackend || hasLocalLoopbackBaseUrl(baseUrl),
+    isOpenRouter: modelMatchesHost(hostModel, "openrouter")
+  };
+}
+function detectOpenAICompat(spec, d) {
+  const provider = spec.provider;
+  const baseUrl = spec.baseUrl;
+  const hostModel = { provider, baseUrl };
+  const facts = d.facts;
+  const isCerebras = modelMatchesHost(hostModel, "cerebras");
+  const isCerebrasHost = hostMatchesUrl(baseUrl, "cerebras");
+  const isKilo = modelMatchesHost(hostModel, "kilo");
+  const isAlibaba = modelMatchesHost(hostModel, "alibabaDashscope");
+  const isXiaomiHost = modelMatchesHost(hostModel, "xiaomi");
+  const isGrok = modelMatchesHost(hostModel, "xai");
+  const isMistral = modelMatchesHost(hostModel, "mistral");
+  const isGoogleAistudioOpenAI = hostMatchesUrl(baseUrl, "googleAistudio");
+  const isOpenAIHost = modelMatchesHost(hostModel, "openai");
+  const isAzureHost = modelMatchesHost(hostModel, "azureOpenAI");
+  const isVercelGateway = modelMatchesHost(hostModel, "vercelAIGateway");
+  const isTogether = modelMatchesHost(hostModel, "together");
+  const isFireworks = hostMatchesUrl(baseUrl, "fireworks");
+  const isGroqHost = modelMatchesHost(hostModel, "groq");
+  const isMiniMaxHost = modelMatchesHost(hostModel, "minimax");
+  const isQwenPortal = modelMatchesHost(hostModel, "qwenPortal");
+  const isMoonshotKimi = facts.is("kimi") && d.isMoonshotNative;
+  const isMoonshotKimiK3 = isMoonshotKimi && facts.family("k3");
+  const usesMoonshotKimiPreservedThinking = isMoonshotKimi && facts.family("k2.6");
+  const isAnthropicModel = modelMatchesHost(hostModel, "anthropic") || facts.is("anthropic");
+  const isQwen = facts.is("qwen");
+  const isDeepseekFamily = modelMatchesHost(hostModel, "deepseekFamily") || facts.is("deepseek");
+  const supportsZaiReasoningEffort = (d.isZai || d.isZhipu) && facts.is("glm") && facts.revGte("5.2");
+  const isNonStandard = isCerebras || isGrok || isMistral || isGoogleAistudioOpenAI || hostMatchesUrl(baseUrl, "chutes") || hostMatchesUrl(baseUrl, "deepseekFamily") || isFireworks || isAlibaba || d.isZai || d.isZhipu || isKilo || isQwen || isXiaomiHost || d.isMoonshotNative || d.isOpenCodeHost;
+  const useMaxTokens = isMistral || d.isMoonshotNative || d.isZai || d.isZhipu || hostMatchesUrl(baseUrl, "chutes") || isFireworks || d.isDirectDeepseekApi;
+  const supportsPromptCacheBreakpoints = isOfficialOpenAIEndpoint(provider, baseUrl) && facts.is("openai") && facts.revGte("5.6");
+  const supportsMultipleSystemMessagesDefault = !isMiniMaxHost && !isAlibaba && !isQwenPortal && !isQwen && (isOpenAIHost || isAzureHost || d.isOpenRouter || isCerebras || isTogether || isFireworks || isGroqHost || isDeepseekFamily || isMistral || isGrok || d.isZai || d.isZhipu || provider === "github-copilot" || provider === "zenmux");
+  const streamIdleTimeoutMs = facts.is("glm") && facts.revGte("5") && !facts.family("vision") && (hostMatchesUrl(baseUrl, "zai") || hostMatchesUrl(baseUrl, "zhipu") || hostMatchesUrl(baseUrl, "opencode")) ? GLM_CODING_PLAN_STREAM_IDLE_TIMEOUT_MS : facts.is("mimo") && hostMatchesUrl(baseUrl, "xiaomi") ? 300000 : spec.reasoning && facts.is("kimi") && (facts.family("k3") || facts.family("k2.7-code")) && hostMatchesUrl(baseUrl, "moonshotNative") ? 300000 : spec.reasoning && facts.is("deepseek") && hostMatchesUrl(baseUrl, "deepseekDirect") ? 300000 : d.isLocalServingBackend ? LOCAL_OPENAI_COMPAT_STREAM_IDLE_TIMEOUT_MS : undefined;
+  const wireModelIdMode = hostMatchesUrl(baseUrl, "openrouter") ? "openrouter" : "raw";
+  const thinkingFormat = facts.is("kimi") && !facts.family("k3") && hostMatchesUrl(baseUrl, "moonshotNative") || hostMatchesUrl(baseUrl, "zai") || hostMatchesUrl(baseUrl, "zhipu") || facts.is("mimo") && hostMatchesUrl(baseUrl, "xiaomi") ? "zai" : hostMatchesUrl(baseUrl, "openrouter") ? "openrouter" : isQwen && hostMatchesUrl(baseUrl, "nvidia") ? "qwen-chat-template" : isQwen && (isFireworks || hostMatchesUrl(baseUrl, "venice")) ? "openai" : hostMatchesUrl(baseUrl, "alibabaDashscope") || isQwen ? "qwen" : "openai";
+  return {
+    supportsStore: !isNonStandard,
+    supportsDeveloperRole: isOpenAIHost || isAzureHost,
+    supportsMultipleSystemMessages: supportsMultipleSystemMessagesDefault,
+    supportsReasoningEffort: !isGrok && !d.isXiaomiMimo && (!(d.isZai || d.isZhipu) || supportsZaiReasoningEffort),
+    supportsReasoningParams: provider !== "github-copilot",
+    supportsSamplingParams: !(facts.is("openai") && (facts.family("o-series") || facts.revGte("5"))),
+    supportsPenaltyAndStopParams: !(isGrok && Boolean(spec.reasoning)),
+    reasoningEffortMap: {},
+    supportsUsageInStreaming: !isCerebrasHost,
+    alwaysSendMaxTokens: facts.is("kimi"),
+    disableReasoningOnForcedToolChoice: !d.isClinePass && (facts.is("kimi") && !isMoonshotKimiK3 || isAnthropicModel),
+    disableReasoningOnToolChoice: !d.isClinePass && isDeepseekFamily && Boolean(spec.reasoning) && !d.isOpenRouter,
+    supportsToolChoice: d.isClinePass || !d.isDirectDeepseekReasoning,
+    supportsForcedToolChoice: !d.requiresEnabledThinking && !(d.isOpenCodeHost && d.isDeepseekReasoning) && !(d.isClinePass && isQwen),
+    supportsNamedToolChoice: true,
+    maxTokensField: useMaxTokens ? "max_tokens" : "max_completion_tokens",
+    requiresToolResultName: isMistral,
+    requiresAssistantAfterToolResult: isMistral,
+    requiresThinkingAsText: isMistral,
+    requiresMistralToolIds: isMistral,
+    thinkingFormat,
+    kimiApiFormat: undefined,
+    reasoningDisableMode: d.isClinePass ? "cline-enabled-false" : d.isVenice ? "venice-disable-thinking" : resolveReasoningDisableMode(thinkingFormat),
+    omitReasoningEffort: false,
+    includeEncryptedReasoning: true,
+    filterReasoningHistory: d.isOpenRouter && isAnthropicModel,
+    thinkingKeep: usesMoonshotKimiPreservedThinking ? "all" : undefined,
+    reasoningContentField: d.isClinePass ? "reasoning" : "reasoning_content",
+    requiresReasoningContentForToolCalls: facts.is("kimi") && !d.isOpenCodeProvider || isDeepseekFamily && Boolean(spec.reasoning) || d.isXiaomiMimo || d.isOpenRouter && Boolean(spec.reasoning),
+    requiresReasoningContentForAllAssistantTurns: (isDeepseekFamily && Boolean(spec.reasoning) || d.isXiaomiMimo) && !d.isOpenRouter,
+    allowsSyntheticReasoningContentForToolCalls: (!isDeepseekFamily || !spec.reasoning) && !d.isXiaomiMimo,
+    replayReasoningContent: d.isLocalOpenAICompatBackend,
+    qwenPreserveThinking: (thinkingFormat === "qwen" || thinkingFormat === "qwen-chat-template") && d.isLocalOpenAICompatBackend,
+    qwenTemplateReasoningEffort: (thinkingFormat === "qwen" || thinkingFormat === "qwen-chat-template") && d.isLocalOpenAICompatBackend && provider !== "ollama" && isQwen && facts.revGte("3.8"),
+    requiresAssistantContentForToolCalls: facts.is("kimi") || d.isDirectDeepseekReasoning,
+    cacheControlFormat: d.isClinePass && (isQwen || isAnthropicModel) || d.isOpenRouter && isAnthropicModel ? "anthropic" : undefined,
+    supportsPromptCacheBreakpoints,
+    promptCacheBreakpointTtl: supportsPromptCacheBreakpoints ? "30m" : undefined,
+    openRouterRouting: undefined,
+    vercelGatewayRouting: undefined,
+    isOpenRouterHost: d.isOpenRouter,
+    wireModelIdMode,
+    isVercelGatewayHost: isVercelGateway,
+    supportsStrictMode: hostMatchesUrl(baseUrl, "openai") || hostMatchesUrl(baseUrl, "azureOpenAI") || hostMatchesUrl(baseUrl, "cerebras") || hostMatchesUrl(baseUrl, "together") || hostMatchesUrl(baseUrl, "openrouter") || hostMatchesUrl(baseUrl, "deepseekFamily"),
+    extraBody: undefined,
+    toolStrictMode: isCerebrasHost ? "all_strict" : "mixed",
+    toolSchemaFlavor: d.isMoonshotNative || facts.is("kimi") ? "moonshot-mfjs" : d.isLocalOpenAICompatBackend ? "grammar" : undefined,
+    streamFirstEventTimeoutMs: d.isLocalServingBackend ? 0 : undefined,
+    streamIdleTimeoutMs,
+    stripDeepseekSpecialTokens: facts.is("deepseek") && (provider === "nvidia" || provider === "deepseek"),
+    streamMarkupHealingPattern: detectStreamMarkupHealing(spec.provider, facts, baseUrl),
+    reasoningDeltasMayBeCumulative: false,
+    emptyLengthFinishIsContextError: false,
+    usesOpenAIToolCallIdLimit: false,
+    promptCacheSessionHeader: hostMatchesUrl(baseUrl, "xai") ? "x-grok-conv-id" : undefined,
+    dropThinkingWhenReasoningEffort: false,
+    nativeKimiK3Reasoning: false,
+    zaiReasoningEffortDialect: false,
+    clampOutputToModelMax: false,
+    stripImageInput: false,
+    thinkingLoopGuard: undefined,
+    rejectRootObjectUnion: false,
+    retryWithoutStrictOnGrammarError: false,
+    supportsPromptCacheKey: false
+  };
+}
+var DSML_HEALING_PROVIDERS = {
+  ollama: true,
+  "ollama-cloud": true,
+  nvidia: true,
+  deepseek: true,
+  fireworks: true,
+  nanogpt: true,
+  "opencode-go": true,
+  openrouter: true
+};
+function detectStreamMarkupHealing(provider, facts, baseUrl) {
+  const isKimiK2 = facts.is("kimi") && facts.identity.family?.startsWith("k2") === true;
+  if (provider === "kimi-code" || provider === "moonshot" || isKimiK2)
+    return "kimi";
+  if (facts.is("deepseek") && DSML_HEALING_PROVIDERS[provider] === true)
+    return "dsml";
+  if (isOfficialOpenAIEndpoint(provider, baseUrl))
+    return;
+  return "thinking";
+}
+function fixupOpenAICompat(spec, compat, d, axes) {
+  const deepseekThinking = compat.extraBody?.thinking;
+  if (d.isDirectDeepseekReasoning && typeof deepseekThinking === "object" && deepseekThinking !== null && "type" in deepseekThinking && deepseekThinking.type === "enabled") {
+    const extraBody = { ...compat.extraBody };
+    delete extraBody.thinking;
+    compat.extraBody = Object.keys(extraBody).length > 0 ? extraBody : undefined;
+  }
+  if (spec.compat?.reasoningDisableMode === undefined && !("reasoningDisableMode" in axes.wire)) {
+    compat.reasoningDisableMode = d.isClinePass ? "cline-enabled-false" : d.requiresEnabledThinking ? "omit" : d.isDirectDeepseekReasoning ? "zai-thinking-disabled" : d.isVenice ? "venice-disable-thinking" : resolveReasoningDisableMode(compat.thinkingFormat);
+  }
+  if (spec.compat?.omitReasoningEffort === undefined && !("omitReasoningEffort" in axes.wire) && !compat.supportsReasoningEffort) {
+    compat.omitReasoningEffort = true;
+  }
+  const axisWhenThinking = spec.reasoning ? objectPayload(axes.wire.whenThinking) : undefined;
+  const whenThinkingPolicy = spec.compat?.whenThinking ?? axisWhenThinking ?? (d.isDirectDeepseekReasoning ? { extraBody: { ...compat.extraBody, thinking: { type: "enabled" } } } : undefined);
+  if (whenThinkingPolicy) {
+    const variant = { ...compat, whenThinking: undefined };
+    applyCompatOverrides(variant, whenThinkingPolicy);
+    if (Reflect.get(whenThinkingPolicy, "reasoningDisableMode") === undefined) {
+      variant.reasoningDisableMode = d.isVenice ? "venice-disable-thinking" : resolveReasoningDisableMode(variant.thinkingFormat);
+    }
+    if (Reflect.get(whenThinkingPolicy, "omitReasoningEffort") === undefined && !variant.supportsReasoningEffort) {
+      variant.omitReasoningEffort = true;
+    }
+    compat.whenThinking = variant;
+  } else {
+    compat.whenThinking = undefined;
+  }
+}
+function resolveOpenAICompletionsPolicy(spec, facts, axes) {
+  const d = detectOpenAI(spec, facts);
+  const compat = detectOpenAICompat(spec, d);
+  applyWireAxes(compat, axes.wire, "openai-completions");
+  applyCompatOverrides(compat, spec.compat);
+  overlayEffortMapAxis(compat, axes, spec.compat);
+  fixupOpenAICompat(spec, compat, d, axes);
+  return compat;
+}
+function resolveOpenAIResponsesPolicy(spec, facts, axes, api) {
+  const baseUrl = spec.baseUrl ?? "";
+  const provider = spec.provider;
+  const hostModel = { provider, baseUrl };
+  const isAzure = modelMatchesHost(hostModel, "azureOpenAI");
+  const isOpenRouter = modelMatchesHost(hostModel, "openrouter");
+  const isOpenAIUrl = hostMatchesUrl(baseUrl, "openai");
+  const isVercelGateway = modelMatchesHost(hostModel, "vercelAIGateway");
+  const isXaiHost = modelMatchesHost(hostModel, "xai");
+  const supportsPromptCacheBreakpoints = isOfficialOpenAIEndpoint(provider, baseUrl) && facts.is("openai") && facts.revGte("5.6");
+  const thinkingFormat = isOpenRouter ? "openrouter" : "openai";
+  const reasoningCapable = Boolean(spec.reasoning);
+  const isLocalServingBackend = PROXY_OPENAI_COMPAT_PROVIDERS[provider] !== true && LOCAL_OPENAI_COMPAT_PROVIDERS[provider] === true || hasLocalLoopbackBaseUrl(baseUrl);
+  const isAnthropicModel = facts.is("anthropic");
+  const isDeepseekFamily = facts.is("deepseek");
+  const compat = {
+    supportsDeveloperRole: isAzure || isOpenAIUrl || hostMatchesUrl(baseUrl, "githubCopilot"),
+    supportsStrictMode: isAzure || hostMatchesUrl(baseUrl, "openai") || hostMatchesUrl(baseUrl, "azureOpenAI") || hostMatchesUrl(baseUrl, "cerebras") || hostMatchesUrl(baseUrl, "together") || hostMatchesUrl(baseUrl, "openrouter") || hostMatchesUrl(baseUrl, "deepseekFamily"),
+    supportsReasoningEffort: !isXaiHost,
+    supportsLongPromptCacheRetention: isOpenAIUrl,
+    supportsPromptCacheBreakpoints,
+    promptCacheBreakpointTtl: supportsPromptCacheBreakpoints ? "30m" : undefined,
+    strictResponsesPairing: isAzure || provider === "github-copilot",
+    supportsImageDetailOriginal: !isXaiHost && !modelMatchesHost(hostModel, "githubCopilot"),
+    supportsReasoningSummary: !isXaiHost,
+    supportsAllTurnsReasoningContext: false,
+    supportsConfigurationUpdate: false,
+    requiresReasoningOffJuiceInstruction: false,
+    stripImageInput: false,
+    thinkingLoopGuard: undefined,
+    reasoningEffortMap: {},
+    supportsReasoningParams: true,
+    supportsSamplingParams: !(facts.is("openai") && (facts.family("o-series") || facts.revGte("5"))),
+    supportsPenaltyAndStopParams: !isXaiHost,
+    thinkingFormat,
+    reasoningDisableMode: resolveReasoningDisableMode(thinkingFormat),
+    omitReasoningEffort: false,
+    includeEncryptedReasoning: true,
+    filterReasoningHistory: isOpenRouter && isAnthropicModel,
+    disableReasoningOnForcedToolChoice: facts.is("kimi"),
+    disableReasoningOnToolChoice: isDeepseekFamily && reasoningCapable && !isOpenRouter,
+    supportsToolChoice: true,
+    supportsForcedToolChoice: provider !== "opencode-go" && provider !== "opencode-zen",
+    supportsNamedToolChoice: true,
+    reasoningContentField: "reasoning_content",
+    requiresReasoningContentForToolCalls: (facts.is("kimi") || isDeepseekFamily && reasoningCapable || isOpenRouter && reasoningCapable) && reasoningCapable,
+    requiresReasoningContentForAllAssistantTurns: isDeepseekFamily && reasoningCapable && !isOpenRouter,
+    allowsSyntheticReasoningContentForToolCalls: !isDeepseekFamily || !reasoningCapable,
+    replayReasoningContent: false,
+    qwenPreserveThinking: false,
+    qwenTemplateReasoningEffort: false,
+    requiresThinkingAsText: false,
+    requiresMistralToolIds: false,
+    requiresToolResultName: false,
+    requiresAssistantAfterToolResult: false,
+    requiresAssistantContentForToolCalls: facts.is("kimi"),
+    openRouterRouting: undefined,
+    vercelGatewayRouting: undefined,
+    isOpenRouterHost: isOpenRouter,
+    isVercelGatewayHost: isVercelGateway,
+    wireModelIdMode: isOpenRouter ? "openrouter" : "raw",
+    toolSchemaFlavor: facts.is("kimi") ? "moonshot-mfjs" : undefined,
+    alwaysSendMaxTokens: facts.is("kimi"),
+    clampOutputToModelMax: false,
+    supportsObfuscationOptOut: isOpenAIUrl || provider === "openai",
+    officialEndpoint: isOfficialOpenAIEndpoint(provider, baseUrl),
+    harmonyLeakMitigation: false,
+    rejectRootObjectUnion: false,
+    retryWithoutStrictOnGrammarError: false,
+    cacheControlFormat: isOpenRouter && isAnthropicModel ? "anthropic" : undefined,
+    stripDeepseekSpecialTokens: facts.is("deepseek") && (provider === "nvidia" || provider === "deepseek"),
+    streamMarkupHealingPattern: detectStreamMarkupHealing(provider, facts, baseUrl),
+    reasoningDeltasMayBeCumulative: false,
+    emptyLengthFinishIsContextError: false,
+    usesOpenAIToolCallIdLimit: false,
+    promptCacheSessionHeader: hostMatchesUrl(baseUrl, "xai") ? "x-grok-conv-id" : undefined,
+    streamFirstEventTimeoutMs: isLocalServingBackend ? 0 : spec.compat?.streamFirstEventTimeoutMs,
+    streamIdleTimeoutMs: isLocalServingBackend ? LOCAL_OPENAI_COMPAT_STREAM_IDLE_TIMEOUT_MS : spec.compat?.streamIdleTimeoutMs
+  };
+  applyWireAxes(compat, axes.wire, api);
+  applyCompatOverrides(compat, spec.compat);
+  overlayEffortMapAxis(compat, axes, spec.compat);
+  if (isXaiHost && "reasoningEffortMap" in axes.wire) {
+    const canonical = effortRecord(axes.wire.reasoningEffortMap) ?? {};
+    compat.reasoningEffortMap = { ...compat.reasoningEffortMap, ...canonical };
+    for (const key of ["xhigh" /* XHigh */, "max" /* Max */]) {
+      if (!(key in canonical))
+        delete compat.reasoningEffortMap[key];
+    }
+  }
+  if (spec.compat?.reasoningDisableMode === undefined && !("reasoningDisableMode" in axes.wire)) {
+    compat.reasoningDisableMode = resolveReasoningDisableMode(compat.thinkingFormat);
+  }
+  if (spec.compat?.omitReasoningEffort === undefined && !("omitReasoningEffort" in axes.wire) && !compat.supportsReasoningEffort) {
+    compat.omitReasoningEffort = true;
+  }
+  if (provider === "xai-oauth" && axes.wire.supportsReasoningEffort === true && spec.compat?.supportsReasoningEffort !== false) {
+    compat.supportsReasoningEffort = true;
+    compat.omitReasoningEffort = false;
+  }
+  return compat;
+}
+function pickResponsesOnly(compat) {
+  return {
+    supportsLongPromptCacheRetention: compat.supportsLongPromptCacheRetention,
+    strictResponsesPairing: compat.strictResponsesPairing,
+    supportsImageDetailOriginal: compat.supportsImageDetailOriginal,
+    supportsObfuscationOptOut: compat.supportsObfuscationOptOut,
+    supportsAllTurnsReasoningContext: compat.supportsAllTurnsReasoningContext,
+    supportsConfigurationUpdate: compat.supportsConfigurationUpdate,
+    officialEndpoint: compat.officialEndpoint,
+    harmonyLeakMitigation: compat.harmonyLeakMitigation,
+    cacheControlFormat: compat.cacheControlFormat,
+    requiresReasoningOffJuiceInstruction: compat.requiresReasoningOffJuiceInstruction,
+    supportsReasoningSummary: compat.supportsReasoningSummary,
+    isVercelGatewayHost: compat.isVercelGatewayHost
+  };
+}
+function resolveAnthropicPolicy(spec, facts, axes) {
+  const baseUrl = spec.baseUrl;
+  const official = isOfficialAnthropicApiUrl(baseUrl);
+  const isCopilot = modelMatchesHost(spec, "githubCopilot");
+  const isZenmux = modelMatchesHost(spec, "zenmux");
+  const requiresThinkingEnabled = modelMatchesHost(spec, "moonshotNative") && facts.kimiMandatoryThinking;
+  const isAzure = isAzureAnthropicRoute(baseUrl);
+  const signingEndpoint = official || isCopilot || isZenmux || isAnthropicSigningProxyUrl(baseUrl);
+  const compat = {
+    officialEndpoint: official,
+    signingEndpoint,
+    supportsContextManagement: true,
+    supportsServerCompaction: false,
+    firstPartyProvider: false,
+    supportsOutputEffort: true,
+    disableStrictTools: isAzure,
+    disableAdaptiveThinking: false,
+    allowAnthropicHeaderOverrides: false,
+    supportsEagerToolInputStreaming: official,
+    supportsLongCacheRetention: official,
+    supportsMidConversationSystem: official && !facts.family("sonnet") && facts.anthropicAdaptiveGenAtLeast("4.8"),
+    supportsTurnScopedSystem: false,
+    supportsMidConversationToolChanges: false,
+    supportsPerMessageEffort: false,
+    supportsThinkingBindingControls: false,
+    supportsForcedToolChoice: !requiresThinkingEnabled && !facts.family("fable", "mythos"),
+    supportsSamplingParams: !facts.anthropicAdaptiveGenAtLeast("4.7"),
+    requiresToolResultId: false,
+    requiresThinkingEnabled,
+    replayUnsignedThinking: !signingEndpoint && (Boolean(spec.reasoning) || modelMatchesHost(spec, "deepseekFamily")),
+    escapeBuiltinToolNames: false,
+    injectClaudeCodeInstruction: true,
+    stripImageInput: false,
+    thinkingLoopGuard: undefined,
+    streamIdleTimeoutMs: spec.compat?.streamIdleTimeoutMs
+  };
+  applyWireAxes(compat, axes.wire, "anthropic-messages");
+  applyCompatOverrides(compat, spec.compat);
+  return compat;
+}
+var BEDROCK_REASONING_STREAM_IDLE_TIMEOUT_MS = 600000;
+function resolveBedrockPolicy(spec, axes) {
+  const compat = {
+    promptCacheMode: "none",
+    supportsLongPromptCacheRetention: false,
+    promptCacheMinimumTokens: 0,
+    promptCacheMaximumCheckpoints: 0
+  };
+  compat.streamIdleTimeoutMs = spec.reasoning ? BEDROCK_REASONING_STREAM_IDLE_TIMEOUT_MS : undefined;
+  applyWireAxes(compat, axes.wire, "bedrock-converse-stream");
+  applyCompatOverrides(compat, spec.compat);
+  return compat;
+}
+function resolveDevinPolicy(spec, axes) {
+  const compat = {
+    trustExplicitThinkingOnly: true,
+    modelRouter: false,
+    supportsParallelToolCalls: false
+  };
+  applyWireAxes(compat, axes.wire, "devin-agent");
+  applyCompatOverrides(compat, spec.compat);
+  return compat;
+}
+function resolveGooglePolicy(spec, axes) {
+  const compat = {
+    supportsFunctionPartId: false,
+    requiresSkipThoughtSignature: false,
+    requiresSkipThoughtSignatureOnFirstFunctionCall: false,
+    dropUnsignedThinking: false,
+    ccaLegacyParametersSchema: false,
+    multimodalFunctionResponse: false,
+    flashStreamLeakWorkaround: false,
+    claudeThinkingBetaHeader: false,
+    antigravityClaudeToolMode: false,
+    stripImageInput: false
+  };
+  applyWireAxes(compat, axes.wire, spec.api);
+  applyCompatOverrides(compat, spec.compat);
+  return compat;
+}
+var DEFAULT_REASONING_EFFORTS = ["minimal" /* Minimal */, "low" /* Low */, "medium" /* Medium */, "high" /* High */];
+var DEFAULT_REASONING_EFFORTS_WITH_XHIGH = [...DEFAULT_REASONING_EFFORTS, "xhigh" /* XHigh */];
+function omitsWireReasoningEffort(api, compat) {
+  if (api !== "openai-responses" && api !== "openai-codex-responses" && api !== "azure-openai-responses") {
+    return false;
+  }
+  return compat !== undefined && "supportsReasoningEffort" in compat && compat.supportsReasoningEffort === false;
+}
+function readCompatEffortMap(compat) {
+  if (compat === undefined || !("reasoningEffortMap" in compat))
+    return;
+  const map = compat.reasoningEffortMap;
+  return map && Object.keys(map).length > 0 ? map : undefined;
+}
+var FIREWORKS_THINKING_EFFORT_MAP = {
+  ["minimal" /* Minimal */]: "none"
+};
+function defaultThinkingMode(spec, facts) {
+  switch (spec.api) {
+    case "google-generative-ai":
+    case "google-gemini-cli":
+    case "google-vertex":
+      return facts.is("gemini") && facts.revMajor() === 3 ? "google-level" : "budget";
+    case "anthropic-messages":
+      if (facts.is("minimax") && facts.family("m2", "m3"))
+        return "anthropic-adaptive";
+      if (facts.is("glm") && facts.revGte("5.2") && (spec.provider === "umans" || spec.provider === "zai")) {
+        return "anthropic-budget-effort";
+      }
+      if (facts.is("anthropic")) {
+        if (facts.revGte("4.6") && !facts.family("haiku"))
+          return "anthropic-adaptive";
+        if (facts.family("opus") && facts.revGte("4.5"))
+          return "anthropic-budget-effort";
+      }
+      return "budget";
+    case "bedrock-converse-stream":
+      if (facts.is("anthropic")) {
+        if (facts.anthropicAdaptiveGenAtLeast("4.6"))
+          return "anthropic-adaptive";
+        if (facts.family("opus") && facts.revGte("4.5"))
+          return "anthropic-budget-effort";
+      }
+      if (facts.is("openai"))
+        return "effort";
+      return "budget";
+    default:
+      return "effort";
+  }
+}
+function fallbackEfforts(spec, compat) {
+  if (spec.api === "anthropic-messages")
+    return DEFAULT_REASONING_EFFORTS_WITH_XHIGH;
+  if (spec.api === "bedrock-converse-stream")
+    return DEFAULT_REASONING_EFFORTS;
+  if ((spec.api === "openai-completions" || spec.api === "openrouter") && compat !== undefined && "thinkingFormat" in compat) {
+    if (compat.thinkingFormat === "openai" && compat.supportsReasoningEffort) {
+      return DEFAULT_REASONING_EFFORTS_WITH_XHIGH;
+    }
+    return DEFAULT_REASONING_EFFORTS;
+  }
+  if (spec.api === "openai-responses" || spec.api === "openai-codex-responses" || spec.api === "azure-openai-responses") {
+    return DEFAULT_REASONING_EFFORTS_WITH_XHIGH;
+  }
+  return DEFAULT_REASONING_EFFORTS;
+}
+function filterEffortMap(map, efforts) {
+  let filtered;
+  for (const effort of efforts) {
+    const mapped = map[effort];
+    if (mapped === undefined)
+      continue;
+    filtered ??= {};
+    filtered[effort] = mapped;
+  }
+  return filtered;
+}
+function readRuleThinking(axes) {
+  const raw = axes.thinking;
+  const out = {};
+  const mode = thinkingMode(raw.mode);
+  if (mode !== undefined)
+    out.mode = mode;
+  const efforts = effortList(raw.efforts);
+  if (efforts !== undefined)
+    out.efforts = efforts;
+  const defaultLevel = effortValue(raw.defaultLevel);
+  if (defaultLevel !== undefined)
+    out.defaultLevel = defaultLevel;
+  const effortMap = effortRecord(raw.effortMap);
+  if (effortMap !== undefined)
+    out.effortMap = effortMap;
+  const effortBudgets = effortNumberRecord(raw.effortBudgets);
+  if (effortBudgets !== undefined)
+    out.effortBudgets = effortBudgets;
+  if (typeof raw.requiresEffort === "boolean")
+    out.requiresEffort = raw.requiresEffort;
+  if (typeof raw.suppressWhenOff === "boolean")
+    out.suppressWhenOff = raw.suppressWhenOff;
+  if (typeof raw.supportsDisplay === "boolean")
+    out.supportsDisplay = raw.supportsDisplay;
+  if (typeof raw.prefixBinding === "boolean")
+    out.prefixBinding = raw.prefixBinding;
+  if (typeof raw.upgradeNeutral === "boolean")
+    out.upgradeNeutral = raw.upgradeNeutral;
+  return out;
+}
+function impliesMandatoryReasoning(facts, modelId) {
+  if (facts.identity.thinkingVariant)
+    return true;
+  if (stripThinkingVariantSuffix(modelId) !== undefined)
+    return true;
+  return false;
+}
+function isQwenTemplateReasoningEffortCompat(compat) {
+  return compat !== undefined && "qwenTemplateReasoningEffort" in compat && compat.qwenTemplateReasoningEffort === true;
+}
+function resolveThinkingPolicy(spec, facts, axes, compat) {
+  const rule = readRuleThinking(axes);
+  const explicitThinking = spec.thinking !== undefined && Array.isArray(spec.thinking.efforts) && spec.thinking.efforts.length > 0 ? spec.thinking : undefined;
+  if (!spec.reasoning && (explicitThinking !== undefined || rule.upgradeNeutral !== true))
+    return;
+  if (spec.provider === "cline-pass" && compat !== undefined && "supportsReasoningEffort" in compat && compat.supportsReasoningEffort === false) {
+    return;
+  }
+  if (omitsWireReasoningEffort(spec.api, compat))
+    return;
+  if (explicitThinking !== undefined) {
+    return fillExplicitThinking(spec, facts, compat, explicitThinking, rule);
+  }
+  if (compat !== undefined && "trustExplicitThinkingOnly" in compat && compat.trustExplicitThinkingOnly === true) {
+    return;
+  }
+  const config = {
+    mode: rule.mode ?? defaultThinkingMode(spec, facts),
+    efforts: rule.efforts ?? fallbackEfforts(spec, compat)
+  };
+  if (config.efforts.length === 0) {
+    throw new Error(`Model ${spec.provider}/${spec.id} resolved to an empty thinking range`);
+  }
+  if (rule.defaultLevel !== undefined)
+    config.defaultLevel = rule.defaultLevel;
+  const effortMap = mergeEffortMap(spec, rule.effortMap, compat, config.efforts);
+  if (effortMap !== undefined)
+    config.effortMap = effortMap;
+  if (rule.effortBudgets !== undefined)
+    config.effortBudgets = rule.effortBudgets;
+  const supportsDisplay = rule.supportsDisplay ?? defaultSupportsDisplay(spec, facts);
+  if (supportsDisplay)
+    config.supportsDisplay = true;
+  if (rule.prefixBinding)
+    config.prefixBinding = true;
+  const requiresEffort = rule.requiresEffort ?? (impliesMandatoryReasoning(facts, spec.id) || isQwenTemplateReasoningEffortCompat(compat));
+  if (requiresEffort)
+    config.requiresEffort = true;
+  if (rule.suppressWhenOff)
+    config.suppressWhenOff = true;
+  return config;
+}
+function defaultSupportsDisplay(spec, facts) {
+  return (spec.api === "anthropic-messages" || spec.api === "bedrock-converse-stream") && facts.anthropicAdaptiveGenAtLeast("4.7");
+}
+function mergeEffortMap(spec, ruleMap, compat, efforts) {
+  const detected = (spec.api === "openai-completions" || spec.api === "openrouter") && modelMatchesHost({ provider: spec.provider, baseUrl: spec.baseUrl ?? "" }, "fireworks") ? FIREWORKS_THINKING_EFFORT_MAP : undefined;
+  const configured = readCompatEffortMap(compat);
+  if (detected === undefined && ruleMap === undefined && configured === undefined)
+    return;
+  return filterEffortMap({ ...detected, ...ruleMap, ...configured }, efforts);
+}
+function fillExplicitThinking(spec, facts, compat, thinking, rule) {
+  const effortMap = thinking.effortMap === undefined ? mergeEffortMap(spec, rule.effortMap, compat, thinking.efforts) : undefined;
+  const needsDisplay = thinking.supportsDisplay === undefined && (rule.supportsDisplay ?? defaultSupportsDisplay(spec, facts));
+  const needsRequiresEffort = thinking.requiresEffort === undefined && (rule.requiresEffort ?? (impliesMandatoryReasoning(facts, spec.id) || isQwenTemplateReasoningEffortCompat(compat)));
+  const needsDefaultLevel = thinking.defaultLevel === undefined && rule.defaultLevel !== undefined;
+  const needsPrefixBinding = thinking.prefixBinding === undefined && rule.prefixBinding === true;
+  if (effortMap === undefined && !needsDisplay && !needsRequiresEffort && !needsDefaultLevel && !needsPrefixBinding) {
+    return thinking;
+  }
+  const filled = { ...thinking };
+  if (effortMap !== undefined)
+    filled.effortMap = effortMap;
+  if (needsDisplay)
+    filled.supportsDisplay = true;
+  if (needsDefaultLevel && rule.defaultLevel !== undefined)
+    filled.defaultLevel = rule.defaultLevel;
+  if (needsRequiresEffort)
+    filled.requiresEffort = true;
+  if (needsPrefixBinding)
+    filled.prefixBinding = true;
+  return filled;
+}
+function buildResolveTarget(spec, identity) {
+  const target = {
+    provider: spec.provider,
+    api: spec.api,
+    class: identity.class,
+    model: spec.id,
+    reasoning: Boolean(spec.reasoning)
+  };
+  if (identity.family !== undefined)
+    target.family = identity.family;
+  if (identity.revision !== undefined)
+    target.revision = identity.revision;
+  return target;
+}
+function specUsesApi(spec, api) {
+  return spec.api === api;
+}
+function resolveModelPolicy(spec) {
+  const identity = resolveIdentity(spec);
+  const facts = new IdentityFacts(identity);
+  const axes = resolveCascade(buildResolveTarget(spec, identity));
+  let compat;
+  if (specUsesApi(spec, "openrouter")) {
+    const chat = resolveOpenAICompletionsPolicy(spec, facts, axes);
+    const responses = resolveOpenAIResponsesPolicy(spec, facts, axes, "openrouter");
+    compat = { ...chat, ...pickResponsesOnly(responses) };
+  } else if (specUsesApi(spec, "openai-completions")) {
+    compat = resolveOpenAICompletionsPolicy(spec, facts, axes);
+  } else if (specUsesApi(spec, "openai-responses") || specUsesApi(spec, "azure-openai-responses") || specUsesApi(spec, "openai-codex-responses")) {
+    compat = resolveOpenAIResponsesPolicy(spec, facts, axes, spec.api);
+  } else if (specUsesApi(spec, "anthropic-messages")) {
+    compat = resolveAnthropicPolicy(spec, facts, axes);
+  } else if (specUsesApi(spec, "bedrock-converse-stream")) {
+    compat = resolveBedrockPolicy(spec, axes);
+  } else if (specUsesApi(spec, "devin-agent")) {
+    compat = resolveDevinPolicy(spec, axes);
+  } else if (specUsesApi(spec, "google-generative-ai") || specUsesApi(spec, "google-vertex") || specUsesApi(spec, "google-gemini-cli")) {
+    compat = resolveGooglePolicy(spec, axes);
+  } else {
+    compat = undefined;
+  }
+  return {
+    identity,
+    compat,
+    thinking: resolveThinkingPolicy(spec, facts, axes, compat),
+    catalog: axes.catalog
+  };
+}
+
+// work/omp-personal-router/node_modules/@oh-my-pi/pi-catalog/src/identity/id.ts
+var bareModelIdCache = new Map;
+function bareModelId(modelId) {
+  const cached = bareModelIdCache.get(modelId);
+  if (cached !== undefined)
+    return cached;
+  const separator = modelId.lastIndexOf("/");
+  const result = separator === -1 ? modelId : modelId.slice(separator + 1);
+  bareModelIdCache.set(modelId, result);
+  return result;
+}
+
+// work/omp-personal-router/node_modules/@oh-my-pi/pi-catalog/src/model-tokenizer.ts
+var MAX_TOKENIZER_CACHE_ENTRIES = 2048;
+var modelTokenizerCache = new Map;
+function revisionAtLeast(revision, floor) {
+  if (revision === undefined)
+    return false;
+  const parsedRevision = parseRevision(revision);
+  const parsedFloor = parseRevision(floor);
+  return parsedRevision !== undefined && parsedFloor !== undefined && compareRevision(parsedRevision, parsedFloor) >= 0;
+}
+function claudeTokenizer(identity) {
+  if (identity.class !== "anthropic")
+    return;
+  if (identity.family === "opus") {
+    if (revisionAtLeast(identity.revision, "5"))
+      return "claude-v5";
+    if (revisionAtLeast(identity.revision, "4.7"))
+      return "claude-v47";
+    return "claude-v3";
+  }
+  if (identity.family === "sonnet" || identity.family === "fable" || identity.family === "mythos") {
+    return revisionAtLeast(identity.revision, "5") ? "claude-v5-sonnet" : "claude-v3";
+  }
+  return "claude-v3";
+}
+function qwenTokenizer(identity) {
+  return identity.class === "qwen" && revisionAtLeast(identity.revision, "3.5") ? "qwen3" : undefined;
+}
+function deepSeekTokenizer(identity) {
+  return identity.class === "deepseek" ? "deepseek-v3" : undefined;
+}
+function kimiTokenizer(identity) {
+  return identity.class === "kimi" ? "kimi-k2" : undefined;
+}
+function glmTokenizer(identity) {
+  return identity.class === "glm" && revisionAtLeast(identity.revision, "5") ? "glm5" : undefined;
+}
+function resolveModelTokenizer(modelId) {
+  const cached = modelTokenizerCache.get(modelId);
+  if (cached !== undefined)
+    return cached ?? undefined;
+  const identity = classifyModel("", bareModelId(modelId), { lenient: true });
+  const tokenizer = claudeTokenizer(identity) ?? qwenTokenizer(identity) ?? deepSeekTokenizer(identity) ?? kimiTokenizer(identity) ?? glmTokenizer(identity);
+  if (modelTokenizerCache.size === MAX_TOKENIZER_CACHE_ENTRIES)
+    modelTokenizerCache.clear();
+  modelTokenizerCache.set(modelId, tokenizer ?? null);
+  return tokenizer;
+}
+
+// work/omp-personal-router/node_modules/@oh-my-pi/pi-catalog/src/utils.ts
+import { wrapFetchForExtraCa } from "@oh-my-pi/pi-utils";
+import { isRecord } from "@oh-my-pi/pi-utils";
+var AUTHOR_PREFIX = /^[A-Za-z][A-Za-z0-9 .+&'-]{0,23}: /;
+var NOISE_TAGS = /\s*\((?:latest|Antigravity|\$+|>?\d+% off|retires [^)]*)\)/g;
+function cleanModelName(name) {
+  const cleaned = name.replace(AUTHOR_PREFIX, "").replace(NOISE_TAGS, "").replace(/ {2,}/g, " ").trim();
+  return cleaned.length > 0 ? cleaned : name;
+}
+
+// work/omp-personal-router/node_modules/@oh-my-pi/pi-catalog/src/pricing.ts
+function nonnegative(value) {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0;
+}
+function isRates(value) {
+  return isRecord(value) && nonnegative(value.input) && nonnegative(value.output) && nonnegative(value.cacheRead) && nonnegative(value.cacheWrite);
+}
+function isLongContext(value) {
+  return isRecord(value) && isRates(value) && typeof value.inputThreshold === "number" && Number.isFinite(value.inputThreshold) && value.inputThreshold > 0 && (value.inputThresholdInclusive === undefined || typeof value.inputThresholdInclusive === "boolean");
+}
+function isPeakWindow(value) {
+  return isRecord(value) && Array.isArray(value.weekdays) && value.weekdays.length > 0 && value.weekdays.every((day) => Number.isInteger(day) && day >= 0 && day <= 6) && new Set(value.weekdays).size === value.weekdays.length && typeof value.startMinute === "number" && Number.isInteger(value.startMinute) && typeof value.endMinute === "number" && Number.isInteger(value.endMinute) && value.startMinute >= 0 && value.endMinute <= 1440 && value.startMinute < value.endMinute;
+}
+function isEffectiveRate(value) {
+  return isRecord(value) && isRates(value) && typeof value.effectiveFrom === "number" && Number.isSafeInteger(value.effectiveFrom) && Math.abs(value.effectiveFrom) <= 8640000000000000 && (value.longContext === undefined || isLongContext(value.longContext));
+}
+function isTimeBasedCost(value) {
+  if (!isRecord(value) || !nonnegative(value.offPeakMultiplier) || !Array.isArray(value.peakWindows) || !value.peakWindows.every(isPeakWindow)) {
+    return false;
+  }
+  if (value.effectiveRates === undefined)
+    return true;
+  if (!Array.isArray(value.effectiveRates) || !value.effectiveRates.every(isEffectiveRate))
+    return false;
+  const dates = new Set;
+  for (const rate of value.effectiveRates) {
+    if (dates.has(rate.effectiveFrom))
+      return false;
+    dates.add(rate.effectiveFrom);
+  }
+  return true;
+}
+function payload(value, keys, field) {
+  if (!isRecord(value) || Object.keys(value).some((key) => !keys.includes(key))) {
+    throw new Error(`Invalid time-based-cost ${field}`);
+  }
+  return value;
+}
+function namedEntries(value, field) {
+  if (!isRecord(value))
+    throw new Error(`Invalid time-based-cost ${field}: expected named objects`);
+  return Object.values(value);
+}
+function materializeTimeBasedCost(value) {
+  const source = payload(value, ["offPeakMultiplier", "peakWindows", "effectiveRates"], "schedule");
+  const peakWindows = namedEntries(source.peakWindows, "peak-windows").map((entry) => {
+    const window = payload(entry, ["weekdays", "startMinute", "endMinute"], "peak-window");
+    if (typeof window.weekdays !== "string" || !/^[0-6](,[0-6])*$/.test(window.weekdays)) {
+      throw new Error("Invalid time-based-cost weekdays: expected comma-separated UTC weekday numbers");
+    }
+    return { ...window, weekdays: window.weekdays.split(",").map(Number) };
+  });
+  const effectiveRates = source.effectiveRates === undefined ? undefined : namedEntries(source.effectiveRates, "effective-rates").map((entry) => {
+    const rate = payload(entry, ["effectiveFrom", "input", "output", "cacheRead", "cacheWrite", "longContext"], "effective-rate");
+    const date = rate.effectiveFrom;
+    if (typeof date !== "string" || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{3})?Z$/.test(date)) {
+      throw new Error("Invalid time-based-cost effective-from: expected an ISO UTC timestamp");
+    }
+    const effectiveFrom = Date.parse(date);
+    if (!Number.isFinite(effectiveFrom) || new Date(effectiveFrom).toISOString() !== (date.includes(".") ? date : date.replace("Z", ".000Z"))) {
+      throw new Error("Invalid time-based-cost effective-from: invalid UTC date");
+    }
+    if (rate.longContext !== undefined) {
+      payload(rate.longContext, ["inputThreshold", "inputThresholdInclusive", "input", "output", "cacheRead", "cacheWrite"], "long-context");
+    }
+    return { ...rate, effectiveFrom };
+  });
+  const schedule = {
+    offPeakMultiplier: source.offPeakMultiplier,
+    peakWindows,
+    ...effectiveRates && { effectiveRates }
+  };
+  if (!isTimeBasedCost(schedule))
+    throw new Error("Invalid time-based-cost schedule: invalid windows, rates, or multiplier");
+  return schedule;
+}
+
+// work/omp-personal-router/node_modules/@oh-my-pi/pi-catalog/src/build.ts
+function numberField(source, key) {
+  const value = Reflect.get(source, key);
+  return typeof value === "number" ? value : undefined;
+}
+function objectPayload2(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value) ? value : undefined;
+}
+function isInputModalities(value) {
+  return Array.isArray(value) && value.every((entry) => entry === "text" || entry === "image");
+}
+function applyCatalogAssignments(model, catalog) {
+  const serviceTierCost = objectPayload2(catalog.serviceTierCost);
+  if (serviceTierCost !== undefined) {
+    const flex = numberField(serviceTierCost, "flex");
+    const priorityTier = numberField(serviceTierCost, "priority");
+    model.serviceTierCost = {
+      ...flex !== undefined && { flex },
+      ...priorityTier !== undefined && { priority: priorityTier }
+    };
+  }
+  const priority = catalog.priority;
+  if (typeof priority === "number")
+    model.priority = priority;
+  const applyPatchToolType = catalog.applyPatchToolType;
+  if (applyPatchToolType === "freeform" || applyPatchToolType === "function") {
+    model.applyPatchToolType = applyPatchToolType;
+  }
+  const editPromptVariant = catalog.editPromptVariant;
+  if (editPromptVariant === "full" || editPromptVariant === "compact") {
+    model.editPromptVariant = editPromptVariant;
+  }
+  const requiresCursorToolSchemaProjection = catalog.requiresCursorToolSchemaProjection;
+  if (requiresCursorToolSchemaProjection === true) {
+    model.requiresCursorToolSchemaProjection = true;
+  } else {
+    delete model.requiresCursorToolSchemaProjection;
+  }
+  const requiresToolResultImageHoisting = catalog.requiresToolResultImageHoisting;
+  if (requiresToolResultImageHoisting === true) {
+    model.requiresToolResultImageHoisting = true;
+  } else {
+    delete model.requiresToolResultImageHoisting;
+  }
+  const contextPromotionTarget = catalog.contextPromotionTarget;
+  if (typeof contextPromotionTarget === "string" && model.contextPromotionTarget === undefined) {
+    model.contextPromotionTarget = contextPromotionTarget;
+  }
+}
+function applyCatalogCorrections(model, catalog) {
+  const longContext = objectPayload2(catalog.longContext);
+  if (longContext !== undefined) {
+    const inputThreshold = numberField(longContext, "inputThreshold");
+    const inclusive = Reflect.get(longContext, "inputThresholdInclusive") === true;
+    const multiplier = numberField(longContext, "multiplier");
+    const input = numberField(longContext, "input");
+    const output = numberField(longContext, "output");
+    const cacheRead = numberField(longContext, "cacheRead");
+    const cacheWrite = numberField(longContext, "cacheWrite");
+    const base = model.cost;
+    const hasTokenPrice = base.input !== 0 || base.output !== 0 || base.cacheRead !== 0 || base.cacheWrite !== 0;
+    if (inputThreshold !== undefined && multiplier !== undefined && hasTokenPrice) {
+      model.cost = {
+        ...base,
+        longContext: {
+          inputThreshold,
+          ...inclusive && { inputThresholdInclusive: true },
+          input: base.input * multiplier,
+          output: base.output * multiplier,
+          cacheRead: base.cacheRead * multiplier,
+          cacheWrite: base.cacheWrite * multiplier
+        }
+      };
+    } else if (inputThreshold !== undefined && input !== undefined && output !== undefined && cacheRead !== undefined && cacheWrite !== undefined) {
+      model.cost = { ...model.cost, longContext: { inputThreshold, input, output, cacheRead, cacheWrite } };
+    }
+  }
+  const patch = objectPayload2(catalog.costPatch);
+  if (patch !== undefined) {
+    model.cost = { ...model.cost };
+    const input = numberField(patch, "input");
+    if (input !== undefined)
+      model.cost.input = input;
+    const output = numberField(patch, "output");
+    if (output !== undefined)
+      model.cost.output = output;
+    const cacheRead = numberField(patch, "cacheRead");
+    if (cacheRead !== undefined)
+      model.cost.cacheRead = cacheRead;
+    const cacheWrite = numberField(patch, "cacheWrite");
+    if (cacheWrite !== undefined)
+      model.cost.cacheWrite = cacheWrite;
+  }
+  if (catalog.timeBased !== undefined) {
+    model.cost = { ...model.cost, timeBased: materializeTimeBasedCost(catalog.timeBased) };
+  }
+  const limitsPatch = objectPayload2(catalog.limitsPatch);
+  if (limitsPatch !== undefined) {
+    const contextWindow = numberField(limitsPatch, "contextWindow");
+    if (contextWindow !== undefined)
+      model.contextWindow = contextWindow;
+    const maxTokens = numberField(limitsPatch, "maxTokens");
+    if (maxTokens !== undefined)
+      model.maxTokens = maxTokens;
+  }
+  const contextWindowFloor = catalog.contextWindowFloor;
+  if (typeof contextWindowFloor === "number") {
+    model.contextWindow = Math.max(model.contextWindow ?? 0, contextWindowFloor);
+  }
+  const inputModalities = catalog.inputModalities;
+  if (isInputModalities(inputModalities)) {
+    model.input = inputModalities;
+  }
+}
+function isDirectOpenAIResponsesEndpoint(spec) {
+  if (spec.api === "openai-responses") {
+    if (spec.provider !== "openai")
+      return false;
+    if (!spec.baseUrl)
+      return true;
+    try {
+      const url = new URL(spec.baseUrl);
+      return url.protocol === "https:" && url.hostname === "api.openai.com";
+    } catch {
+      return false;
+    }
+  }
+  if (spec.api !== "azure-openai-responses" || spec.provider !== "azure" && spec.provider !== "azure-openai") {
+    return false;
+  }
+  if (!spec.baseUrl)
+    return true;
+  try {
+    const url = new URL(spec.baseUrl);
+    return url.protocol === "https:" && (url.hostname.endsWith(".openai.azure.com") || url.hostname === "models.inference.ai.azure.com");
+  } catch {
+    return false;
+  }
+}
+function explicitComputerUseConfig(spec) {
+  if (!("supportsComputerUseConfig" in spec))
+    return spec.supportsComputerUse;
+  const value = Reflect.get(spec, "supportsComputerUseConfig");
+  return typeof value === "boolean" ? value : undefined;
+}
+function revisionAtLeast2(identity, major, minor) {
+  if (identity.revision === undefined)
+    return false;
+  const [revMajor = 0, revMinor = 0] = identity.revision.split(".").map(Number);
+  return revMajor > major || revMajor === major && revMinor >= minor;
+}
+function supportsOpenAIGAComputerUse(spec, identity, explicitSupport) {
+  if (explicitSupport !== undefined)
+    return explicitSupport;
+  if (!isDirectOpenAIResponsesEndpoint(spec))
+    return false;
+  const wireIdentity = spec.requestModelId === undefined ? identity : resolveModelPolicy({ ...spec, id: spec.requestModelId }).identity;
+  return wireIdentity.class === "openai" && revisionAtLeast2(wireIdentity, 5, 4);
+}
+function buildModel(spec) {
+  const policy = resolveModelPolicy(spec);
+  const supportsComputerUseConfig = explicitComputerUseConfig(spec);
+  const model = {
+    ...spec,
+    reasoning: spec.reasoning || policy.thinking !== undefined,
+    name: cleanModelName(spec.name),
+    identity: policy.identity,
+    requiresGlyphTokenization: policy.identity.class === "anthropic",
+    tokenizer: spec.tokenizer ?? resolveModelTokenizer(spec.requestModelId ?? spec.id),
+    thinking: policy.thinking,
+    supportsComputerUse: supportsOpenAIGAComputerUse(spec, policy.identity, supportsComputerUseConfig),
+    supportsComputerUseConfig,
+    compat: policy.compat,
+    compatConfig: spec.compat
+  };
+  applyCatalogAssignments(model, policy.catalog);
+  applyCatalogCorrections(model, policy.catalog);
+  return model;
+}
+
+// work/omp-personal-router/ninerouter.ts
+var NINEROUTER_PROVIDER = "9router";
+var NINEROUTER_API = "personal-nine-router";
+var NINEROUTER_BASE_URL = "https://llm.thalys.cloud/v1";
+var NINEROUTER_ORIGIN = "https://llm.thalys.cloud";
+var NINEROUTER_MAX_OUTPUT_TOKENS = 32768;
+var DEFAULT_CONTEXT_WINDOW = 128000;
+var SUBSCRIBED_PREFIXES = new Set(["cc", "cx", "ocg", "glm"]);
+var PAYG_PREFIXES = new Set(["ds", "openrouter", "or"]);
+var CANONICAL_PROVIDERS = {
+  cc: "anthropic",
+  cx: "openai-codex",
+  ocg: "opencode-go",
+  glm: "zai-coding-plan"
+};
+var NATIVE_APIS = {
+  cc: "anthropic-messages",
+  cx: "openai-responses"
+};
+// Per-model overrides win over the prefix default: opencode-go serves union-alpha
+// only on the Anthropic Messages shape; /v1/chat/completions answers 500 for it.
+var NATIVE_MODEL_APIS = {
+  "ocg/union-alpha": "anthropic-messages"
+};
+var NATIVE_PATHS = {
+  "anthropic-messages": "/v1/messages",
+  "openai-responses": "/v1/responses",
+  "openai-completions": "/v1/chat/completions"
+};
+function safeCatalogId(value) {
+  return typeof value === "string" && value.length > 0 && value.length <= 512 && !/[\u0000-\u001f\u007f\s?#]/.test(value);
+}
+function parseModelId(value) {
+  if (!safeCatalogId(value))
+    return;
+  const slash = value.indexOf("/");
+  if (slash <= 0 || slash === value.length - 1)
+    return;
+  const prefix = value.slice(0, slash);
+  const rest = value.slice(slash + 1);
+  if (!/^[A-Za-z0-9_-]+$/.test(prefix))
+    return;
+  if (rest.split("/").some((part) => part.length === 0 || part === "." || part === ".."))
+    return;
+  return { id: value, prefix, rest };
+}
+function canonicalForParsed(parsed) {
+  const provider = CANONICAL_PROVIDERS[parsed.prefix];
+  return provider ? `${provider}/${parsed.rest}` : undefined;
+}
+function canonicalNineRouterRef(value) {
+  if (typeof value !== "string")
+    return;
+  const id = value.startsWith(`${NINEROUTER_PROVIDER}/`) ? value.slice(NINEROUTER_PROVIDER.length + 1) : value;
+  const parsed = parseModelId(id);
+  return parsed ? canonicalForParsed(parsed) : undefined;
+}
+var canonicalRef = canonicalNineRouterRef;
+function finitePositiveInteger(value, fallback, maximum) {
+  if (!Number.isSafeInteger(value) || value <= 0)
+    return fallback;
+  return maximum ? Math.min(value, maximum) : value;
+}
+function capability(capabilities, key) {
+  return capabilities && typeof capabilities === "object" && capabilities[key] === true ? true : false;
+}
+function classify(parsed) {
+  if (!parsed) {
+    return { canonicalRef: undefined, subscribed: false, allowed: false, payg: false, reason: "invalid-model" };
+  }
+  const subscribed = SUBSCRIBED_PREFIXES.has(parsed.prefix);
+  const payg = PAYG_PREFIXES.has(parsed.prefix);
+  const canonicalRef2 = canonicalForParsed(parsed);
+  if (subscribed)
+    return { canonicalRef: canonicalRef2, subscribed: true, allowed: true, payg: false };
+  if (payg)
+    return { canonicalRef: undefined, subscribed: false, allowed: false, payg: true, reason: "payg-prefix" };
+  return { canonicalRef: undefined, subscribed: false, allowed: false, payg: false, reason: "unknown-prefix" };
+}
+function readJson(path) {
+  try {
+    return JSON.parse(readFileSync(path, "utf8"));
+  } catch {
+    return;
+  }
+}
+function readGatewayKey(path) {
+  try {
+    if (lstatSync(path).isSymbolicLink())
+      return;
+    const mode = statSync(path).mode & 511;
+    if ((mode & 63) !== 0)
+      return;
+    const key = readFileSync(path, "utf8").trim();
+    if (!key || /[\r\n]/.test(key))
+      return;
+    return key;
+  } catch {
+    return;
+  }
+}
+function modelRecords(catalog) {
+  const rows = catalog?.models;
+  if (!Array.isArray(rows))
+    return [];
+  const seen = new Set;
+  const result = [];
+  rows.forEach((row, rawIndex) => {
+    if (!safeCatalogId(row?.id) || seen.has(row.id))
+      return;
+    seen.add(row.id);
+    const parsed = parseModelId(row.id) ?? { id: row.id, prefix: "", rest: "" };
+    const cls = classify(parsed);
+    const capabilities = row?.capabilities;
+    const supportsImages = capability(capabilities, "vision");
+    const supportsTools = capability(capabilities, "tools");
+    const reasoning = capability(capabilities, "reasoning");
+    const name = typeof row?.name === "string" && row.name.trim() ? row.name : parsed.id;
+    result.push({
+      ...parsed,
+      ...cls,
+      contextWindow: finitePositiveInteger(row?.context_length, DEFAULT_CONTEXT_WINDOW),
+      maxTokens: finitePositiveInteger(row?.max_completion_tokens, NINEROUTER_MAX_OUTPUT_TOKENS, NINEROUTER_MAX_OUTPUT_TOKENS),
+      supportsImages,
+      supportsTools,
+      reasoning,
+      name,
+      rawIndex,
+      ref: `${NINEROUTER_PROVIDER}/${parsed.id}`
+    });
+  });
+  return result;
+}
+function description(record) {
+  return {
+    ref: record.ref,
+    id: record.id,
+    canonicalRef: record.canonicalRef,
+    prefix: record.prefix,
+    provider: NINEROUTER_PROVIDER,
+    subscribed: record.subscribed,
+    allowed: record.allowed,
+    payg: record.payg,
+    quota: { observedAt: 0, state: "unknown", windows: [] },
+    contextWindow: record.contextWindow,
+    maxTokens: record.maxTokens,
+    supportsImages: record.supportsImages,
+    supportsTools: record.supportsTools,
+    reasoning: record.reasoning,
+    autoQualified: false,
+    reason: record.reason
+  };
+}
+function safeLog(log, event, data = {}) {
+  try {
+    log?.(event, data);
+  } catch {}
+}
+function refForInput(value, records) {
+  if (typeof value !== "string")
+    return;
+  const ref = value.startsWith(`${NINEROUTER_PROVIDER}/`) ? value : `${NINEROUTER_PROVIDER}/${value}`;
+  return records.get(ref);
+}
+function modelPayload(body) {
+  if (typeof body === "string") {
+    try {
+      const parsed = JSON.parse(body);
+      return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : undefined;
+    } catch {
+      return;
+    }
+  }
+  if (body instanceof Uint8Array) {
+    try {
+      const parsed = JSON.parse(new TextDecoder().decode(body));
+      return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : undefined;
+    } catch {
+      return;
+    }
+  }
+  return;
+}
+function inputUrl(input) {
+  if (typeof input === "string")
+    return input;
+  if (input instanceof URL)
+    return input.toString();
+  if (input && typeof input === "object" && typeof input.url === "string") {
+    return input.url;
+  }
+  return;
+}
+function expectedPath(url, api) {
+  try {
+    const parsed = new URL(url);
+    return parsed.protocol === "https:" && parsed.origin === NINEROUTER_ORIGIN && parsed.pathname === NATIVE_PATHS[api] && !parsed.search && !parsed.hash;
+  } catch {
+    return false;
+  }
+}
+function safeHeaders(input, key) {
+  const source = new Headers(input);
+  const headers = new Headers;
+  const allow = new Set([
+    "accept",
+    "anthropic-beta",
+    "anthropic-version",
+    "cache-control",
+    "content-type",
+    "user-agent"
+  ]);
+  source.forEach((value, name) => {
+    const lower = name.toLowerCase();
+    if (allow.has(lower))
+      headers.set(name, value);
+  });
+  headers.set("authorization", `Bearer ${key}`);
+  headers.set("x-api-key", key);
+  return headers;
+}
+function blocked(log, reason, model) {
+  safeLog(log, "ninerouter-blocked", { reason, ...model ? { model } : {} });
+  throw new Error(`9Router request blocked: ${reason}`);
+}
+function restoreClaudeToolNames(response, body) {
+  const names = new Set((Array.isArray(body.tools) ? body.tools : []).map((t) => t.name).filter((n) => typeof n === "string"));
+  if (!names.size || !response.body || !response.headers.get("content-type")?.includes("text/event-stream"))
+    return response;
+  const restore = (block) => {
+    if (block?.type !== "tool_use" || typeof block.name !== "string" || names.has(block.name) || !block.name.endsWith("_ide"))
+      return;
+    const original = block.name.slice(0, -4);
+    if (names.has(original))
+      block.name = original;
+  };
+  let pending = "";
+  const decoder = new TextDecoder;
+  const encoder = new TextEncoder;
+  const line = (value) => {
+    if (!value.startsWith("data:"))
+      return value;
+    try {
+      const event = JSON.parse(value.slice(5).trim());
+      restore(event.content_block);
+      if (Array.isArray(event.content))
+        event.content.forEach(restore);
+      return "data: " + JSON.stringify(event);
+    } catch {
+      return value;
+    }
+  };
+  const stream = response.body.pipeThrough(new TransformStream({
+    transform(chunk, controller) {
+      pending += decoder.decode(chunk, { stream: true });
+      let end;
+      while ((end = pending.indexOf(`
+`)) >= 0) {
+        controller.enqueue(encoder.encode(line(pending.slice(0, end)) + `
+`));
+        pending = pending.slice(end + 1);
+      }
+    },
+    flush(controller) {
+      pending += decoder.decode();
+      if (pending)
+        controller.enqueue(encoder.encode(line(pending)));
+    }
+  }));
+  const headers = new Headers(response.headers);
+  headers.delete("content-length");
+  headers.delete("content-encoding");
+  return new Response(stream, { status: response.status, statusText: response.statusText, headers });
+}
+function guardedFetch(key, api, modelId, maxTokens, delegate, log) {
+  return async (input, init) => {
+    const url = inputUrl(input);
+    if (!url || !expectedPath(url, api))
+      blocked(log, "origin-or-path", modelId);
+    const method = (init?.method ?? (input && typeof input === "object" && "method" in input ? input.method : "GET")).toUpperCase();
+    if (method !== "POST")
+      blocked(log, "method", modelId);
+    const body = modelPayload(init?.body);
+    if (!body || body.model !== modelId)
+      blocked(log, "model", modelId);
+    for (const field of ["models", "route", "provider", "providers", "fallback", "fallbacks"]) {
+      if (field in body)
+        blocked(log, "provider-routing", modelId);
+    }
+    let encodedBody;
+    const outputFields = ["max_tokens", "max_completion_tokens", "max_output_tokens"];
+    let outputLimit = maxTokens;
+    for (const field of outputFields) {
+      if (!(field in body))
+        continue;
+      const requested = body[field];
+      if (!Number.isSafeInteger(requested) || requested <= 0)
+        blocked(log, "invalid-output-limit", modelId);
+      outputLimit = Math.min(requested, outputLimit);
+    }
+    const limitField = api === "openai-responses" ? "max_output_tokens" : api === "openai-completions" && ("max_completion_tokens" in body) ? "max_completion_tokens" : "max_tokens";
+    for (const field of outputFields)
+      delete body[field];
+    body[limitField] = outputLimit;
+    if (typeof init?.body === "string")
+      encodedBody = JSON.stringify(body);
+    else if (init?.body instanceof Uint8Array)
+      encodedBody = new TextEncoder().encode(JSON.stringify(body));
+    const requestInit = {
+      ...init,
+      method: "POST",
+      redirect: "error",
+      headers: safeHeaders(init?.headers ?? (input && typeof input === "object" && "headers" in input ? input.headers : undefined), key),
+      ...encodedBody !== undefined ? { body: encodedBody } : {}
+    };
+    let response;
+    try {
+      response = await delegate(input, requestInit);
+    } catch (error) {
+      safeLog(log, "ninerouter-transport-error", { model: modelId, ...errorDetails(error, undefined, requestInit.signal ?? (input instanceof Request ? input.signal : undefined)) });
+      throw error;
+    }
+    if (response.redirected || response.status >= 300 && response.status < 400)
+      blocked(log, "redirect", modelId);
+    if (response.url && !expectedPath(response.url, api))
+      blocked(log, "redirect-origin-or-path", modelId);
+    return api === "anthropic-messages" ? restoreClaudeToolNames(response, body) : response;
+  };
+}
+function disabledController(log, reason) {
+  safeLog(log, "ninerouter-disabled", { reason });
+  return {
+    enabled: false,
+    provider: NINEROUTER_PROVIDER,
+    api: NINEROUTER_API,
+    baseUrl: NINEROUTER_BASE_URL,
+    models: [],
+    canonicalRef: canonicalNineRouterRef,
+    describe: () => {
+      return;
+    },
+    isAllowed: () => false,
+    dispose: () => {}
+  };
+}
+function installNineRouter(pi, options) {
+  const root = typeof options?.root === "string" && options.root.length > 0 ? options.root : undefined;
+  if (!root)
+    return disabledController(options?.log, "invalid-root");
+  const settings = readJson(join(root, "settings.json"));
+  if (settings?.gateway?.enabled !== true)
+    return disabledController(options.log, "gateway-disabled");
+  if (!pi || typeof pi.registerProvider !== "function")
+    return disabledController(options.log, "provider-registration-unavailable");
+  if (typeof options.nativeStreamSimple !== "function")
+    return disabledController(options.log, "native-transport-unavailable");
+  const catalog = readJson(join(root, "9router-catalog.json"));
+  const records = modelRecords(catalog);
+  if (!records.length)
+    return disabledController(options.log, "catalog-unavailable");
+  const key = readGatewayKey(join(root, "9router-key"));
+  if (!key)
+    return disabledController(options.log, "key-unavailable");
+  const byRef = new Map(records.map((record) => [record.ref, record]));
+  const models = records.map((record) => ({
+    id: record.id,
+    name: record.name,
+    api: NINEROUTER_API,
+    provider: NINEROUTER_PROVIDER,
+    gateway: true,
+    baseUrl: NINEROUTER_BASE_URL,
+    reasoning: record.reasoning,
+    input: record.supportsImages ? ["text", "image"] : ["text"],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: record.contextWindow,
+    maxTokens: record.maxTokens,
+    supportsImages: record.supportsImages,
+    supportsTools: record.supportsTools,
+    transport: undefined,
+    quota: { observedAt: 0, state: "unknown", windows: [] },
+    payg: record.payg,
+    canonicalRef: record.canonicalRef,
+    qualityTiers: record.prefix === "glm" ? [] : undefined,
+    autoQualified: false
+  }));
+  const streamSimple = (model, context, streamOptions = {}) => {
+    if (!model || model.provider !== NINEROUTER_PROVIDER || model.api !== NINEROUTER_API) {
+      return blocked(options.log, "model-registration", typeof model?.id === "string" ? model.id : undefined);
+    }
+    if (model.transport !== undefined)
+      return blocked(options.log, "native-transport", model.id);
+    const record = byRef.get(`${NINEROUTER_PROVIDER}/${model.id}`);
+    if (!record || !record.allowed)
+      return blocked(options.log, record?.reason ?? "model-not-allowlisted", model.id);
+    const nativeApi = NATIVE_MODEL_APIS[record.id] ?? NATIVE_APIS[record.prefix] ?? "openai-completions";
+    const nativeModel = buildModel({
+      ...model,
+      headers: undefined,
+      apiKey: undefined,
+      auth: undefined,
+      credentials: undefined,
+      token: undefined,
+      accessToken: undefined,
+      transport: undefined,
+      compat: undefined,
+      api: nativeApi,
+      baseUrl: NINEROUTER_BASE_URL
+    });
+    const delegate = typeof streamOptions?.fetch === "function" ? streamOptions.fetch : globalThis.fetch;
+    if (typeof delegate !== "function")
+      return blocked(options.log, "fetch-unavailable", model.id);
+    const sanitizedOptions = { ...streamOptions ?? {} };
+    delete sanitizedOptions.headers;
+    delete sanitizedOptions.fetch;
+    delete sanitizedOptions.authorization;
+    delete sanitizedOptions.credentials;
+    delete sanitizedOptions.auth;
+    delete sanitizedOptions.token;
+    delete sanitizedOptions.accessToken;
+    sanitizedOptions.apiKey = key;
+    sanitizedOptions.headers = undefined;
+    sanitizedOptions.fetch = guardedFetch(key, nativeApi, record.id, record.maxTokens, delegate, options.log);
+    sanitizedOptions.maxInFlightRequests = {};
+    return options.nativeStreamSimple(nativeModel, context, sanitizedOptions);
+  };
+  try {
+    pi.registerProvider(NINEROUTER_PROVIDER, {
+      name: "9Router",
+      baseUrl: NINEROUTER_BASE_URL,
+      apiKey: "personal-nine-router-keyfile",
+      api: NINEROUTER_API,
+      models,
+      streamSimple
+    });
+  } catch {
+    return disabledController(options.log, "provider-registration-failed");
+  }
+  const describe = (value) => {
+    const record = refForInput(value, byRef);
+    return record ? description(record) : undefined;
+  };
+  let disposed = false;
+  const controller = {
+    enabled: true,
+    provider: NINEROUTER_PROVIDER,
+    api: NINEROUTER_API,
+    baseUrl: NINEROUTER_BASE_URL,
+    models,
+    canonicalRef: canonicalNineRouterRef,
+    describe,
+    isAllowed: (value) => !!describe(value)?.allowed,
+    dispose: () => {
+      if (disposed)
+        return;
+      disposed = true;
+    }
+  };
+  const fetchedAt = typeof catalog?.fetchedAt === "string" || typeof catalog?.fetchedAt === "number" ? catalog.fetchedAt : undefined;
+  safeLog(options.log, "ninerouter-registered", { models: models.length, ...fetchedAt !== undefined ? { fetchedAt } : {} });
+  return controller;
+}
+var ninerouter_default = installNineRouter;
+export {
+  installNineRouter,
+  ninerouter_default as default,
+  canonicalRef,
+  canonicalNineRouterRef,
+  NINEROUTER_PROVIDER,
+  NINEROUTER_ORIGIN,
+  NINEROUTER_MAX_OUTPUT_TOKENS,
+  NINEROUTER_BASE_URL,
+  NINEROUTER_API
+};

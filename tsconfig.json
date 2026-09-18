@@ -1,0 +1,39 @@
+{
+  "compilerOptions": {
+    "target": "es2022",
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "skipLibCheck": true,
+    "noEmit": true,
+    "types": [
+      "bun-types",
+      "node"
+    ],
+    "allowImportingTsExtensions": true
+  },
+  "include": [
+    "policy.ts",
+    "routing-context.ts",
+    "jev-client.ts",
+    "jev-questions.ts",
+    "assessment-cache.ts",
+    "type-guards.ts",
+    "budget.ts",
+    "quota.ts",
+    "accounts.ts",
+    "ninerouter-usage.ts",
+    "fanout.ts",
+    "promotion.ts",
+    "context-tools.ts",
+    "semantic.test.ts",
+    "policy.test.ts",
+    "ninerouter-usage.test.ts",
+    "accounts.test.ts",
+    "fanout.test.ts"
+  ],
+  "exclude": [
+    "ninerouter.ts",
+    "node_modules"
+  ]
+}

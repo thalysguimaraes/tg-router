@@ -1,0 +1,605 @@
+/** Personal routing policy. Pure data in/out; no auth, I/O, provider or classifier calls. */
+export type Effort = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+export type RouteTier = "mechanical" | "bounded" | "execution" | "complex" | "premium";
+/** Authoritative max age for a positive quota observation. Must stay <= the usage adapter's stale cutoff. */
+export const QUOTA_MAX_AGE_MS = 180_000;
+export type RoutePhase = "lightweight" | "implementation" | "review" | "investigation" | "planning";
+export type QuotaState = "healthy" | "reserve" | "depleted" | "unknown";
+
+/** Integration passes every applicable window, scoped to an eligible native account. */
+export interface QuotaWindow {
+  id: string;
+  remainingFraction?: number;
+  usedFraction?: number;
+  resetsAt?: number;
+  reserveFraction?: number;
+  /** Explicit provider status, when present, wins over a rounded usage percentage. */
+  exhausted?: boolean;
+  /** resetsAt - observedAt at capture time; undefined when either is unknown. */
+  horizonMs?: number;
+}
+export interface QuotaAccount {
+  connectionId: string;
+  priority: number;
+  state: QuotaState;
+  /** min over windows of remainingFraction / max(1, hoursToReset). -1 when unknown. */
+  pressure: number;
+  /** modelLock_<model> expiry > now for the queried model. */
+  locked: boolean;
+}
+export interface QuotaSnapshot {
+  observedAt: number;
+  state?: QuotaState;
+  windows?: QuotaWindow[];
+  accounts?: QuotaAccount[];
+}
+export interface RouteModel {
+  ref: string;
+  /**
+   * Stable provider identity used for capability and preference decisions.
+   * `ref` remains the concrete transport/model reference returned in a
+   * decision (for example, `9router/cx/gpt-5.6-sol`).
+   */
+  canonicalRef?: string;
+  /** A gateway route is a transport choice, not a second native account. */
+  gateway?: boolean;
+  authenticated: boolean;
+  contextWindow: number;
+  supportsImages: boolean;
+  supportsTools: boolean;
+  supportedEfforts?: Effort[];
+  validated?: { tools?: boolean; vision?: boolean; reasoning?: boolean };
+  quota?: QuotaSnapshot;
+  /** Explicit task qualification for extra models; unrelated benchmark scores are not used. */
+  qualityTiers?: RouteTier[];
+  payg?: boolean;
+}
+export interface CurrentRoute {
+  model: string;
+  effort?: Effort;
+  tier?: RouteTier;
+  phase?: RoutePhase;
+}
+export interface RouteInput {
+  prompt: string;
+  /** Epoch milliseconds; callers should supply their observation clock. */
+  now?: number;
+  models: RouteModel[];
+  current?: CurrentRoute;
+  previous?: { tier: RouteTier; phase: RoutePhase };
+  /**
+   * Hard floor a spawned child inherits from its parent's assignment. Raises
+   * an uncertain or under-classified prompt; never lowers an explicit one.
+   * Not a user command and not persisted across handoffs.
+   */
+  childFloor?: { tier: RouteTier; phase: RoutePhase };
+  /** An explicit user choice, never an inferred provider/model name in task text. */
+  manualPin?: { model: string; effort?: Effort };
+  contextTokens: number;
+  /** False only when integration proves no prior assistant work exists. */
+  hasWorkContext?: boolean;
+  outputMarginTokens?: number;
+  needsImages?: boolean;
+  needsTools?: boolean;
+  boundary?: "user" | "child" | "phase" | "compaction" | "provider-failure" | "tool";
+  task?: { bounded?: boolean; acceptanceDefined?: boolean; highValue?: boolean; failedQualityChecks?: number };
+  promotion?: { active: boolean; confirmedAt: number };
+  paidFallback?: { authorized: boolean; budgetReserved: boolean; allowedModels: string[] };
+  /** A visible work-state handoff exists before leaving Fable's reasoning format. */
+  handoffReady?: boolean;
+  quotaMaxAgeMs?: number;
+  promotionMaxAgeMs?: number;
+  /** Live canonical models already held by parent + siblings when boundary === "child". */
+  siblings?: Array<{ canonicalRef: string; count: number }>;
+}
+export interface RouteDecision {
+  action: "select" | "preserve" | "unavailable";
+  model?: string;
+  effort?: Effort;
+  tier: RouteTier;
+  phase: RoutePhase;
+  reason: string;
+  quotaState?: QuotaState;
+  rejected: Array<{ model: string; reason: string }>;
+}
+
+/** Map OMP's native subagent model roles to a routing floor for the child. */
+export function childFloorFor(value: unknown): { tier: RouteTier; phase: RoutePhase } | undefined {
+  if (typeof value !== "string") return undefined;
+  const alias = value.trim().toLowerCase().replace(/^@/, "");
+  switch (alias) {
+    case "task": return { tier: "bounded", phase: "implementation" };
+    case "plan": return { tier: "complex", phase: "planning" };
+    case "revisao": return { tier: "execution", phase: "review" };
+    case "pesquisa": return { tier: "complex", phase: "investigation" };
+    default: return undefined;
+  }
+}
+
+/** Normalized semantic assessment produced by the classifier adapter or cache. */
+export interface SemanticAssessment {
+  phase?: { selected: string; confidence?: number };
+  tier?: { selected: string; probabilities: Record<string, number>; confidence?: number };
+  boundedProbability?: number;
+  highImpactProbability?: number;
+  underspecifiedProbability?: number;
+  truncated?: boolean;
+  usable?: boolean;
+}
+
+/** Rollout modes for the semantic classifier. `off` never calls it. */
+export type SemanticMode = "off" | "shadow" | "assisted" | "calibrated";
+
+/**
+ * Starting gates (SPEC §9.2). Calibration may tighten them, never loosen past
+ * these floors without recorded evidence.
+ *
+ * UNCALIBRATED, and `downgradeMaxHigherTierMass` is currently binding: measured
+ * against api.typesafe.ai on 2026-09-17, a clearly mechanical task
+ * ("rename the local variable tmp to buffer in parseHeader()") returned
+ * mechanical at confidence 0.93 while still leaving ~0.07 probability mass on
+ * adjacent higher tiers. That exceeds the 0.01 ceiling, so `calibrated` mode
+ * downgrades approximately never in practice. This fails safe (it can only
+ * over-route, never under-route) and is deliberately left unchanged: picking
+ * the real ceiling requires the labeled holdout in SPEC §17.2, not a single
+ * observation. `assisted` mode is unaffected and works today.
+ */
+export const SEMANTIC_GATES = {
+  overrideTopProbability: 0.80,
+  overrideConfidence: 0.80,
+  downgradeTopProbability: 0.90,
+  downgradeConfidence: 0.90,
+  downgradeMargin: 0.20,
+  downgradeMaxHigherTierMass: 0.01,
+} as const;
+
+export interface ResolveAssessmentInput {
+  assessment: SemanticAssessment | undefined;
+  rulesClassification: { tier: RouteTier; phase: RoutePhase };
+  mode: SemanticMode;
+  /** A spawned child's inherited floor; semantics may raise but never cross it. */
+  floorTier?: RouteTier;
+  /** True when a child's inherited phase must not be reinterpreted. */
+  floorLocksPhase?: boolean;
+  highValue?: boolean;
+  failedQualityChecks?: number;
+}
+
+/**
+ * Pure combination of rule classification with semantic evidence.
+ * Hard rules outrank semantics; uncertainty degrades to the rule baseline;
+ * downgrades additionally require the calibrated mode and strict gates.
+ */
+export function resolveClassification(input: ResolveAssessmentInput): { tier: RouteTier; phase: RoutePhase; source: "rules" | "semantic-assisted" | "semantic-downgrade"; reason: string } {
+  const { tier, phase } = input.rulesClassification;
+  const assessment = input.assessment;
+  if (!assessment || assessment.usable === false || input.mode === "off") {
+    return { tier, phase, source: "rules", reason: input.mode === "off" ? "Semantic routing is off." : "No usable semantic assessment; rules baseline applies." };
+  }
+  const floorRank = input.floorTier ? Math.max(rank(tier), rank(input.floorTier)) : rank(tier);
+  if (input.mode === "assisted") {
+    // Assisted mode: semantic phase clarification and upward-only tier moves.
+    const semanticTier = assessment.tier ? safeTier(assessment.tier.selected) : undefined;
+    if (semanticTier && rank(semanticTier) > floorRank && gatesPass(assessment.tier!, SEMANTIC_GATES.overrideTopProbability, SEMANTIC_GATES.overrideConfidence)) {
+      return { tier: semanticTier, phase: phaseOf(assessment, phase), source: "semantic-assisted", reason: `Semantic assessment raised the capability floor (${tier} -> ${semanticTier}).` };
+    }
+    const semanticPhase = safePhase(assessment.phase?.selected ?? "");
+    if (semanticPhase && input.floorLocksPhase !== true) {
+      return { tier, phase: semanticPhase, source: "semantic-assisted", reason: `Semantic phase clarification: ${phase} -> ${semanticPhase}.` };
+    }
+    return { tier, phase, source: "rules", reason: "Assisted mode keeps the rules baseline." };
+  }
+  if (input.mode === "calibrated") {
+    // safeTier returns the "unknown" label as a tier; treat it as unusable.
+    const semanticTierRaw = assessment.tier ? safeTier(assessment.tier.selected) : undefined;
+    const semanticTierObject = assessment.tier;
+    if (!semanticTierRaw || semanticTierRaw === ("unknown" as RouteTier) || !semanticTierObject) return { tier, phase, source: "rules", reason: "No usable semantic tier; rules baseline applies." };
+    const semanticTier: RouteTier = semanticTierRaw;
+    // Review never downgrades. Two reasons, one of them measured:
+    // 1. Automatic review routing is restricted to Fable/Astra, so dropping
+    //    the tier would contradict that restriction.
+    // 2. Observed on jev-1.13 (2026-09-17): "review whether this payment-state
+    //    transition can double-charge" scores highImpact ~0.30, because a
+    //    review does not itself move money. The model answers literally and is
+    //    not wrong, so the impact gate alone cannot protect review work. Real
+    //    mutations (deleting production rows, changing token expiry, rotating
+    //    live keys) score 0.94-0.98 and the 0.5 gate catches those decisively.
+    const reviewPhase = assessment.phase?.selected === "review" || input.rulesClassification.phase === "review";
+    const downgradeGuard =
+      input.highValue === true ? "high-value work never downgrades"
+      : (input.failedQualityChecks ?? 0) > 0 ? "unresolved quality failure blocks downgrade"
+      : (assessment.highImpactProbability ?? 0) >= 0.5 ? "high-impact signal blocks downgrade"
+      : reviewPhase ? "review work never downgrades"
+      : (assessment.underspecifiedProbability ?? 0) >= 0.5 || assessment.truncated === true ? "insufficient context blocks downgrade"
+      : undefined;
+    if (downgradeGuard) return { tier, phase, source: "rules", reason: `Calibrated mode kept ${tier}: ${downgradeGuard}.` };
+    if (rank(semanticTier) < floorRank) {
+      const higherTierMass = TIERS.filter(t => rank(t) > rank(semanticTier)).reduce((sum, t) => sum + (semanticTierObject.probabilities[t] ?? 0), 0);
+      const top = topProbability(semanticTierObject.probabilities, semanticTier);
+      const confidence = semanticTierObject.confidence ?? 0;
+      if (top >= SEMANTIC_GATES.downgradeTopProbability && confidence >= SEMANTIC_GATES.downgradeConfidence &&
+          top - secondProbability(semanticTierObject.probabilities, semanticTier) >= SEMANTIC_GATES.downgradeMargin &&
+          higherTierMass <= SEMANTIC_GATES.downgradeMaxHigherTierMass) {
+        // A downgrade may land anywhere from the rules tier down to the role
+        // minimum; without a role minimum the semantic tier itself is the floor.
+        const floor = input.floorTier && rank(input.floorTier) > rank(semanticTier) ? input.floorTier : semanticTier;
+        return { tier: floor, phase: phaseOf(assessment, phase), source: rank(floor) < rank(tier) ? "semantic-downgrade" : "rules", reason: rank(floor) < rank(tier) ? `Calibrated semantic downgrade (${tier} -> ${floor}) passed all uncertainty gates; child floor honored.` : `Rules tier ${tier} kept; semantic tier ${semanticTier} sits at or above the floor.` };
+      }
+      return { tier, phase, source: "rules", reason: "Semantic downgrade failed an uncertainty gate; rules baseline applies." };
+    }
+    if (rank(semanticTier) > floorRank && gatesPass(semanticTierObject, SEMANTIC_GATES.overrideTopProbability, SEMANTIC_GATES.overrideConfidence)) {
+      return { tier: semanticTier, phase: phaseOf(assessment, phase), source: "semantic-assisted", reason: `Semantic assessment raised the capability floor (${tier} -> ${semanticTier}).` };
+    }
+    const semanticPhase = safePhase(assessment.phase?.selected ?? "");
+    if (semanticPhase && input.floorLocksPhase !== true) {
+      return { tier, phase: semanticPhase, source: "semantic-assisted", reason: `Semantic phase clarification: ${phase} -> ${semanticPhase}.` };
+    }
+    return { tier, phase, source: "rules", reason: "Calibrated mode kept the rules baseline." };
+  }
+  // shadow: never changes the decision; caller records the comparison.
+  return { tier, phase, source: "rules", reason: "Shadow mode executes the rules baseline." };
+}
+
+function safeTier(value: string): RouteTier | undefined {
+  return (TIERS as readonly string[]).includes(value) ? value as RouteTier : undefined;
+}
+function safePhase(value: string): RoutePhase | undefined {
+  return (["lightweight", "implementation", "review", "investigation", "planning"] as readonly string[]).includes(value) ? value as RoutePhase : undefined;
+}
+function phaseOf(assessment: SemanticAssessment, fallback: RoutePhase): RoutePhase {
+  return safePhase(assessment.phase?.selected ?? "") ?? fallback;
+}
+function gatesPass(tier: { selected: string; confidence?: number; probabilities: Record<string, number> }, topProbabilityGate: number, confidenceGate: number): boolean {
+  return topProbability(tier.probabilities, tier.selected) >= topProbabilityGate && (tier.confidence ?? 0) >= confidenceGate;
+}
+function topProbability(probabilities: Record<string, number>, selected: string): number {
+  return probabilities[selected] ?? 0;
+}
+function secondProbability(probabilities: Record<string, number>, selected: string): number {
+  const rest = Object.entries(probabilities).filter(([key]) => key !== selected).map(([, value]) => value);
+  return rest.length ? Math.max(...rest) : 0;
+}
+
+export const MODELS = {
+  astra: "openai-codex/gpt-6-astra",
+  sol: "openai-codex/gpt-5.6-sol",
+  luna: "openai-codex/gpt-5.6-luna",
+  deepseek: "opencode-go/deepseek-v4.1-flash",
+  glm: "opencode-go/glm-5.3-flash",
+  union: "opencode-go/union-alpha",
+  fable: "anthropic/claude-fable-5-1",
+  sonnet: "anthropic/claude-sonnet-5",
+  opus: "anthropic/claude-opus-5",
+} as const;
+
+const TIERS: RouteTier[] = ["mechanical", "bounded", "execution", "complex", "premium"];
+const EFFORTS: Effort[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+// This is the reviewed personal task loadout, not a universal ranking of model intelligence.
+const QUALIFICATIONS: Record<string, RouteTier[]> = {
+  [MODELS.luna]: ["mechanical"],
+  [MODELS.deepseek]: ["mechanical", "bounded"],
+  [MODELS.glm]: ["mechanical", "bounded"],
+  // Free stealth model; Terminal-Bench places it above Sol but it has no premium track record here.
+  [MODELS.union]: ["mechanical", "bounded", "execution"],
+  [MODELS.sol]: ["mechanical", "bounded", "execution"],
+  [MODELS.sonnet]: ["mechanical", "bounded", "execution"],
+  [MODELS.astra]: TIERS,
+  [MODELS.opus]: TIERS,
+  [MODELS.fable]: TIERS,
+};
+
+interface Classification { tier: RouteTier; phase: RoutePhase; uncertain: boolean; continuation: boolean; phaseLocked?: boolean }
+const normalize = (text: string) => text.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
+const rank = (tier: RouteTier) => TIERS.indexOf(tier);
+const canonicalModelRef = (model: RouteModel): string => model.canonicalRef ?? model.ref;
+const isGatewayModel = (model: RouteModel): boolean => model.gateway === true || model.ref.startsWith("9router/");
+const finiteFraction = (value: number | undefined): value is number =>
+  value !== undefined && Number.isFinite(value) && value >= 0 && value <= 1;
+const fresh = (at: number, now: number, maxAge: number) =>
+  Number.isFinite(at) && at <= now && now - at <= maxAge;
+
+// Narrow lexical exceptions for bounded implementation contracts. Never discard
+// an entire negated clause: it may also contain a separate positive risk request.
+function implementationCapabilityText(text: string): string {
+  return text
+    .replace(/\bunsupported diagnostics\b/g, " ")
+    .replace(/\bdiagnosticos nao suportados\b/g, " ")
+    .replace(/\breturn (?:owned files and )?(?:the )?critical invariants?\b/g, " ")
+    .replace(/\b(?:retorne|retornar) (?:as )?invariantes criticas\b/g, " ")
+    .replace(/\b(?:no|without) production (?:install(?:ation)?|changes?|deployments?)\b/g, " ")
+    .replace(/\bdo not (?:deploy|install) (?:to |in )?production\b/g, " ")
+    .replace(/\bsem (?:alteracoes|instalacao|implantacao) em producao\b/g, " ")
+    .replace(/\bnao (?:implante|instale|altere) (?:em |a )?producao\b/g, " ");
+}
+
+function classify(input: RouteInput): Classification {
+  const text = normalize(input.prompt).trim();
+  // A child spawned as an implementation worker with an explicit contract may
+  // have its capability text lightly de-noised of contract boilerplate.
+  const boundedImplementation = input.childFloor?.phase === "implementation" && input.task?.bounded === true && input.task.acceptanceDefined === true;
+  const capabilityText = boundedImplementation ? implementationCapabilityText(text) : text;
+  const prior = (input.previous?.phase ? input.previous : undefined) ?? (input.current?.tier && input.current.phase
+    ? { tier: input.current.tier, phase: input.current.phase } : undefined);
+  const continuing = /^(continue|continuar|continua|prossiga|prosseguir|siga|segue|sim|ok|okay|certo|pode seguir|pode continuar|vai em frente|go ahead|proceed|resume|keep going|do it)[.!?\s]*$/.test(text);
+  const planning = /\b(plan|planning|planej\w*|arquitet\w*|architecture|design decisions|trade.?offs?|estrateg\w*|strategy)\b/.test(text);
+  const investigationPattern = /\b(investig\w*|diagnos\w*|research\w*|pesquis\w*|root cause|causa raiz|analise|analisar|analyze|analysis|debug\w*)\b/;
+  const riskyPattern = /\b(security|seguranca|migrac\w*|migration|production|producao|autentic\w*|authentication|concorrencia|concurrency|race condition|data loss|perda de dados)\b/;
+  const difficultPattern = /\b(complex\w*|ambigu\w*|profund\w*|deep|dificil|hard|critico|critical|sem hipotese|unknown root cause|sem causa|contradit\w*|nao converge|sintese extensa)\b/;
+  const investigation = investigationPattern.test(capabilityText);
+  const risky = riskyPattern.test(capabilityText);
+  const difficult = difficultPattern.test(capabilityText);
+  const visualJudgment = /\b(redesign|critique|critica visual|direcao de arte|art direction|visual judgment|polimento visual|design system|identidade visual)\b/.test(text);
+  const review = /\b(review|revis\w*|rever|auditar|audit)\b/.test(text);
+  const coding = /\b(implement\w*|implemente|corrig\w*|corrija|fix|refator\w*|refactor\w*|codig\w*|code|test\w*|patch|bug|adicione|add|edite|edit|alter\w*|change|atualiz\w*|update)\b/.test(text);
+  const mechanical = /\b(resum\w*|summari[sz]\w*|format\w*|reformat\w*|renome\w*|rename|list|liste|listar|listing|extra\w*|extract|localiz\w*|find file|which file|onde fica|traduz\w*|translate|changelog|typo|ortograf\w*)\b/.test(text);
+  const explicitTask = planning || investigation || risky || difficult || visualJudgment || review || coding || mechanical;
+  const shortFollowup = !explicitTask && text.split(/\s+/).filter(Boolean).length <= 10;
+  if (prior && (continuing || shortFollowup)) return { ...prior, uncertain: false, continuation: true };
+
+  let result: Classification;
+  if ((difficult && (planning || investigation || review)) || visualJudgment) {
+    result = { tier: "premium", phase: planning || visualJudgment ? "planning" : review ? "review" : "investigation", uncertain: false, continuation: false };
+  } else if (risky || planning || investigation || difficult) {
+    result = { tier: "complex", phase: planning ? "planning" : "investigation", uncertain: false, continuation: false };
+  } else if (review) {
+    result = { tier: "execution", phase: "review", uncertain: false, continuation: false };
+  } else if (input.task?.bounded && input.task.acceptanceDefined && coding) {
+    result = { tier: "bounded", phase: "implementation", uncertain: false, continuation: false };
+  } else if (mechanical) {
+    result = { tier: "mechanical", phase: "lightweight", uncertain: false, continuation: false };
+  } else if (coding) {
+    // Ordinary implementation is an approved bounded worker task. A task
+    // does not need a child-only acceptance contract to use GLM/DeepSeek.
+    result = { tier: "bounded", phase: "implementation", uncertain: false, continuation: false };
+  } else {
+    result = { tier: prior?.tier ?? "complex", phase: prior?.phase ?? "investigation", uncertain: true, continuation: false };
+  }
+  // A child floor is inherited from the parent's assignment, not chosen by a
+  // user. It raises an uncertain or under-classified prompt to what the parent
+  // asked for, and supplies the phase when the prompt has none of its own. It
+  // never lowers an explicitly classified capability: a research child that
+  // is told to implement something is still doing implementation.
+  const explicitCapabilityPhase = planning || investigation || risky || difficult || visualJudgment || review || coding;
+  const floor = input.childFloor;
+  if (floor && !prior) {
+    if (result.uncertain && !explicitCapabilityPhase) {
+      result = { tier: floor.tier, phase: floor.phase, uncertain: false, continuation: false };
+    } else if (rank(result.tier) < rank(floor.tier)) {
+      result = { ...result, tier: floor.tier, phase: explicitCapabilityPhase ? result.phase : floor.phase, uncertain: false };
+    } else if (!explicitCapabilityPhase) {
+      result = { ...result, phase: floor.phase, uncertain: false };
+    }
+  }
+  if (prior?.phase === "planning" && rank(result.tier) < rank(prior.tier) && !input.handoffReady &&
+      input.boundary !== "phase" && input.boundary !== "compaction" && input.boundary !== "child") {
+    return { ...prior, uncertain: false, continuation: true, phaseLocked: true };
+  }
+  return result;
+}
+
+function quotaState(model: RouteModel, input: RouteInput): QuotaState {
+  const snapshot = model.quota;
+  if (!snapshot) return "unknown";
+  const now = input.now ?? 0;
+  const windows = snapshot.windows ?? [];
+  // An exhausted window stays blocked until its stated reset, even when the snapshot aged out.
+  const exhausted = windows.filter(window => window.exhausted === true || (window.exhausted !== false && (window.usedFraction === 1 || window.remainingFraction === 0)));
+  if (exhausted.some(window => window.resetsAt === undefined || window.resetsAt > now)) return "depleted";
+  // Passing the reset is not evidence of an empty new window: another client may have used it.
+  if (windows.some(window => window.resetsAt !== undefined && window.resetsAt <= now && snapshot.observedAt < window.resetsAt)) return "unknown";
+  if (!fresh(snapshot.observedAt, now, input.quotaMaxAgeMs ?? 180_000)) return "unknown";
+  if (snapshot.state === "depleted") return "depleted";
+  if (snapshot.state === "reserve") return "reserve";
+  if (snapshot.state === "unknown") return "unknown";
+  let unknownWindow = false;
+  let reserved = false;
+  for (const window of windows) {
+    const remaining = finiteFraction(window.remainingFraction) ? window.remainingFraction
+      : finiteFraction(window.usedFraction) ? 1 - window.usedFraction : undefined;
+    if (remaining === undefined) { unknownWindow = true; continue; }
+    const reserve = finiteFraction(window.reserveFraction) ? window.reserveFraction
+      : /fable|premium/.test(window.id) ? 0.20 : /7d|week|seman/.test(window.id) ? 0.15 : 0;
+    if (remaining <= reserve) reserved = true;
+  }
+  if (unknownWindow) return "unknown";
+  if (reserved) return "reserve";
+  return windows.length > 0 || snapshot.state === "healthy" ? "healthy" : snapshot.state ?? "unknown";
+}
+
+function qualifies(model: RouteModel, tier: RouteTier, input: RouteInput): boolean {
+  const declared = model.qualityTiers ?? QUALIFICATIONS[canonicalModelRef(model)] ?? QUALIFICATIONS[model.ref];
+  if (declared) return declared.includes(tier);
+  // A previously accepted current route can be retained; unknown models are never newly chosen.
+  return model.ref === input.current?.model && input.current.tier !== undefined && rank(input.current.tier) >= rank(tier);
+}
+
+function modelEffort(model: RouteModel, tier: RouteTier, input: RouteInput, requested?: Effort): Effort {
+  const desired = requested ?? (tier === "mechanical" ? "medium" :
+    (input.task?.failedQualityChecks ?? 0) >= 2 && (tier === "complex" || tier === "premium") ? "xhigh" : "high");
+  if (!model.supportedEfforts?.length) return desired;
+  if (model.supportedEfforts.includes(desired)) return desired;
+  const sorted = [...model.supportedEfforts].sort((a, b) => EFFORTS.indexOf(a) - EFFORTS.indexOf(b));
+  return sorted.filter(level => EFFORTS.indexOf(level) <= EFFORTS.indexOf(desired)).at(-1) ?? sorted[0]!;
+}
+
+function rejection(model: RouteModel, tier: RouteTier, input: RouteInput, isManual = false): string | undefined {
+  if (!model.authenticated) return "route is not authenticated";
+  if (!Number.isFinite(model.contextWindow) || model.contextWindow <= 0 ||
+      input.contextTokens + (input.outputMarginTokens ?? 16_384) > model.contextWindow) return "complete context and output margin do not fit";
+  if (input.needsImages && !model.supportsImages) return "image input is required";
+  if (input.needsTools !== false && !model.supportsTools) return "tool use is required";
+  if (!isManual && !qualifies(model, tier, input)) return "model is not qualified for the task's capability floor";
+  if (/\/(?:auto|openrouter\/auto)$/.test(model.ref)) return "generic automatic upstream routing is outside this loadout";
+  if (!isManual && canonicalModelRef(model).startsWith("opencode-go/")) {
+    if (input.needsTools !== false && !model.validated?.tools) return "Go tool-loop validation is missing";
+    if (input.needsImages && !model.validated?.vision) return "Go vision validation is missing";
+    if (!model.validated?.reasoning) return "Go reasoning mapping validation is missing";
+  }
+  const paid = model.payg === true || model.ref.startsWith("openrouter/") || model.ref.startsWith("deepseek/");
+  if (paid && !isManual && !(input.paidFallback?.authorized && input.paidFallback.budgetReserved && input.paidFallback.allowedModels.includes(model.ref))) {
+    return "paid fallback lacks explicit authorization and a reserved budget";
+  }
+  const quota = quotaState(model, input);
+  if (quota === "depleted") return "an applicable quota window is exhausted";
+  const establishedPremium = model.ref === input.current?.model && input.current.tier !== undefined && input.boundary !== "child";
+  if (!isManual && canonicalModelRef(model) === MODELS.fable && !establishedPremium && quota === "unknown") {
+    return "a new premium route requires fresh quota evidence";
+  }
+  return undefined;
+}
+
+function preference(tier: RouteTier, phase: RoutePhase, input: RouteInput): string[] {
+  const now = input.now ?? 0;
+  const promo = input.promotion?.active === true && fresh(input.promotion.confirmedAt, now, input.promotionMaxAgeMs ?? 3_600_000);
+  // Union is free and benches above the Go workers; it leads the worker pool while the promo lasts.
+  const workers = promo ? [MODELS.union, MODELS.deepseek, MODELS.glm] : [MODELS.union, MODELS.glm, MODELS.deepseek];
+  if (phase === "review") return [MODELS.fable, MODELS.astra];
+  if (phase === "implementation" && tier !== "bounded") {
+    // Repeated quality failures must move implementation up the quality
+    // ladder before considering the legacy Sol/Opus fallbacks.
+    return [MODELS.astra, MODELS.fable, MODELS.sol, MODELS.opus, MODELS.sonnet];
+  }
+  if (phase === "implementation") return [...workers, MODELS.astra, MODELS.fable, MODELS.sol, MODELS.sonnet, MODELS.opus];
+  if (phase === "investigation") {
+    // High-value work may explicitly spend the premium reserve; ordinary
+    // research still prefers Astra even when its inferred tier is premium.
+    return tier === "premium" && input.task?.highValue
+      ? [MODELS.fable, MODELS.astra, MODELS.opus]
+      : [MODELS.astra, MODELS.opus, MODELS.fable];
+  }
+  switch (tier) {
+    case "mechanical": return [MODELS.luna, MODELS.sol, ...workers, MODELS.sonnet, MODELS.astra, MODELS.opus, MODELS.fable];
+    case "bounded": return [...workers, MODELS.sol, MODELS.sonnet, MODELS.astra, MODELS.opus, MODELS.fable];
+    case "execution": return [MODELS.union, MODELS.sol, MODELS.sonnet, MODELS.astra, MODELS.opus, MODELS.fable];
+    case "complex": return [MODELS.astra, MODELS.opus, MODELS.fable];
+    case "premium": return [MODELS.fable, MODELS.astra, MODELS.opus];
+  }
+}
+
+/** Continuous quota pressure: remaining fraction per hour until reset, 0..1 scaled down as the reset nears. -1 when unknown. */
+export function pressure(snapshot: QuotaSnapshot | undefined, now: number): number {
+  const windows = (snapshot?.windows ?? []).filter(window => finiteFraction(window.remainingFraction));
+  if (!windows.length) return -1;
+  return Math.min(...windows.map(window => window.remainingFraction! / Math.max(1, ((window.resetsAt ?? now + 3600000) - now) / 3600000)));
+}
+export const PRESSURE_SWAP_RATIO = 0.5;
+
+export function decideRoute(input: RouteInput): RouteDecision {
+  const classification = classify(input);
+  const failures = input.task?.failedQualityChecks ?? 0;
+  if (failures >= 2) {
+    const previousTier = input.previous?.tier ?? input.current?.tier ?? classification.tier;
+    classification.tier = TIERS[Math.min(TIERS.length - 1, Math.max(rank(classification.tier), rank(previousTier) + 1))]!;
+  }
+  const { tier, phase } = classification;
+  const rejected: RouteDecision["rejected"] = [];
+  const unavailable = (reason: string): RouteDecision => ({ action: "unavailable", tier, phase, reason, rejected });
+  if (!Number.isFinite(input.contextTokens) || input.contextTokens < 0 ||
+      (input.outputMarginTokens !== undefined && (!Number.isFinite(input.outputMarginTokens) || input.outputMarginTokens < 0))) {
+    return unavailable("A valid complete-context token estimate is required; history will not be truncated.");
+  }
+  const current = input.models.find(model => model.ref === input.current?.model);
+  const decisionFor = (model: RouteModel, reason: string, effort?: Effort): RouteDecision => ({
+    action: model.ref === input.current?.model ? "preserve" : "select",
+    model: model.ref, effort: modelEffort(model, tier, input, effort), tier, phase, reason,
+    quotaState: quotaState(model, input), rejected,
+  });
+
+  if (input.manualPin) {
+    const pinned = input.models.find(model => model.ref === input.manualPin!.model);
+    if (!pinned) return unavailable("The explicitly pinned model is absent; automatic substitution is disabled.");
+    const why = rejection(pinned, tier, input, true);
+    if (why) { rejected.push({ model: pinned.ref, reason: why }); return unavailable("The explicit pin is unavailable: " + why + "."); }
+    return decisionFor(pinned, "Explicit user model pin takes precedence over automatic routing.", input.manualPin.effort ?? input.current?.effort);
+  }
+
+  if (input.boundary === "tool") {
+    if (!current) return unavailable("No established route exists for this tool-loop continuation.");
+    const why = rejection(current, input.current?.tier ?? tier, input);
+    if (why) { rejected.push({ model: current.ref, reason: why }); return unavailable("The established route cannot continue; native failure handling must reconcile it."); }
+    return {
+      ...decisionFor(current, "Keep the established route during the tool loop; no economic switch is allowed.", input.current?.effort),
+      tier: input.current?.tier ?? tier,
+      phase: input.current?.phase ?? phase,
+    };
+  }
+
+  const eligible = input.models.filter(model => {
+    const why = rejection(model, tier, input);
+    if (why) rejected.push({ model: model.ref, reason: why });
+    return !why;
+  });
+  if (eligible.length === 0) return unavailable("No authenticated route meets capability, context, quota and payment constraints; the quality floor is unchanged.");
+
+  if (current && eligible.includes(current) && failures < 2 && input.boundary !== "provider-failure" &&
+      (classification.continuation || classification.uncertain)) {
+    return decisionFor(current, classification.phaseLocked
+      ? "Preserve the planning phase until an explicit phase boundary or work-state handoff."
+      : classification.continuation ? "Continue the established phase and capable model; a short follow-up is not a downgrade signal."
+      : "Classification is uncertain; retain the currently qualified model.", input.current?.effort);
+  }
+
+  const order = preference(tier, phase, input);
+  const paid = (model: RouteModel) => model.payg === true || model.ref.startsWith("openrouter/") || model.ref.startsWith("deepseek/");
+  // A mapped gateway route owns its canonical identity for automatic routing.
+  // Keep the direct route available to explicit pins, but do not silently fall
+  // back to it when the gateway route is unavailable or fails in transport.
+  const gatewayCanonicalRefs = new Set(input.models
+    .filter(model => isGatewayModel(model) && model.canonicalRef)
+    .map(model => model.canonicalRef!));
+  const automaticEligible = eligible.filter(model => {
+    if (phase === "review" && canonicalModelRef(model) !== MODELS.fable && canonicalModelRef(model) !== MODELS.astra) {
+      rejected.push({ model: model.ref, reason: "review routing is limited to Fable or Astra" });
+      return false;
+    }
+    if (isGatewayModel(model) || !gatewayCanonicalRefs.has(canonicalModelRef(model))) return true;
+    rejected.push({ model: model.ref, reason: "a mapped 9Router route owns this canonical identity; direct fallback requires an explicit pin" });
+    return false;
+  });
+  const candidates = [...automaticEligible].sort((a, b) => {
+    if (paid(a) !== paid(b)) return paid(a) ? 1 : -1;
+    // Reserves are preferences among already qualified routes, never a license to lower quality.
+    if (!input.task?.highValue) {
+      const aReserve = quotaState(a, input) === "reserve";
+      const bReserve = quotaState(b, input) === "reserve";
+      if (aReserve !== bReserve) return aReserve ? 1 : -1;
+    }
+    const aIndex = order.indexOf(canonicalModelRef(a)), bIndex = order.indexOf(canonicalModelRef(b));
+    const byPreference = (aIndex < 0 ? order.length : aIndex) - (bIndex < 0 ? order.length : bIndex);
+    if (byPreference !== 0) return byPreference;
+    // Equal canonical routes are unusual, but prefer the gateway deterministically.
+    return Number(isGatewayModel(b)) - Number(isGatewayModel(a));
+  });
+  if (candidates.length === 0) return unavailable("No authenticated route meets capability, context, quota and payment constraints; the quality floor is unchanged.");
+  // Pressure-aware adjacent swap: prefer a qualified candidate with meaningfully less quota pressure.
+  // The swap stays within one already-maintained preference order and is disabled for high-value tasks.
+  let swapReason = "";
+  if (!input.task?.highValue) {
+    const siblingLoad = (canonical: string) => (input.siblings ?? [])
+      .filter(entry => entry.canonicalRef.split("/")[0] === canonical.split("/")[0])
+      .reduce((sum, entry) => sum + entry.count, 0);
+    for (let index = 0; index < candidates.length - 1; index++) {
+      const a = candidates[index]!, b = candidates[index + 1]!;
+      let pa = pressure(a.quota, input.now ?? 0);
+      let pb = pressure(b.quota, input.now ?? 0);
+      if (input.boundary === "child") {
+        pa = pa < 0 ? -1 : pa / (1 + siblingLoad(canonicalModelRef(a)));
+        pb = pb < 0 ? -1 : pb / (1 + siblingLoad(canonicalModelRef(b)));
+      }
+      // Re-run admission for b so the swap never promotes a rejected lower-tier model.
+      if (pa >= 0 && pb >= 0 && pa < PRESSURE_SWAP_RATIO * pb && !rejection(b, tier, input)) {
+        candidates[index] = b; candidates[index + 1] = a;
+        swapReason = ` Pressure swap: ${canonicalModelRef(a)} -> ${canonicalModelRef(b)}.`;
+        break; // one adjacent-swap pass
+      }
+    }
+  }
+  const selected = candidates[0]!;
+  if (current && canonicalModelRef(current) === MODELS.fable && selected.ref !== current.ref && input.contextTokens > 0 && input.hasWorkContext !== false && !input.handoffReady) {
+    if (eligible.includes(current)) return decisionFor(current, "Retain Fable until a visible work-state handoff makes a model transition safe.", input.current?.effort);
+    return unavailable("Leaving unavailable Fable requires a visible work-state handoff before changing models.");
+  }
+  const reserveNote = quotaState(selected, input) === "reserve" ? " A soft reserve is used because quality takes priority." : "";
+  const unknownNote = quotaState(selected, input) === "unknown" ? " Quota is unknown; this is not evidence of unused capacity." : "";
+  return decisionFor(selected, `Selected the personal ${tier} loadout after capability and admission checks.${reserveNote}${unknownNote}${swapReason}`);
+}
