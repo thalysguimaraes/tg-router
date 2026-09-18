@@ -476,13 +476,49 @@ function preference(tier: RouteTier, phase: RoutePhase, input: RouteInput): stri
   }
 }
 
-/** Continuous quota pressure: remaining fraction per hour until reset, 0..1 scaled down as the reset nears. -1 when unknown. */
+/** Continuous quota headroom: remaining fraction per hour until reset. Larger = more slack. -1 when unknown. */
 export function pressure(snapshot: QuotaSnapshot | undefined, now: number): number {
   const windows = (snapshot?.windows ?? []).filter(window => finiteFraction(window.remainingFraction));
   if (!windows.length) return -1;
   return Math.min(...windows.map(window => window.remainingFraction! / Math.max(1, ((window.resetsAt ?? now + 3600000) - now) / 3600000)));
 }
 export const PRESSURE_SWAP_RATIO = 0.5;
+
+/**
+ * Cost class of a model. The allocator NEVER crosses upward: a task the cheapest
+ * qualified class can do is never given to a dearer class, however much slack
+ * the dearer class has. Within a class, headroom decides. Order is by what a
+ * turn costs you: free/flat workers, then mid subscriptions, then premium
+ * allowances that are the scarcest thing you own.
+ */
+const COST_CLASS: Record<string, number> = {
+  [MODELS.union]: 0, [MODELS.deepseek]: 0, [MODELS.glm]: 0, [MODELS.luna]: 0,
+  [MODELS.sol]: 1, [MODELS.sonnet]: 1,
+  [MODELS.astra]: 2, [MODELS.opus]: 2, [MODELS.fable]: 2,
+};
+const costClass = (model: RouteModel): number => {
+  if (model.payg === true || model.ref.startsWith("openrouter/") || model.ref.startsWith("deepseek/")) return 3;
+  return COST_CLASS[canonicalModelRef(model)] ?? 2;
+};
+
+/**
+ * Headroom the allocator ranks by. Sibling children already holding the same
+ * provider dilute it. Reserve state halves it so a reserve window is used only
+ * when nothing else in the class has slack. Unknown quota ranks below any
+ * known value: it is not evidence of capacity.
+ */
+function allocationHeadroom(model: RouteModel, input: RouteInput): number {
+  let value = pressure(model.quota, input.now ?? 0);
+  if (value < 0) return -1;
+  if (input.boundary === "child") {
+    const load = (input.siblings ?? [])
+      .filter(entry => entry.canonicalRef.split("/")[0] === canonicalModelRef(model).split("/")[0])
+      .reduce((sum, entry) => sum + entry.count, 0);
+    value = value / (1 + load);
+  }
+  if (!input.task?.highValue && quotaState(model, input) === "reserve") value = value / 2;
+  return value;
+}
 
 export function decideRoute(input: RouteInput): RouteDecision {
   const classification = classify(input);
@@ -540,7 +576,6 @@ export function decideRoute(input: RouteInput): RouteDecision {
   }
 
   const order = preference(tier, phase, input);
-  const paid = (model: RouteModel) => model.payg === true || model.ref.startsWith("openrouter/") || model.ref.startsWith("deepseek/");
   // A mapped gateway route owns its canonical identity for automatic routing.
   // Keep the direct route available to explicit pins, but do not silently fall
   // back to it when the gateway route is unavailable or fails in transport.
@@ -556,44 +591,31 @@ export function decideRoute(input: RouteInput): RouteDecision {
     rejected.push({ model: model.ref, reason: "a mapped 9Router route owns this canonical identity; direct fallback requires an explicit pin" });
     return false;
   });
+  // Allocation. Lexicographic by cost class (never cross upward), then by
+  // headroom within the class (spend the most abundant window first), then by
+  // the phase preference list as a tie-break, then gateway-first.
+  // Reserve and unknown quota are folded into headroom, not treated as walls:
+  // a reserve window in the cheapest class still beats spending a dearer class.
+  const headroomOf = new Map<RouteModel, number>(automaticEligible.map(model => [model, allocationHeadroom(model, input)]));
   const candidates = [...automaticEligible].sort((a, b) => {
-    if (paid(a) !== paid(b)) return paid(a) ? 1 : -1;
-    // Reserves are preferences among already qualified routes, never a license to lower quality.
-    if (!input.task?.highValue) {
-      const aReserve = quotaState(a, input) === "reserve";
-      const bReserve = quotaState(b, input) === "reserve";
-      if (aReserve !== bReserve) return aReserve ? 1 : -1;
-    }
+    const byClass = costClass(a) - costClass(b);
+    if (byClass !== 0) return byClass;
+    const ha = headroomOf.get(a)!, hb = headroomOf.get(b)!;
+    // Known headroom beats unknown; among known, more slack first, but only
+    // when the difference is meaningful. Small differences fall through to
+    // the reviewed preference order so quality within a class still counts.
+    if ((ha < 0) !== (hb < 0)) return ha < 0 ? 1 : -1;
+    if (ha >= 0 && hb >= 0 && (Math.min(ha, hb) < PRESSURE_SWAP_RATIO * Math.max(ha, hb))) return hb - ha;
     const aIndex = order.indexOf(canonicalModelRef(a)), bIndex = order.indexOf(canonicalModelRef(b));
     const byPreference = (aIndex < 0 ? order.length : aIndex) - (bIndex < 0 ? order.length : bIndex);
     if (byPreference !== 0) return byPreference;
-    // Equal canonical routes are unusual, but prefer the gateway deterministically.
     return Number(isGatewayModel(b)) - Number(isGatewayModel(a));
   });
   if (candidates.length === 0) return unavailable("No authenticated route meets capability, context, quota and payment constraints; the quality floor is unchanged.");
-  // Pressure-aware adjacent swap: prefer a qualified candidate with meaningfully less quota pressure.
-  // The swap stays within one already-maintained preference order and is disabled for high-value tasks.
-  let swapReason = "";
-  if (!input.task?.highValue) {
-    const siblingLoad = (canonical: string) => (input.siblings ?? [])
-      .filter(entry => entry.canonicalRef.split("/")[0] === canonical.split("/")[0])
-      .reduce((sum, entry) => sum + entry.count, 0);
-    for (let index = 0; index < candidates.length - 1; index++) {
-      const a = candidates[index]!, b = candidates[index + 1]!;
-      let pa = pressure(a.quota, input.now ?? 0);
-      let pb = pressure(b.quota, input.now ?? 0);
-      if (input.boundary === "child") {
-        pa = pa < 0 ? -1 : pa / (1 + siblingLoad(canonicalModelRef(a)));
-        pb = pb < 0 ? -1 : pb / (1 + siblingLoad(canonicalModelRef(b)));
-      }
-      // Re-run admission for b so the swap never promotes a rejected lower-tier model.
-      if (pa >= 0 && pb >= 0 && pa < PRESSURE_SWAP_RATIO * pb && !rejection(b, tier, input)) {
-        candidates[index] = b; candidates[index + 1] = a;
-        swapReason = ` Pressure swap: ${canonicalModelRef(a)} -> ${canonicalModelRef(b)}.`;
-        break; // one adjacent-swap pass
-      }
-    }
-  }
+  const runnerUp = candidates[1];
+  const swapReason = runnerUp && costClass(runnerUp) === costClass(candidates[0]!) && order.indexOf(canonicalModelRef(runnerUp)) < order.indexOf(canonicalModelRef(candidates[0]!))
+    ? ` Headroom: ${canonicalModelRef(candidates[0]!)} (${headroomOf.get(candidates[0]!)!.toFixed(3)}/h) over ${canonicalModelRef(runnerUp)} (${headroomOf.get(runnerUp)!.toFixed(3)}/h).`
+    : "";
   const selected = candidates[0]!;
   if (current && canonicalModelRef(current) === MODELS.fable && selected.ref !== current.ref && input.contextTokens > 0 && input.hasWorkContext !== false && !input.handoffReady) {
     if (eligible.includes(current)) return decisionFor(current, "Retain Fable until a visible work-state handoff makes a model transition safe.", input.current?.effort);
