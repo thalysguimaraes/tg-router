@@ -20,10 +20,16 @@ interface State { prices: Record<string, number>; seen: string[] }
 const load = (): State => { try { return JSON.parse(readFileSync(stateFile, 'utf8')); } catch { return { prices: {}, seen: [] }; } };
 const state = load();
 
+// Only models the gateway actually serves can be candidates. models.dev lists
+// everything a vendor publishes; probing an unroutable id 401s the account.
+const servable = new Set<string>();
+try {
+  const catalog = JSON.parse(readFileSync(join(root, '9router-catalog.json'), 'utf8')) as { models?: Array<{ id?: unknown }> };
+  for (const m of catalog.models ?? []) if (typeof m.id === 'string') servable.add(m.id.split('/').pop()!);
+} catch {}
+
 const { modelsDev, openrouter, sources } = await fetchCatalogs();
-const findings = analyzeRoster({ roster: ROSTER, modelsDev, openrouter, previousPrices: state.prices });
-const report: RosterReport = { checkedAt: new Date().toISOString(), sources, findings };
-writeFileSync(reportFile, JSON.stringify(report, null, 2) + '\n', { mode: 0o600 });
+const findings = analyzeRoster({ roster: ROSTER, modelsDev, openrouter, servable: servable.size ? servable : undefined, previousPrices: state.prices });
 
 // Remember current prices for next run's reprice detection.
 const prices: Record<string, number> = { ...state.prices };
