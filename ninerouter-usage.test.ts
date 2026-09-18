@@ -1,9 +1,9 @@
 import { describe, expect, test } from 'bun:test';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { NineRouterAccountUsage, NineRouterQuotaWindow, NineRouterProviderUsage, NineRouterUsageCache } from './ninerouter-usage';
-import { gatewayQuota, refreshNineRouterUsage } from './ninerouter-usage';
+import { gatewayQuota, refreshNineRouterUsage, nineRouterOrigin } from './ninerouter-usage';
 
 type FetchLike = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
 
@@ -266,7 +266,7 @@ describe('refreshNineRouterUsage secret timeout isolation', () => {
       // timeoutMs is 100ms here: if the secret read were still charged to the
       // HTTP budget (the old behaviour) its signal would abort before release
       // and this snapshot would carry errors.auth instead of totals.
-      const pending = refreshNineRouterUsage(root, { timeoutMs: 100, force: true, fetch: respond, opRead: secret.read });
+      const pending = refreshNineRouterUsage(root, { origin: 'https://gateway.test', timeoutMs: 100, force: true, fetch: respond, opRead: secret.read });
       // A real AbortSignal.timeout(100) is already armed, so this genuinely has
       // to outlast it; deterministic clock control cannot drive an abort that
       // the production code creates internally.
@@ -291,5 +291,45 @@ describe('refreshNineRouterUsage secret timeout isolation', () => {
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
+  });
+});
+
+describe('the admin origin is configuration, not a shipped constant', () => {
+  // Regression: the origin was briefly a hardcoded placeholder default, so an
+  // unset environment silently pointed every credentialed admin call at a
+  // non-existent host and every turn failed with a transport error.
+  const withRoot = (settings: unknown, run: (root: string) => void) => {
+    const root = mkdtempSync(join(tmpdir(), 'nr-origin-'));
+    try {
+      if (settings !== undefined) writeFileSync(join(root, 'settings.json'), JSON.stringify(settings));
+      run(root);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  };
+
+  test('resolves from the gateway baseUrl already in settings', () => {
+    withRoot({ gateway: { enabled: true, baseUrl: 'https://gateway.test/v1' } }, root => {
+      expect(nineRouterOrigin(root)).toBe('https://gateway.test');
+    });
+  });
+
+  test('missing, malformed or non-https configuration yields no origin rather than a guess', () => {
+    withRoot(undefined, root => expect(nineRouterOrigin(root)).toBeUndefined());
+    withRoot({ gateway: { enabled: true } }, root => expect(nineRouterOrigin(root)).toBeUndefined());
+    withRoot({ gateway: { enabled: true, baseUrl: 'not a url' } }, root => expect(nineRouterOrigin(root)).toBeUndefined());
+    withRoot({ gateway: { enabled: true, baseUrl: 'http://gateway.test/v1' } }, root => expect(nineRouterOrigin(root)).toBeUndefined());
+  });
+
+  test('an unconfigured origin reports unavailable and issues no request', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'nr-origin-'));
+    try {
+      let called = false;
+      const cache = await refreshNineRouterUsage(root, {
+        force: true,
+        fetch: async () => { called = true; return Response.json({}); },
+        opRead: async () => 'secret',
+      });
+      expect(called).toBe(false);
+      expect(cache.errors?.auth).toBe('unavailable');
+    } finally { rmSync(root, { recursive: true, force: true }); }
   });
 });

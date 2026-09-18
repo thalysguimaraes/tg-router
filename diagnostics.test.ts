@@ -113,7 +113,7 @@ test('registered gateway transport logs safe cause details and rethrows original
   const logs: Array<Record<string, unknown>> = [];
   let provider: { models: Array<{ id: string }>; streamSimple: (model: object, context: object, options: object) => Promise<Response> } | undefined;
   try {
-    writeFileSync(join(root, 'settings.json'), JSON.stringify({ gateway: { enabled: true } }));
+    writeFileSync(join(root, 'settings.json'), JSON.stringify({ gateway: { enabled: true, baseUrl: 'https://gateway.test/v1' } }));
     writeFileSync(join(root, '9router-catalog.json'), JSON.stringify({ models: [{ id: 'cx/gpt-6-astra' }] }));
     writeFileSync(join(root, '9router-key'), 'test-only-private-key', { mode: 0o600 });
     const controller = installNineRouter({ registerProvider: (_name: string, value: NonNullable<typeof provider>) => { provider = value; } }, {

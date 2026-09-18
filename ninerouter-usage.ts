@@ -4,13 +4,34 @@ import { createHash, randomUUID } from 'node:crypto';
 import type { QuotaAccount, QuotaSnapshot, QuotaState, QuotaWindow } from './policy';
 
 /**
- * The 9Router admin surface. Fixed for the lifetime of the process so callers
- * cannot redirect credentials mid-flight; the deployment supplies it through
- * the environment because the gateway is self-hosted and per-user. Both the
- * origin and the 1Password reference are deployment facts, not defaults worth
- * shipping.
+ * The 9Router admin surface. Self-hosted and per-user, so it is a deployment
+ * fact rather than a constant worth shipping: it is read from
+ * `settings.json` (`gateway.baseUrl`, the same value the transport already
+ * uses) and may be overridden by `OMP_NINEROUTER_ORIGIN`. Resolved once per
+ * root and cached, so a caller cannot redirect credentials mid-flight.
  */
-export const NINE_ROUTER_ORIGIN = process.env.OMP_NINEROUTER_ORIGIN ?? 'https://9router.example';
+const originCache = new Map<string, string | undefined>();
+export function nineRouterOrigin(root?: string): string | undefined {
+  const override = process.env.OMP_NINEROUTER_ORIGIN;
+  if (override) return safeOrigin(override);
+  if (!root) return undefined;
+  if (originCache.has(root)) return originCache.get(root);
+  let resolved: string | undefined;
+  try {
+    const settings = JSON.parse(readFileSync(join(root, 'settings.json'), 'utf8'));
+    resolved = safeOrigin(settings?.gateway?.baseUrl);
+  } catch { resolved = undefined; }
+  originCache.set(root, resolved);
+  return resolved;
+}
+/** Only an absolute https origin is usable; anything else is no configuration at all. */
+function safeOrigin(value: unknown): string | undefined {
+  if (typeof value !== 'string' || !value) return undefined;
+  try {
+    const url = new URL(value);
+    return url.protocol === 'https:' ? url.origin : undefined;
+  } catch { return undefined; }
+}
 export const NINE_ROUTER_USAGE_FILE = '9router-usage.json';
 export const NINE_ROUTER_PASSWORD_REF = process.env.OMP_NINEROUTER_OP_REF ?? 'op://Personal/9Router/password';
 export const NINE_ROUTER_CACHE_TTL_MS = 120_000;
@@ -85,6 +106,8 @@ export interface NineRouterUsageCache {
 export type NineRouterCache = NineRouterUsageCache;
 
 export interface NineRouterRefreshOptions {
+  /** Admin origin override; defaults to the one resolved from settings.json. */
+  origin?: string;
   /** Injectable for tests. The default is globalThis.fetch. */
   fetch?: FetchLike;
   /** Alias retained for callers that call the HTTP dependency a transport. */
@@ -385,8 +408,8 @@ function timeoutSignal(timeoutMs: number): AbortSignal {
   return AbortSignal.timeout(Math.max(100, Math.min(timeoutMs, 60_000)));
 }
 
-async function jsonRequest(fetchImpl: FetchLike, path: string, init: RequestInit, timeoutMs: number, parseBody = true): Promise<{ response: Response; body: any }> {
-  const response = await fetchImpl(`${NINE_ROUTER_ORIGIN}${path}`, { ...init, redirect: 'manual', signal: timeoutSignal(timeoutMs) });
+async function jsonRequest(fetchImpl: FetchLike, origin: string, path: string, init: RequestInit, timeoutMs: number, parseBody = true): Promise<{ response: Response; body: any }> {
+  const response = await fetchImpl(`${origin}${path}`, { ...init, redirect: 'manual', signal: timeoutSignal(timeoutMs) });
   if (!response.ok) throw new Error(SAFE_ERROR);
   if (!parseBody) return { response, body: undefined };
   try { return { response, body: await response.json() }; } catch { throw new Error(SAFE_ERROR); }
@@ -521,7 +544,9 @@ export function refreshNineRouterUsage(root: string, options: NineRouterRefreshO
   return pending;
 }
 /** Login once and return a cookie-bound request helper for admin mutations (e.g. priority swaps). */
-export async function nineRouterSession(options: { fetch?: FetchLike; opRead?: (ref: string, signal?: AbortSignal) => Promise<string>; timeoutMs?: number } = {}): Promise<{ request: (path: string, init?: RequestInit) => Promise<any> } | undefined> {
+export async function nineRouterSession(options: { root?: string; origin?: string; fetch?: FetchLike; opRead?: (ref: string, signal?: AbortSignal) => Promise<string>; timeoutMs?: number } = {}): Promise<{ request: (path: string, init?: RequestInit) => Promise<any> } | undefined> {
+  const origin = options.origin ?? nineRouterOrigin(options.root);
+  if (!origin) return undefined;
   const timeoutMs = options.timeoutMs ?? 15_000;
   const fetchImpl = options.fetch ?? globalThis.fetch.bind(globalThis);
   const opRead = options.opRead ?? ((reference: string, signal?: AbortSignal) => readPasswordFromOp(reference, signal ?? timeoutSignal(timeoutMs)));
@@ -529,7 +554,7 @@ export async function nineRouterSession(options: { fetch?: FetchLike; opRead?: (
   try {
     const password = String(await opRead(NINE_ROUTER_PASSWORD_REF, timeoutSignal(timeoutMs))).trim();
     if (!password) throw new Error(SAFE_ERROR);
-    const login = await jsonRequest(fetchImpl, '/api/auth/login', {
+    const login = await jsonRequest(fetchImpl, origin, '/api/auth/login', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ password }),
@@ -540,7 +565,7 @@ export async function nineRouterSession(options: { fetch?: FetchLike; opRead?: (
     return undefined;
   }
   return {
-    request: (path: string, init: RequestInit = {}) => jsonRequest(fetchImpl, path, { ...init, headers: { cookie, ...(init.headers ?? {}) } }, timeoutMs),
+    request: (path: string, init: RequestInit = {}) => jsonRequest(fetchImpl, origin, path, { ...init, headers: { cookie, ...(init.headers ?? {}) } }, timeoutMs),
   };
 }
 
@@ -549,6 +574,13 @@ async function refreshUsageOnce(root: string, options: NineRouterRefreshOptions 
   const observedAt = now();
   const previous = readNineRouterUsage(root);
   if (!options.force && isFresh(previous, observedAt)) return previous;
+  const origin = options.origin ?? nineRouterOrigin(root);
+  if (!origin) {
+    // No configured gateway is unavailable evidence, not an empty quota.
+    const unavailable = markUnavailable(previous, 'auth', observedAt);
+    atomicWrite(root, unavailable);
+    return unavailable;
+  }
   const timeoutMs = options.timeoutMs ?? 15_000;
   // A cache miss must be able to pay for `op read` without eating the HTTP budget.
   const secretTimeoutMs = options.secretTimeoutMs ?? Math.max(timeoutMs, 15_000);
@@ -568,7 +600,7 @@ async function refreshUsageOnce(root: string, options: NineRouterRefreshOptions 
 
   let cookie: string;
   try {
-    const login = await jsonRequest(fetchImpl, '/api/auth/login', {
+    const login = await jsonRequest(fetchImpl, origin, '/api/auth/login', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ password }),
@@ -585,7 +617,7 @@ async function refreshUsageOnce(root: string, options: NineRouterRefreshOptions 
   let stats: NineRouterTotals | undefined;
   let statsFailed = false;
   try {
-    const result = await jsonRequest(fetchImpl, '/api/usage/stats?period=today', { headers: { cookie } }, timeoutMs);
+    const result = await jsonRequest(fetchImpl, origin, '/api/usage/stats?period=today', { headers: { cookie } }, timeoutMs);
     stats = totalsFromStats(result.body);
     if (!stats) throw new Error(SAFE_ERROR);
   } catch { statsFailed = true; }
@@ -593,7 +625,7 @@ async function refreshUsageOnce(root: string, options: NineRouterRefreshOptions 
   let connections: Connection[] = [];
   let providersFailed = false;
   try {
-    const result = await jsonRequest(fetchImpl, '/api/providers', { headers: { cookie } }, timeoutMs);
+    const result = await jsonRequest(fetchImpl, origin, '/api/providers', { headers: { cookie } }, timeoutMs);
     connections = activeConnections(result.body);
   } catch { providersFailed = true; }
 
@@ -602,7 +634,7 @@ async function refreshUsageOnce(root: string, options: NineRouterRefreshOptions 
   if (!providersFailed) {
     const results = await Promise.all(connections.map(async connection => {
       try {
-        const result = await jsonRequest(fetchImpl, `/api/usage/${encodeURIComponent(connection.id)}`, { headers: { cookie } }, timeoutMs);
+        const result = await jsonRequest(fetchImpl, origin, `/api/usage/${encodeURIComponent(connection.id)}`, { headers: { cookie } }, timeoutMs);
         return { connection, account: accountFromUsage(connection, result.body) };
       } catch {
         usageFailed = true;

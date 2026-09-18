@@ -203,7 +203,7 @@ Environment — deployment facts, no personal defaults shipped:
 
 | Variable | Default | Effect |
 |---|---|---|
-| `OMP_NINEROUTER_ORIGIN` | `https://9router.example` | your 9Router origin. Fixed at process start so a caller cannot redirect credentials mid-flight. |
+| `OMP_NINEROUTER_ORIGIN` | from `gateway.baseUrl` | overrides the 9Router origin. Normally unset: the origin is read from `settings.json`, where the transport already needs it. Must be `https`; resolved once at install and then fixed, so a caller cannot redirect credentials mid-flight. With neither configured the gateway stays disabled rather than guessing a host. |
 | `OMP_NINEROUTER_OP_REF` | `op://Personal/9Router/password` | 1Password reference for the gateway admin password. |
 | `OMP_ROUTER_TYPESAFE_OP_REF` | `op://Personal/AgentKit - Typesafe/password` | 1Password reference for the TypeSafe key used by `/route key`. |
 | `TYPESAFE_API_KEY` | — | supplies the key directly, bypassing 1Password. |
@@ -214,7 +214,7 @@ Environment — deployment facts, no personal defaults shipped:
 | Key | Default | Effect |
 |---|---|---|
 | `enabled` | `true` | `false` disables routing entirely; omp keeps whatever model is selected. |
-| `gateway` | — | 9Router transport config; `gateway.enabled` toggles it. |
+| `gateway` | — | 9Router transport config. `gateway.enabled` toggles it; `gateway.baseUrl` is your gateway's `/v1` endpoint and is also where the admin origin comes from. |
 | `paidFallbackEnabled` | `false` | allows falling back to paid OpenRouter routes when no subscription route qualifies. Every paid call still needs a reserved budget. |
 | `dailyCashCapUsd` | `10` | hard daily ceiling for paid spend. |
 | `monthlyCashCapUsd` | `30` | hard monthly ceiling. |
@@ -233,7 +233,7 @@ writes into omp's own credential store.
 ## Verify
 
 ```sh
-bun test            # 146 tests: policy, quota, ledger, classifier contract, pipeline, admission hooks, probe, load safety
+bun test            # 149 tests: policy, quota, ledger, classifier contract, pipeline, admission hooks, probe, load safety
 bun run typecheck   # strict, every owned module including index.ts
 ```
 

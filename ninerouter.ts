@@ -21243,8 +21243,23 @@ function buildModel(spec) {
 // src/ninerouter.ts
 var NINEROUTER_PROVIDER = "9router";
 var NINEROUTER_API = "personal-nine-router";
-var NINEROUTER_ORIGIN = process.env.OMP_NINEROUTER_ORIGIN ?? "https://9router.example";
+var NINEROUTER_FALLBACK_ORIGIN = "https://9router.example";
+// The gateway is self-hosted and per-user, so its origin is configuration:
+// settings.json `gateway.baseUrl`, overridable by OMP_NINEROUTER_ORIGIN.
+// Resolved once at install and then fixed for the process, so a caller can
+// never redirect a credentialed request mid-flight.
+var NINEROUTER_ORIGIN = NINEROUTER_FALLBACK_ORIGIN;
 var NINEROUTER_BASE_URL = `${NINEROUTER_ORIGIN}/v1`;
+function resolveNineRouterOrigin(settings) {
+  const candidate = process.env.OMP_NINEROUTER_ORIGIN ?? settings?.gateway?.baseUrl;
+  if (typeof candidate !== "string" || !candidate) return undefined;
+  try {
+    const url = new URL(candidate);
+    return url.protocol === "https:" ? url.origin : undefined;
+  } catch {
+    return undefined;
+  }
+}
 var NINEROUTER_MAX_OUTPUT_TOKENS = 32768;
 var DEFAULT_CONTEXT_WINDOW = 128000;
 var SUBSCRIBED_PREFIXES = new Set(["cc", "cx", "ocg", "glm"]);
@@ -21592,6 +21607,11 @@ function installNineRouter(pi, options) {
   const settings = readJson(join(root, "settings.json"));
   if (settings?.gateway?.enabled !== true)
     return disabledController(options.log, "gateway-disabled");
+  const resolvedOrigin = resolveNineRouterOrigin(settings);
+  if (!resolvedOrigin)
+    return disabledController(options.log, "gateway-origin-unconfigured");
+  NINEROUTER_ORIGIN = resolvedOrigin;
+  NINEROUTER_BASE_URL = `${resolvedOrigin}/v1`;
   if (!pi || typeof pi.registerProvider !== "function")
     return disabledController(options.log, "provider-registration-unavailable");
   if (typeof options.nativeStreamSimple !== "function")

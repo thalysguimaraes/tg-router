@@ -448,7 +448,7 @@ export default function personalRouter(pi:any) {
         if(targetQuota&&steerProvider&&Date.now()-(steerThrottle[steerProvider]??0)>=STEER_INTERVAL_MS){
           steerThrottle[steerProvider]=Date.now();
           const provider=steerProvider;
-          steerAccounts({provider,snapshot:targetQuota,session:()=>nineRouterSession(),log}).catch(()=>{});
+          steerAccounts({provider,snapshot:targetQuota,session:()=>nineRouterSession({root}),log}).catch(()=>{});
         }
       }
       if(decision.action==='unavailable'&&cfg.paidFallbackEnabled&&!state.pin){
