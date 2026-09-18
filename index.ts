@@ -320,7 +320,9 @@ export default function personalRouter(pi:any) {
         const gateway=isGateway(m);
         const description=gateway?nineRouter.describe(modelRef):undefined;
         const canonicalRef=description?.canonicalRef??canonical(m);
-        const unavailableUntil=state.unavailableModels?.[modelRef];
+        // Either signal steers automatic allocation away; only the terminal
+        // one refuses an attempt outright (see before_provider_request).
+        const unavailableUntil=Math.max(state.unavailableModels?.[modelRef]??0,state.blockedModels?.[modelRef]??0);
         const goModelId=canonicalRef?.startsWith('opencode-go/')?canonicalRef.slice('opencode-go/'.length):undefined;
         return {
           ref:modelRef,
@@ -516,15 +518,19 @@ export default function personalRouter(pi:any) {
     }
   });
 
-  /** Current facts for one attempt: latest context size, runtime backoffs and gateway usage; never the first snapshot. */
+  /**
+   * Current facts for one attempt: latest context size and gateway usage,
+   * never the first snapshot. A transient runtime backoff is deliberately NOT
+   * folded in here: it steers the next routing decision, but refusing the
+   * attempt on it would strand a session whose only route just blipped.
+   */
   function attemptFacts(ctx:any,record:any,modelRef:string){
     const base=record.models.find((entry:any)=>entry.ref===modelRef);
     if(!base)return undefined;
     const now=Date.now();
-    const unavailableUntil=state.unavailableModels?.[modelRef];
     const catalog=ctx.models.list().find((m:any)=>ref(m)===modelRef);
     const gatewayQuota=catalog&&isGateway(catalog)?gatewayQuotaFor(catalog,readGatewayUsage()):undefined;
-    const quota=unavailableUntil>now?({observedAt:now,state:'depleted',windows:[{id:'runtime-model-backoff',exhausted:true,resetsAt:unavailableUntil}]} satisfies QuotaSnapshot):gatewayQuota??base.quota;
+    const quota=gatewayQuota??base.quota;
     const reported=ctx.getContextUsage?.()?.tokens;
     const contextTokens=Number.isFinite(reported)&&reported>0?Math.max(reported,record.contextTokens):record.contextTokens;
     return {model:{...base,quota},input:{prompt:'',now,models:record.models,contextTokens,outputMarginTokens:record.outputMarginTokens,needsImages:record.needsImages,needsTools:record.needsTools,quotaMaxAgeMs:record.quotaMaxAgeMs,current:{model:record.model,tier:record.tier}}};
@@ -539,12 +545,18 @@ export default function personalRouter(pi:any) {
     // router already knows. The committed-tier floor is automatic-mode only.
     const pinned=!!state.pin;
     if(!state.disabled&&settings().enabled!==false&&modelRef){
-      const blockedUntil=state.unavailableModels?.[modelRef];
+      // Only a TERMINAL block refuses an attempt outright. A transient
+      // backoff is allocation input, not grounds to strand the session.
+      // No decision record at all means the router has not decided yet
+      // (first call, or a retry after a failure cleared it) — that is not
+      // evidence the route is wrong. Only a record that exists and does not
+      // cover this model is real drift.
+      const blockedUntil=state.blockedModels?.[modelRef];
       const facts=lastAttemptContext?attemptFacts(ctx,lastAttemptContext,modelRef):undefined;
-      const admitted=blockedUntil>Date.now()?{ok:false as const,reason:'route is blocked by an observed runtime failure'}
+      const admitted=blockedUntil>Date.now()?{ok:false as const,reason:'route is not served by the upstream'}
         :facts?admitAttempt(facts.model,facts.input,pinned?undefined:lastAttemptContext.tier)
-        :pinned?{ok:true as const}
-        :{ok:false as const,reason:lastAttemptContext?'route was never admitted by the routing decision':'no routing decision covers this attempt'};
+        :!lastAttemptContext||pinned?{ok:true as const}
+        :{ok:false as const,reason:'route was never admitted by the routing decision'};
       if(!admitted.ok){
         blocked=true;ctx.abort();log('attempt-blocked',{model:modelRef,decided:lastAttemptContext?.model,pinned,reason:admitted.reason});
         notify(`Routing: rota atual inválida para esta chamada (${admitted.reason}).`,'warning');
@@ -567,23 +579,30 @@ export default function personalRouter(pi:any) {
     if(m.provider==='openrouter')await reconcile(ctx);
     if(m.stopReason==='error'){
       state.providerFailed=true;
-      // A model the upstream does not serve is a permanent property of the
-      // route, not a transient outage: retrying burns the whole retry budget
-      // against a fixed answer. Block it for a day and release a pin that
-      // points at it, so routing can pick something that exists.
+      // Two different facts, two different lifetimes. A model the upstream
+      // does not serve is PERMANENT: it can never answer, so it is blocked
+      // outright and a pin pointing at it is released. Everything else —
+      // timeouts, dropped connections, 5xx — is TRANSIENT: it steers
+      // automatic allocation away for a few minutes but must never refuse an
+      // attempt, or one network blip strands a session with no route at all.
       const permanent=unsupportedModel(m.error??m.errorMessage);
-      // An unidentifiable responder cannot be blocked by ref; the profile path still applies.
-      if(!permanent&&m.provider==='anthropic'&&state.claudeProfile){state.unavailableProfiles={...state.unavailableProfiles,[state.claudeProfile]:Date.now()+180000};}
-      else if(actual)state.unavailableModels={...state.unavailableModels,[actual]:Date.now()+(permanent?86_400_000:180_000)};
       if(permanent){
+        if(actual){
+          state.blockedModels={...state.blockedModels,[actual]:Date.now()+86_400_000};
+          delete state.unavailableModels?.[actual];
+        }
         log('model-unsupported',{model:actual,pinReleased:state.pin?.model===actual});
         if(state.pin?.model===actual){delete state.pin;notify(`Routing: ${actual} não é servido pelo upstream; pin removido e roteamento automático retomado.`,'warning');}
         else notify(`Routing: ${actual} não é servido pelo upstream; rota bloqueada.`,'warning');
       }
+      // An unidentifiable responder cannot be backed off by ref; the profile path still applies.
+      else if(m.provider==='anthropic'&&state.claudeProfile){state.unavailableProfiles={...state.unavailableProfiles,[state.claudeProfile]:Date.now()+180000};}
+      else if(actual)state.unavailableModels={...state.unavailableModels,[actual]:Date.now()+180_000};
       save();
     } else if(m.stopReason==='stop'||m.stopReason==='toolUse'){
       state.providerFailed=false;
       if(actual&&state.unavailableModels)delete state.unavailableModels[actual];
+      if(actual&&state.blockedModels)delete state.blockedModels[actual];
       if(m.provider==='anthropic'&&state.claudeProfile&&state.unavailableProfiles)delete state.unavailableProfiles[state.claudeProfile];
       save();
     }
@@ -595,7 +614,7 @@ export default function personalRouter(pi:any) {
     if(!unsupportedModel(event?.errorMessage))return;
     const target=lastActual??ref(ctxCurrent?.models?.current());
     if(!target)return;
-    state.unavailableModels={...state.unavailableModels,[target]:Date.now()+86_400_000};
+    state.blockedModels={...state.blockedModels,[target]:Date.now()+86_400_000};
     const pinReleased=state.pin?.model===target;
     if(pinReleased)delete state.pin;
     log('model-unsupported',{model:target,pinReleased,duringRetry:true});

@@ -86,19 +86,29 @@ user turn / child spawn / handoff
                         included, is re-checked against the route it will use
                         (`admitAttempt`). The DECISION is frozen (route, committed
                         tier, capability snapshots); the FACTS are rebuilt per
-                        attempt: current context size, runtime backoffs, latest
-                        local gateway usage, current clock. A pin chooses the
-                        route but is still checked against those facts; only
-                        the committed-tier floor is automatic-mode only. No
+                        attempt: current context size, latest local gateway
+                        usage, current clock. A pin chooses the route but is
+                        still checked against those facts; only the
+                        committed-tier floor is automatic-mode only. No
                         reclassification, no spend.
 ```
 
-A failure that retrying cannot fix is treated as terminal. 9Router wraps an
-upstream `401 Model <id> is not supported` in a `503`, which the host retries;
-pinned to such a model the session burned all ten retries. `unsupportedModel`
-recognizes it from `auto_retry_start` (retries emit no `message_end`), blocks
-the ref for a day, releases a pin that points at it, and the next attempt is
-refused by admission instead of retried. Genuine `503`s stay retryable.
+### Terminal vs transient failure
+
+A failure only refuses the next attempt when retrying genuinely cannot help.
+The two cases are kept apart deliberately, because conflating them is how a
+router strands a session:
+
+| | example | lifetime | effect |
+|---|---|---|---|
+| **terminal** | 9Router wraps an upstream `401 Model <id> is not supported` in a retryable `503` | 24h | route blocked, a pin pointing at it released, next attempt refused instead of retried |
+| **transient** | timeout, dropped connection, genuine `5xx` | 3min | steers the *next* routing decision away; never refuses an attempt |
+
+Terminal failures are recognized from `auto_retry_start` as well, because
+retries emit no `message_end` — otherwise the host spends its whole retry
+budget on a permanent condition. A transient failure must never be able to
+refuse an attempt: the route it would block may be the only one the session
+has, and "the network blipped" is not evidence the route is wrong.
 
 Classification happens only at a safe boundary: a new user task, a spawned
 child, an explicit handoff, or a provider failure. Never mid tool-loop.
@@ -223,7 +233,7 @@ writes into omp's own credential store.
 ## Verify
 
 ```sh
-bun test            # 140 tests: policy, quota, ledger, classifier contract, pipeline, probe, load safety
+bun test            # 146 tests: policy, quota, ledger, classifier contract, pipeline, admission hooks, probe, load safety
 bun run typecheck   # strict, every owned module including index.ts
 ```
 
