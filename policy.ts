@@ -266,7 +266,6 @@ export const MODELS = {
   luna: "openai-codex/gpt-5.6-luna",
   deepseek: "opencode-go/deepseek-v4.1-flash",
   glm: "opencode-go/glm-5.3-flash",
-  union: "opencode-go/union-alpha",
   fable: "anthropic/claude-fable-5-1",
   sonnet: "anthropic/claude-sonnet-5",
   opus: "anthropic/claude-opus-5",
@@ -279,8 +278,6 @@ const QUALIFICATIONS: Record<string, RouteTier[]> = {
   [MODELS.luna]: ["mechanical"],
   [MODELS.deepseek]: ["mechanical", "bounded"],
   [MODELS.glm]: ["mechanical", "bounded"],
-  // Free stealth model; Terminal-Bench places it above Sol but it has no premium track record here.
-  [MODELS.union]: ["mechanical", "bounded", "execution"],
   [MODELS.sol]: ["mechanical", "bounded", "execution"],
   [MODELS.sonnet]: ["mechanical", "bounded", "execution"],
   [MODELS.astra]: TIERS,
@@ -451,8 +448,8 @@ function rejection(model: RouteModel, tier: RouteTier, input: RouteInput, isManu
 function preference(tier: RouteTier, phase: RoutePhase, input: RouteInput): string[] {
   const now = input.now ?? 0;
   const promo = input.promotion?.active === true && fresh(input.promotion.confirmedAt, now, input.promotionMaxAgeMs ?? 3_600_000);
-  // Union is free and benches above the Go workers; it leads the worker pool while the promo lasts.
-  const workers = promo ? [MODELS.union, MODELS.deepseek, MODELS.glm] : [MODELS.union, MODELS.glm, MODELS.deepseek];
+  // A fresh confirmed Go promotion puts DeepSeek ahead of GLM for the worker pool.
+  const workers = promo ? [MODELS.deepseek, MODELS.glm] : [MODELS.glm, MODELS.deepseek];
   if (phase === "review") return [MODELS.fable, MODELS.astra];
   if (phase === "implementation" && tier !== "bounded") {
     // Repeated quality failures must move implementation up the quality
@@ -470,7 +467,7 @@ function preference(tier: RouteTier, phase: RoutePhase, input: RouteInput): stri
   switch (tier) {
     case "mechanical": return [MODELS.luna, MODELS.sol, ...workers, MODELS.sonnet, MODELS.astra, MODELS.opus, MODELS.fable];
     case "bounded": return [...workers, MODELS.sol, MODELS.sonnet, MODELS.astra, MODELS.opus, MODELS.fable];
-    case "execution": return [MODELS.union, MODELS.sol, MODELS.sonnet, MODELS.astra, MODELS.opus, MODELS.fable];
+    case "execution": return [MODELS.sol, MODELS.sonnet, MODELS.astra, MODELS.opus, MODELS.fable];
     case "complex": return [MODELS.astra, MODELS.opus, MODELS.fable];
     case "premium": return [MODELS.fable, MODELS.astra, MODELS.opus];
   }
@@ -492,7 +489,7 @@ export const PRESSURE_SWAP_RATIO = 0.5;
  * allowances that are the scarcest thing you own.
  */
 const COST_CLASS: Record<string, number> = {
-  [MODELS.union]: 0, [MODELS.deepseek]: 0, [MODELS.glm]: 0, [MODELS.luna]: 0,
+  [MODELS.deepseek]: 0, [MODELS.glm]: 0, [MODELS.luna]: 0,
   [MODELS.sol]: 1, [MODELS.sonnet]: 1,
   [MODELS.astra]: 2, [MODELS.opus]: 2, [MODELS.fable]: 2,
 };

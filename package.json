@@ -7,7 +7,8 @@
   "scripts": {
     "test": "bun test",
     "typecheck": "tsc --noEmit -p tsconfig.json",
-    "link": "bun run scripts/link.ts"
+    "link": "bun run scripts/link.ts",
+    "roster-check": "bun run scripts/roster-check.ts"
   },
   "devDependencies": {
     "@types/node": "^22",

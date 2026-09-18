@@ -89,8 +89,17 @@ export interface NineRouterRefreshOptions {
   readPassword?: (reference: string, signal?: AbortSignal) => Promise<string> | string;
   /** Injectable clock to make TTL and reset tests deterministic. */
   now?: () => number;
-  /** Network and child-process timeout. */
+  /** Per-request HTTP timeout. */
   timeoutMs?: number;
+  /**
+   * Timeout for the secret read alone. It is deliberately separate from
+   * `timeoutMs`: a cached keychain read returns in ~16ms, but a cache miss
+   * falls through to `op read`, which costs 2.7-4.4s and may raise a biometric
+   * prompt. Charging that to the HTTP budget made a 4s refresh abort during its
+   * own credential fetch and cache `errors.auth`, which is what kept 9Router
+   * telemetry permanently unavailable.
+   */
+  secretTimeoutMs?: number;
   /** Bypass this local cache only, never force/reset the upstream quota. */
   force?: boolean;
   /** Optional rolling 30-day total. It is explicitly period=30d, never calendar-month data. */
@@ -535,11 +544,13 @@ async function refreshUsageOnce(root: string, options: NineRouterRefreshOptions 
   const previous = readNineRouterUsage(root);
   if (!options.force && isFresh(previous, observedAt)) return previous;
   const timeoutMs = options.timeoutMs ?? 15_000;
+  // A cache miss must be able to pay for `op read` without eating the HTTP budget.
+  const secretTimeoutMs = options.secretTimeoutMs ?? Math.max(timeoutMs, 15_000);
   const fetchImpl = options.fetch ?? options.transport ?? globalThis.fetch.bind(globalThis);
-  const opRead = options.opRead ?? options.readPassword ?? ((reference: string, signal?: AbortSignal) => readPasswordFromOp(reference, signal ?? timeoutSignal(timeoutMs)));
+  const opRead = options.opRead ?? options.readPassword ?? ((reference: string, signal?: AbortSignal) => readPasswordFromOp(reference, signal ?? timeoutSignal(secretTimeoutMs)));
   let password: string;
   try {
-    password = String(await opRead(NINE_ROUTER_PASSWORD_REF, timeoutSignal(timeoutMs))).trim();
+    password = String(await opRead(NINE_ROUTER_PASSWORD_REF, timeoutSignal(secretTimeoutMs))).trim();
     if (!password) throw new Error(SAFE_ERROR);
   } catch {
     // Advance the attempt clock and mark any retained provider rows unavailable;

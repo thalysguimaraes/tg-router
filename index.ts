@@ -22,7 +22,7 @@ import { createJevClient, JEVS_CLASSIFIER_MODEL, JEV_INPUT_USD_PER_MTOK } from '
 import { resolveClassification, type RouteTier, type SemanticAssessment, type SemanticMode } from './policy';
 
 const VERSION='1.2.0';
-const REFS=['openai-codex/gpt-6-astra','openai-codex/gpt-5.6-sol','openai-codex/gpt-5.6-luna','anthropic/claude-fable-5-1','anthropic/claude-sonnet-5','anthropic/claude-opus-5','opencode-go/deepseek-v4.1-flash','opencode-go/glm-5.3-flash','opencode-go/union-alpha'];
+const REFS=['openai-codex/gpt-6-astra','openai-codex/gpt-5.6-sol','openai-codex/gpt-5.6-luna','anthropic/claude-fable-5-1','anthropic/claude-sonnet-5','anthropic/claude-opus-5','opencode-go/deepseek-v4.1-flash','opencode-go/glm-5.3-flash'];
 const BACKUPS=['openrouter/openai/gpt-5.6-sol','openrouter/anthropic/claude-opus-5','openrouter/openai/gpt-6-astra'];
 const STEER_INTERVAL_MS=600_000;
 const steerThrottle:Record<string,number>={};
@@ -141,7 +141,9 @@ export default function personalRouter(pi:any) {
   function refreshGatewayUsage(now=Date.now()){
     if(!nineRouter?.enabled||usageRefreshPromise||now-usageRefreshAt<NINE_ROUTER_REFRESH_THROTTLE_MS)return;
     usageRefreshAt=now;
-    usageRefreshPromise=Promise.resolve(refreshNineRouterUsage(root,{timeoutMs:4000})).then((cache:any)=>{gatewayUsage=cache;}).catch((error:any)=>{log('ninerouter-usage-refresh-error',{errorType:error?.name??'Error'});}).finally(()=>{usageRefreshPromise=undefined;});
+    // 2500ms is the HTTP budget only; the secret read has its own timeout, so a
+    // biometric cache miss no longer aborts the refresh mid-credential-fetch.
+    usageRefreshPromise=Promise.resolve(refreshNineRouterUsage(root,{timeoutMs:2500})).then((cache:any)=>{gatewayUsage=cache;}).catch((error:any)=>{log('ninerouter-usage-refresh-error',{errorType:error?.name??'Error'});}).finally(()=>{usageRefreshPromise=undefined;});
   }
   function gatewayQuotaFor(model:any,cache:any){
     if(!isGateway(model))return undefined;

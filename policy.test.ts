@@ -106,7 +106,7 @@ test("a subscription route beats a paid route in the same class", () => {
 // longer a user command: the floor raises vague or under-classified prompts
 // and never lowers an explicit one.
 const workerModel: RouteModel = {
-  ref: "9router/ocg/union-alpha", canonicalRef: MODELS.union, gateway: true, authenticated: true,
+  ref: "9router/ocg/glm-5.3-flash", canonicalRef: MODELS.glm, gateway: true, authenticated: true,
   contextWindow: 200_000, supportsTools: true, supportsImages: false, validated: { tools: true, reasoning: true },
   quota: { observedAt: NOW - 1_000, state: "healthy", windows: [{ id: "daily", remainingFraction: 0.9 }] },
 };
