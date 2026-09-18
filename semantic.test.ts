@@ -513,3 +513,57 @@ describe('rounded probability distributions are accepted', () => {
     if (!result.ok) expect(result.reason).toBe('invalid-schema');
   });
 });
+
+describe('session signals block downgrades deterministically', () => {
+  // Measured against the outcome corpus: struggle rate 15% after an errored
+  // turn vs 4% after a clean one; 25% on a session's first turn vs ~4% later.
+  // These guards do not depend on what Jev says.
+  const confidentCheap = {
+    usable: true,
+    tier: { selected: 'bounded', probabilities: { bounded: 0.96, execution: 0.02, complex: 0.01, premium: 0.01 }, confidence: 0.95 },
+    phase: { selected: 'implementation' },
+    highImpactProbability: 0.02,
+    underspecifiedProbability: 0.05,
+    truncated: false,
+  } as const;
+  const resolve = async (extra: Record<string, unknown>) => {
+    const { resolveClassification } = await import('./policy');
+    return resolveClassification({
+      assessment: confidentCheap as never,
+      rulesClassification: { tier: 'complex', phase: 'investigation' },
+      mode: 'calibrated',
+      ...extra,
+    } as never);
+  };
+
+  test('an errored previous turn blocks a downgrade', async () => {
+    const result = await resolve({ previousTurnErrored: true, priorUserTurns: 5 });
+    expect(result.tier).toBe('complex');
+    expect(result.reason).toContain('previous turn errored');
+  });
+
+  test('the first turn of a session blocks a downgrade', async () => {
+    const result = await resolve({ previousTurnErrored: false, priorUserTurns: 0 });
+    expect(result.tier).toBe('complex');
+    expect(result.reason).toContain('first turn');
+  });
+
+  test('a clean, established session lets the other gates decide', async () => {
+    const result = await resolve({ previousTurnErrored: false, priorUserTurns: 5 });
+    expect(result.reason).not.toContain('previous turn errored');
+    expect(result.reason).not.toContain('first turn');
+  });
+
+  test('the routing context carries the signals as structured fields only', () => {
+    const context = buildRoutingContext({
+      taskGoal: 'g', currentUserRequest: 'r', boundary: 'user',
+      hasImages: false, toolsRequired: true, confirmedQualityFailures: 0,
+      previousTurnErrored: true, priorUserTurns: 3, previousTurnToolCalls: 41,
+    });
+    expect(context.observations.previousTurnErrored).toBe(true);
+    expect(context.observations.priorUserTurns).toBe(3);
+    expect(context.observations.previousTurnToolCalls).toBe(41);
+    // Redacted free text stays out of the observations block.
+    expect(Object.values(context.observations).every(v => typeof v !== 'string')).toBe(true);
+  });
+});

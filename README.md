@@ -87,7 +87,7 @@ state (ledger, quota cache, decision log, session corpus) lives in
 ## Verify
 
 ```sh
-bun test            # 92 tests; policy, quota, ledger, classifier contract, load safety
+bun test            # 96 tests; policy, quota, ledger, classifier contract, load safety
 bun run typecheck   # strict, owned modules
 ```
 
@@ -132,6 +132,20 @@ Labels are therefore by outcome:
 
 Any classification change is replayed against these. The invariant that
 gates shipping: **0 `cheap-struggled` turns may move down**.
+
+### Session signals
+
+Two measured signals are computed from the session at decision time and act
+as deterministic downgrade guards, independent of anything Jev says:
+
+| signal | measured struggle rate | effect |
+|---|---|---|
+| previous assistant turn errored | 15% vs 4% after a clean turn | blocks downgrade |
+| first user turn of a session | 25% vs ~4% later | blocks downgrade |
+
+They are also sent to Jev as structured `observations` fields, never as prose.
+The previous turn's tool-call count is carried for traces; on its own it did
+not separate outcomes.
 
 ### Rules derived from the corpus
 
@@ -237,5 +251,6 @@ is fixable there with the same corpus.
 - The no-keyword default still lands on `complex` when there is no prior
   phase. More corpus-backed rules can chip at it; each must pass the
   0-struggled-moved-down replay.
-- Structured enrichment of the Jev context (last turn's tool/edit counts,
-  dirty-file count, error history) is the next lever for semantic quality.
+- Structured session signals reach Jev but move its answers only slightly
+  (reasoning depth 1.9 → 2.4 as difficulty stacks). Their real value is in
+  the deterministic guard, not the classifier.

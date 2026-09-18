@@ -178,6 +178,10 @@ export interface ResolveAssessmentInput {
   floorTier?: RouteTier;
   /** True when a child's inherited phase must not be reinterpreted. */
   floorLocksPhase?: boolean;
+  /** The previous assistant turn errored. Measured 4x struggle rate; blocks downgrades. */
+  previousTurnErrored?: boolean;
+  /** Prior user turns in the session; 0 means first turn. Measured 6x struggle rate; blocks downgrades. */
+  priorUserTurns?: number;
   highValue?: boolean;
   failedQualityChecks?: number;
 }
@@ -222,9 +226,15 @@ export function resolveClassification(input: ResolveAssessmentInput): { tier: Ro
     //    mutations (deleting production rows, changing token expiry, rotating
     //    live keys) score 0.94-0.98 and the 0.5 gate catches those decisively.
     const reviewPhase = assessment.phase?.selected === "review" || input.rulesClassification.phase === "review";
+    // Session signals measured against the outcome corpus (scripts/relabel.ts):
+    // a cheap model struggled 15% of the time on the turn after an error vs 4%
+    // after a clean one, and 25% on a session's first turn vs ~4% later. Both
+    // are deterministic and block a downgrade regardless of what Jev says.
     const downgradeGuard =
       input.highValue === true ? "high-value work never downgrades"
       : (input.failedQualityChecks ?? 0) > 0 ? "unresolved quality failure blocks downgrade"
+      : input.previousTurnErrored === true ? "previous turn errored; struggle rate is 4x after an error"
+      : input.priorUserTurns === 0 ? "first turn of a session; no established work to lean on"
       : (assessment.highImpactProbability ?? 0) >= 0.5 ? "high-impact signal blocks downgrade"
       : reviewPhase ? "review work never downgrades"
       : (assessment.underspecifiedProbability ?? 0) >= 0.5 || assessment.truncated === true ? "insufficient context blocks downgrade"

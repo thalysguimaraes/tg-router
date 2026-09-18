@@ -290,6 +290,12 @@ export default function personalRouter(pi:any) {
       // assessed against it. Cleared by /route handoff and session_compact.
       const substantive=String(event.prompt??'').trim().split(/\s+/).filter(Boolean).length>=8;
       if(!state.taskGoal&&substantive)state.taskGoal=String(event.prompt).slice(0,2000);
+      // Structured difficulty signals from the session itself. Free text is
+      // never added here; each field was measured against the outcome corpus.
+      const lastAssistant=[...messages].reverse().find((msg:any)=>msg?.role==='assistant');
+      const previousTurnErrored=lastAssistant?.stopReason==='error'||state.providerFailed===true;
+      const previousTurnToolCalls=Array.isArray(lastAssistant?.content)?lastAssistant.content.filter((c:any)=>c?.type==='toolCall'||c?.type==='tool_use').length:undefined;
+      const priorUserTurns=messages.filter((msg:any)=>msg?.role==='user').length;
       if(semanticMode!=='off'&&!state.pin){
         const routingContext=buildRoutingContext({
           taskGoal:state.taskGoal?String(state.taskGoal):String(event.prompt??'').slice(0,2000),
@@ -302,6 +308,9 @@ export default function personalRouter(pi:any) {
           hasImages:needsImages,
           toolsRequired:input.needsTools,
           confirmedQualityFailures:state.failedQualityChecks??0,
+          previousTurnErrored,
+          priorUserTurns,
+          ...(previousTurnToolCalls!==undefined?{previousTurnToolCalls}:{}),
         });
         const hmacKey=process.env.OMP_ROUTER_HMAC_KEY??join(root,'keyring');
         const cacheKey=cacheKeyFor(routingContext,assessmentCacheKey({state:routingContext,schemaVersion:JEV_SCHEMA_VERSION,questionSetVersion:JEV_QUESTION_SET_VERSION,classifierModel:JEVS_CLASSIFIER_MODEL,hmacKey:typeof hmacKey==='string'?hmacKey:join(root,'keyring')}),JEV_QUESTION_SET_VERSION,JEVS_CLASSIFIER_MODEL,String(state.epoch??'global'));
@@ -316,7 +325,7 @@ export default function personalRouter(pi:any) {
       const rulesClassification=state.tier&&state.phase?{tier:state.tier,phase:state.phase}:{tier:'complex' as RouteTier,phase:'investigation' as const};
       let semanticResolution:{tier:RouteTier;phase:typeof rulesClassification.phase;source:'rules'|'semantic-assisted'|'semantic-downgrade';reason:string}|undefined;
       if(semanticMode!=='off'&&semanticAssessment){
-        semanticResolution=resolveClassification({assessment:semanticAssessment,rulesClassification,mode:semanticMode,floorTier:state.childFloor?.tier,floorLocksPhase:!!state.childFloor,highValue:state.highValue===true,failedQualityChecks:state.failedQualityChecks??0});
+        semanticResolution=resolveClassification({assessment:semanticAssessment,rulesClassification,mode:semanticMode,floorTier:state.childFloor?.tier,floorLocksPhase:!!state.childFloor,highValue:state.highValue===true,failedQualityChecks:state.failedQualityChecks??0,previousTurnErrored,priorUserTurns});
         if(semanticMode==='shadow'){
           semanticTrace={...(semanticTrace??{}),shadow:{baselineTier:rulesClassification.tier,semanticTier:semanticResolution.tier,proposedSource:semanticResolution.source}};
         } else if(semanticResolution.source!=='rules'){
