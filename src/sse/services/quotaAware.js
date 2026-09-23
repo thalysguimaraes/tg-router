@@ -68,7 +68,11 @@ function quotaRank(usage, provider, model, now) {
   return { known: true, blocked: false, pressure };
 }
 
-/** Known eligible quota precedes unknown quota; unknown accounts retain priority order. */
+/**
+ * Known eligible quota precedes unknown quota; unknown accounts retain priority order.
+ * Accounts at or below the margin rank last instead of being dropped: when every account
+ * is near exhaustion the request still reaches the provider, whose 429 drives modelLock.
+ */
 export async function rankQuotaAwareConnections(connections, model, waitMs = QUOTA_WAIT_MS) {
   if (!connections.length) return [];
   let timer;
@@ -83,8 +87,8 @@ export async function rankQuotaAwareConnections(connections, model, waitMs = QUO
   const now = Date.now();
   return connections
     .map((connection, index) => ({ connection, index, rank: quotaRank(usage[index], connection.provider, model, now) }))
-    .filter(({ rank }) => !rank.blocked)
     .sort((a, b) =>
+      Number(a.rank.blocked) - Number(b.rank.blocked) ||
       Number(b.rank.known) - Number(a.rank.known) ||
       b.rank.pressure - a.rank.pressure ||
       a.index - b.index

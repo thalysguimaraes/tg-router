@@ -66,6 +66,12 @@ describe("quota-aware account selection", () => {
     expect((await getProviderCredentials("claude", null, "claude-sonnet-4"))?.connectionId).toBe("b");
   });
 
+  it("still serves from the best account when every account is below the margin", async () => {
+    mocks.getUsageForProvider.mockImplementation(async (connection) =>
+      connection.id === "a" ? usage(3, 80, 80) : usage(80, 4, 80));
+    expect((await getProviderCredentials("claude", null, "claude-sonnet-4"))?.connectionId).toBe("a");
+  });
+
   it("uses the fable window only for fable models", async () => {
     mocks.getUsageForProvider.mockImplementation(async (connection) =>
       connection.id === "a" ? usage(80, 80, 0) : usage(80, 80, 80));
