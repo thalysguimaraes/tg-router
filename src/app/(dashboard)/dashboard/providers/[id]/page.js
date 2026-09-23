@@ -403,14 +403,6 @@ export default function ProviderDetailPage() {
     }
   };
 
-  const handleRoundRobinToggle = (enabled) => {
-    const strategy = enabled ? "round-robin" : null;
-    const sticky = enabled ? (providerStickyLimit || "1") : providerStickyLimit;
-    if (enabled && !providerStickyLimit) setProviderStickyLimit("1");
-    setProviderStrategy(strategy);
-    saveProviderStrategy(strategy, sticky);
-  };
-
   const handleStickyLimitChange = (value) => {
     setProviderStickyLimit(value);
     saveProviderStrategy("round-robin", value);
@@ -1557,13 +1549,23 @@ export default function ProviderDetailPage() {
                   )}
                 </>
               )}
-              {/* Round Robin toggle */}
+              {/* Account selection strategy */}
               <div className="flex flex-wrap items-center gap-2">
-                <span className="text-xs text-text-muted font-medium">Round Robin</span>
-                <Toggle
-                  checked={providerStrategy === "round-robin"}
-                  onChange={handleRoundRobinToggle}
-                />
+                <span className="text-xs text-text-muted font-medium">Account selection</span>
+                <select
+                  value={providerStrategy || ""}
+                  onChange={(e) => {
+                    const strategy = e.target.value || null;
+                    setProviderStrategy(strategy);
+                    saveProviderStrategy(strategy, providerStickyLimit);
+                  }}
+                  className="px-2 py-1 text-xs border border-border rounded-md bg-background"
+                >
+                  <option value="">Default</option>
+                  <option value="fill-first">Fill first</option>
+                  <option value="round-robin">Round robin</option>
+                  <option value="quota-aware">Quota aware</option>
+                </select>
                 {providerStrategy === "round-robin" && (
                   <div className="flex items-center gap-1.5">
                     <span className="text-xs text-text-muted">Sticky:</span>

@@ -4,6 +4,7 @@ import { formatRetryAfter, checkFallbackError, isModelLockActive, buildModelLock
 import { MAX_RATE_LIMIT_COOLDOWN_MS } from "open-sse/config/errorConfig.js";
 import { resolveProviderId, FREE_PROVIDERS } from "@/shared/constants/providers.js";
 import { getAntigravityQuotaCache } from "./antigravityQuota.js";
+import { rankQuotaAwareConnections } from "./quotaAware.js";
 import * as log from "../utils/logger.js";
 
 // Mutex to prevent race conditions during account selection
@@ -138,16 +139,22 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
     const providerOverride = (settings.providerStrategies || {})[providerId] || {};
     const strategy = providerOverride.fallbackStrategy || settings.fallbackStrategy || "fill-first";
 
+    const rankedConnections = strategy === "quota-aware"
+      ? await rankQuotaAwareConnections(availableConnections, model)
+      : availableConnections;
+
     let connection;
     // Pin to preferred connection if specified and available
     if (preferredConnectionId) {
-      connection = availableConnections.find((c) => c.id === preferredConnectionId);
+      connection = rankedConnections.find((c) => c.id === preferredConnectionId);
       if (connection) {
         log.info("AUTH", `${provider} | pinned to ${connection.id?.slice(0, 8)} (${connection.name || connection.email || "unnamed"})`);
       }
     }
     if (connection) {
       // skip strategy
+    } else if (strategy === "quota-aware") {
+      connection = rankedConnections[0];
     } else if (strategy === "round-robin") {
       const stickyLimit = providerOverride.stickyRoundRobinLimit || settings.stickyRoundRobinLimit || 3;
 
@@ -192,6 +199,7 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
       connection = availableConnections[0];
     }
 
+    if (!connection) return null;
     const resolvedProxy = await resolveConnectionProxyConfig(connection.providerSpecificData || {});
 
     return {
