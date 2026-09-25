@@ -6,6 +6,7 @@ import { parseSSELine, hasValuableContent, fixInvalidId, formatSSE } from "./str
 import { getOpenAIResponsesEventName, isOpenAIResponsesTerminalEvent, formatIncompleteOpenAIResponsesStreamFailure } from "./responsesStreamHelpers.js";
 import { dbg, isDebugEnabled } from "./debugLog.js";
 
+import { extractReasoningText } from "../translator/concerns/reasoning.js";
 import { SSE_DONE, SSE_HEADERS, SSE_HEADERS_NO_BUFFER } from "./sseConstants.js";
 
 export { COLORS, formatSSE };
@@ -190,7 +191,7 @@ export function createSSEStream(options = {}) {
 
               const delta = parsed.choices?.[0]?.delta;
               const content = delta?.content;
-              const reasoning = delta?.reasoning_content;
+              const reasoning = extractReasoningText(delta);
               if (content && typeof content === "string") {
                 totalContentLength += content.length;
                 accumulatedContent += content;
