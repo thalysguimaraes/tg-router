@@ -34,7 +34,10 @@ function buildTransformStream({ provider, sourceFormat, targetFormat, userAgent,
     return createSSETransformStreamWithLogger(FORMATS.OPENAI_RESPONSES, codexTarget, provider, reqLogger, toolNameMap, model, connectionId, body, onStreamComplete, apiKey, customToolNames, credentials);
   }
 
-  if (needsTranslation(targetFormat, sourceFormat)) {
+  // Claude OAuth renames client tools even on same-format requests. Route those
+  // responses through the translator so its decloaking restores the exact names.
+  const needsClaudeToolRestoration = sourceFormat === FORMATS.CLAUDE && toolNameMap?.size > 0;
+  if (needsTranslation(targetFormat, sourceFormat) || needsClaudeToolRestoration) {
     return createSSETransformStreamWithLogger(targetFormat, sourceFormat, provider, reqLogger, toolNameMap, model, connectionId, body, onStreamComplete, apiKey, customToolNames, credentials);
   }
 

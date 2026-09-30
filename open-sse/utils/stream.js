@@ -355,8 +355,10 @@ export function createSSEStream(options = {}) {
         if (translated?.length > 0) {
           for (const item of translated) {
             if (item === null || item === undefined) continue;
-            // Filter empty chunks
-            if (!hasValuableContent(item, sourceFormat)) {
+            // Same-format Claude streams only need tool-name restoration. Keep
+            // all native events, including thinking signatures and future deltas.
+            const isClaudePassthrough = targetFormat === FORMATS.CLAUDE && sourceFormat === FORMATS.CLAUDE;
+            if (!isClaudePassthrough && !hasValuableContent(item, sourceFormat)) {
               continue; // Skip this empty chunk
             }
 
