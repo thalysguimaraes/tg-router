@@ -57,6 +57,10 @@ describe("getCapabilitiesForModel", () => {
     });
   });
 
+  it("reports Claude Sonnet 5.5 as a 1M adaptive-thinking model", () => {
+    expect(getCapabilitiesForModel("claude", "claude-sonnet-5-5")).toMatchObject(claudeSonnet5Expected);
+  });
+
   it("reports Kiro Claude Opus 4.8 as a 1M context model", () => {
     expect(getCapabilitiesForModel("kiro", "claude-opus-4.8").contextWindow).toBe(1000000);
     expect(getCapabilitiesForModel("kiro", "anthropic/claude-opus-4.8").contextWindow).toBe(1000000);
