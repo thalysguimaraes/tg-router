@@ -1,3 +1,8 @@
+# v0.5.86-qa.5 (2026-10-01)
+
+## Fixes
+- **DeepSeek direct**: map the selectable V4.1 Flash id to the upstream `deepseek-flash` API id.
+
 # v0.5.86 (2026-09-23)
 
 ## Features
