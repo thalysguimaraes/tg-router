@@ -29,6 +29,7 @@ vi.mock("../../open-sse/utils/stream.js", () => ({
 
 vi.mock("@/lib/usageDb.js", () => ({
   trackPendingRequest: vi.fn(),
+  saveRequestUsage: vi.fn(async () => {}),
   appendRequestLog: vi.fn(async () => {}),
   saveRequestDetail: vi.fn(async () => {}),
 }));
@@ -293,5 +294,42 @@ describe("handleChatCore Headroom diagnostics", () => {
         messages: [{ role: "user", content: "Write polished prose." }],
       }),
     }));
+  });
+});
+
+describe('handleChatCore multimodal style safeguard', () => {
+  const run = async (content) => {
+    executeMock.mockResolvedValue({ response:new Response(JSON.stringify({choices:[{message:{role:'assistant',content:'ok'},index:0,finish_reason:'stop'}]}),{status:200,headers:{'content-type':'application/json'}}),url:'https://api.deepseek.com/chat/completions',headers:{},transformedBody:null });
+    await handleChatCore({body:{model:'deepseek-v4.1-flash',stream:false,messages:[{role:'user',content}]},modelInfo:{provider:'deepseek',model:'deepseek-v4.1-flash'},credentials:{apiKey:'test',providerSpecificData:{}},connectionId:'media-regression',rtkEnabled:false,headroomEnabled:false,pxpipeEnabled:false,cavemanEnabled:true,cavemanLevel:'full',ponytailEnabled:true,ponytailLevel:'full',clientRawRequest:{endpoint:'/v1/chat/completions',body:{},headers:{accept:'application/json'}}});
+    return executeMock.mock.calls.at(-1)[0].body;
+  };
+  it('preserves the image and user instruction without either style prompt', async () => {
+    const image={type:'image_url',image_url:{url:'data:image/png;base64,synthetic-probe'}};
+    const content=[{type:'text',text:'Identify the image color.'},image];
+    const body=await run(content);
+    expect(body.messages).toEqual([{role:'user',content}]);
+    expect(body.messages[0].content[1]).toEqual(image);
+  });
+  it('retains both style prompts for text-only requests', async () => {
+    const body=await run('Explain this function.');
+    expect(body.messages.find(m=>m.role==='system').content).toContain('Respond like terse caveman');
+    expect(body.messages.find(m=>m.role==='system').content).toContain('You are a lazy senior developer');
+  });
+});
+
+
+describe('Haiku Go translated transport', () => {
+  it('uses Messages URL and x-api-key for an OpenAI client', async () => {
+    executeMock.mockResolvedValue({response:new Response(JSON.stringify({type:'message',role:'assistant',content:[{type:'text',text:'ok'}],stop_reason:'end_turn',usage:{input_tokens:1,output_tokens:1}}),{status:200,headers:{'content-type':'application/json'}}),url:'https://opencode.ai/zen/go/v1/messages',headers:{},transformedBody:null});
+    await handleChatCore({body:{model:'claude-haiku-5-5',stream:false,messages:[{role:'user',content:'hello'}]},modelInfo:{provider:'opencode-go',model:'claude-haiku-5-5'},credentials:{apiKey:'test-key',providerSpecificData:{}},connectionId:'haiku-transport',clientRawRequest:{endpoint:'/v1/chat/completions',body:{},headers:{accept:'application/json'}}});
+    const {credentials,body}=executeMock.mock.calls.at(-1)[0];
+    const {DefaultExecutor}=await import('../../open-sse/executors/default.js');
+    const executor=new DefaultExecutor('opencode-go');
+    const url=executor.buildUrl('claude-haiku-5-5',false,0,credentials);
+    expect(url).toBe('https://opencode.ai/zen/go/v1/messages');
+    const headers=executor.buildHeaders(credentials,false,url,'claude-haiku-5-5',body);
+    expect(headers['x-api-key']).toBe('test-key');
+    expect(headers['anthropic-version']).toBeDefined();
+    expect(body.messages[0].content).toEqual([{type:'text',text:'hello'}]);
   });
 });

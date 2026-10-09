@@ -35,7 +35,10 @@ export default {
   ],
   // supportedFormats follow the endpoint table in https://opencode.ai/docs/go/
   models: [
-    { id: "deepseek-flash", name: "DeepSeek V4.1 Flash", supportedFormats: ["openai"] },
+    { id: "claude-haiku-5-5", name: "Claude Haiku 5.5", targetFormat: "claude", supportedFormats: ["claude"] },
+    { id: "deepseek-v4.1-flash", name: "DeepSeek V4.1 Flash", supportedFormats: ["openai"] },
+    // Compatibility alias: Go uses the versioned wire ID, unlike api.deepseek.com.
+    { id: "deepseek-flash", name: "DeepSeek V4.1 Flash (compatibility alias)", upstreamModelId: "deepseek-v4.1-flash", supportedFormats: ["openai"] },
     { id: "glm-5.3-flash", name: "GLM 5.3 Flash (Vision)", supportedFormats: ["openai"] },
     { id: "glm-5.3", name: "GLM 5.3", supportedFormats: ["openai"] },
     { id: "glm-5.2", name: "GLM 5.2", supportedFormats: ["openai"] },

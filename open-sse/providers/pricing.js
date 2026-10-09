@@ -11,6 +11,8 @@
  */
 export const MODEL_PRICING = {
   // === Anthropic / Claude ===
+  "claude-haiku-5-5": { input: 0.10, output: 0.50, cached: 0.01, reasoning: 0.50, cache_creation: 0.125,
+    longContext: { threshold: 100000, input: 0.50, output: 2.50, cached: 0.05, reasoning: 2.50, cache_creation: 0.625 } },
   "claude-opus-4-6":              { input: 5.00,  output: 25.00, cached: 0.50,  reasoning: 25.00,  cache_creation: 6.25  },
   "claude-opus-4-5-20251101":     { input: 5.00,  output: 25.00, cached: 0.50,  reasoning: 25.00,  cache_creation: 6.25  },
   "claude-sonnet-4-6":            { input: 3.00,  output: 15.00, cached: 0.30,  reasoning: 15.00,  cache_creation: 3.75  },
@@ -424,6 +426,10 @@ export function calculateCostFromTokens(tokens, pricing) {
   let cost = 0;
 
   const inputTokens = tokens.prompt_tokens || tokens.input_tokens || 0;
+  // Prompt-length pricing applies to all token categories, including cache reads.
+  if (pricing.longContext && inputTokens > pricing.longContext.threshold) {
+    pricing = { ...pricing, ...pricing.longContext };
+  }
   const cachedTokens = tokens.cached_tokens || tokens.cache_read_input_tokens || 0;
   const cacheCreationTokens = tokens.cache_creation_input_tokens || 0;
   // prompt_tokens is cache-inclusive (see canonicalizeUsage): cached + cache_creation

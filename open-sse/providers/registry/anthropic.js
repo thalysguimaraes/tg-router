@@ -22,6 +22,7 @@ export default {
     },
   },
   models: [
+    { id: "claude-haiku-5-5", name: "Claude Haiku 5.5" },
     { id: "claude-sonnet-4-20250514", name: "Claude Sonnet 4" },
     { id: "claude-opus-4-20250514", name: "Claude Opus 4" },
     { id: "claude-3-5-sonnet-20241022", name: "Claude 3.5 Sonnet" },

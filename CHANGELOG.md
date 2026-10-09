@@ -1,3 +1,12 @@
+# v0.5.86-qa.6 (2026-10-09)
+
+## Fixes
+- Keep Caveman and Ponytail style prompts out of requests carrying media, preserving multimodal accuracy while retaining text-only behavior.
+- Expose the versioned OpenCode Go DeepSeek V4.1 Flash route; keep the unversioned ID as a mapped compatibility alias with the correct limits.
+
+## Features
+- Add Claude Haiku 5.5 through Claude Code, Anthropic API and OpenCode Go, with adaptive thinking, vision and prompt-length pricing.
+
 # v0.5.86-qa.5 (2026-10-01)
 
 ## Fixes
