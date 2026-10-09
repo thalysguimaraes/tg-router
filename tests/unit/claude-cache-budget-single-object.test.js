@@ -56,7 +56,7 @@ describe("cache marker budget and single-block content", () => {
     expect(countMarkers(out)).toBe(1);
   });
 
-  it("keeps a turn whose content is a single object and strips its marker", () => {
+  it("keeps a marked single-object turn and its marker", () => {
     const out = prepareClaudeRequest({
       model: "claude-sonnet-5", max_tokens: 100,
       system: [text("s1")],
@@ -69,7 +69,7 @@ describe("cache marker budget and single-block content", () => {
     const kept = out.messages.filter(m => JSON.stringify(m.content).includes("u1"));
     expect(kept.length).toBe(1);                        // base: 0 (dropped)
     expect(kept[0].content).toHaveLength(1);           // normalized to array
-    expect(kept[0].content[0].cache_control).toBeUndefined();
+    expect(kept[0].content[0].cache_control).toEqual(CC);
   });
 
   it("drops no conversation turn when content is a single text object", () => {
@@ -114,7 +114,7 @@ describe("cache marker budget and single-block content", () => {
     expect(kept.length).toBe(1);
     expect(Array.isArray(kept[0].content)).toBe(true); // base: bare object survives
     expect(kept[0].content).toHaveLength(1);
-    expect(kept[0].content[0].cache_control).toBeUndefined();
+    expect(kept[0].content[0].cache_control).toEqual(CC);
     const ctx = out.messages.find(m => JSON.stringify(m.content).includes("c1"));
     expect(ctx.content).toEqual([text("c1"), text("c2")]);
     expect(countMarkers(out)).toBeLessThanOrEqual(4);  // fixed: 3
@@ -157,13 +157,11 @@ describe("cache marker budget and single-block content", () => {
       ],
     });
     expect(countMarkers(out)).toBe(4);                    // pre-fix: 5 forwarded unchanged
-    expect(out.system[0].cache_control).toBeUndefined();  // earliest marker pruned
+    expect(out.system[1].cache_control).toBeUndefined();  // oldest client marker pruned
   });
 
-  // A spent budget must not cost the head anchors their 1h TTL: system/tools are
-  // the whole point of re-anchoring, and a 5m fallback silently halves the cache
-  // lifetime on exactly the requests that already cached aggressively.
-  it("keeps the 1h head anchors when the client spent the whole budget", () => {
+  // Explicit marks keep their TTL; router defaults apply only to unmarked requests.
+  it("preserves client head markers when the client spent the whole budget", () => {
     const out = anchorClaudeCache({
       system: [text("s1"), text("s2", { cache_control: CC })],
       tools: [tool("t1", { cache_control: CC }), tool("t2")],
@@ -174,11 +172,11 @@ describe("cache marker budget and single-block content", () => {
       ],
     });
     expect(countMarkers(out)).toBeLessThanOrEqual(4);
-    expect(out.system.at(-1).cache_control?.ttl).toBe("1h");  // pre-fix: fell back to 5m
-    expect(out.tools.at(-1).cache_control?.ttl).toBe("1h");   // pre-fix: fell back to 5m
+    expect(out.system.at(-1).cache_control).toEqual(CC);
+    expect(out.tools[0].cache_control).toEqual(CC);
   });
 
-  it("keeps the 1h head anchors on an over-budget body", () => {
+  it("trims over-budget explicit marks from oldest to newest", () => {
     const out = anchorClaudeCache({
       system: [text("s1", { cache_control: CC })],
       tools: [tool("t1", { cache_control: CC }), tool("t2")],
@@ -191,8 +189,11 @@ describe("cache marker budget and single-block content", () => {
       ],
     });
     expect(countMarkers(out)).toBe(4);
-    expect(out.system.at(-1).cache_control?.ttl).toBe("1h");
-    expect(out.tools.at(-1).cache_control?.ttl).toBe("1h");
+    expect(out.system[0].cache_control).toBeUndefined();
+    expect(out.tools[0].cache_control).toBeUndefined();
+    expect(out.messages[1].content[0].cache_control).toEqual(CC);
+    expect(out.messages[2].content[0].cache_control).toEqual(CC);
+    expect(out.messages[3].content[0].cache_control).toEqual(CC);
   });
 
   it("strips a marker from a deferred tool even when the budget is spent", () => {

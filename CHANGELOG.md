@@ -1,3 +1,8 @@
+# Unreleased
+
+## Fixes
+- Preserve Claude client prompt-cache markers and TTLs; cap explicit breakpoints at four while retaining latest marks.
+
 # v0.5.86-qa.6 (2026-10-09)
 
 ## Fixes

@@ -47,15 +47,11 @@ export function hasValidContent(msg) {
   return false;
 }
 // Content may arrive as a single content block object (spec allows string | array;
-// some clients send the bare object). Wrap it as a one-block array and strip any
-// client-placed cache_control: a bare-object marker must never survive
-// normalization, on any path, guard or no guard.
+// some clients send the bare object). Wrap it as a one-block array without losing
+// its cache_control marker.
 function normalizeMessageContent(msg) {
   const c = msg?.content;
-  if (c && typeof c === "object" && !Array.isArray(c)) {
-    delete c.cache_control;
-    msg.content = [c];
-  }
+  if (c && typeof c === "object" && !Array.isArray(c)) msg.content = [c];
   return msg;
 }
 
@@ -74,19 +70,9 @@ function countCacheControlBlocks(body) {
   }
   return n;
 }
-// Trim every marker past the 4-marker budget. The head anchors (last system
-// block, last cacheable tool) are held; the remaining slots go to the tail-most
-// of the other markers in document order. A plain "keep the last 4 in document
-// order" rule would drop the head anchors first — they lead document order, yet
-// they are exactly what re-anchoring exists to pin.
-function capCacheControlBlocks(body) {
-  const isHead = (b) => {
-    const sys = Array.isArray(body?.system) ? body.system : [];
-    if (sys.length && sys[sys.length - 1] === b) return true;
-    const tools = Array.isArray(body?.tools) ? body.tools : [];
-    const lastTool = lastCacheableToolIndex(tools);
-    return lastTool >= 0 && tools[lastTool] === b;
-  };
+// Anthropic allows four cache markers. Default anchors preserve system/tool heads;
+// explicit client markers keep the latest breakpoints.
+function capCacheControlBlocks(body, preserveHeads = true) {
   const marked = [];
   if (Array.isArray(body?.system)) for (const b of body.system) if (b?.cache_control) marked.push(b);
   if (Array.isArray(body?.tools)) for (const t of body.tools) if (t?.cache_control) marked.push(t);
@@ -95,6 +81,17 @@ function capCacheControlBlocks(body) {
       if (Array.isArray(m?.content)) for (const b of m.content) if (b?.cache_control) marked.push(b);
     }
   }
+  if (!preserveHeads) {
+    for (const b of marked.slice(0, Math.max(0, marked.length - 4))) delete b.cache_control;
+    return;
+  }
+  const isHead = (b) => {
+    const sys = Array.isArray(body?.system) ? body.system : [];
+    if (sys.length && sys[sys.length - 1] === b) return true;
+    const tools = Array.isArray(body?.tools) ? body.tools : [];
+    const lastTool = lastCacheableToolIndex(tools);
+    return lastTool >= 0 && tools[lastTool] === b;
+  };
   const head = marked.filter(isHead);
   const rest = marked.filter(b => !isHead(b));
   const keep = Math.max(0, 4 - head.length);
@@ -356,6 +353,11 @@ export function anchorClaudeCache(body) {
       if (t?.defer_loading === true) delete t.cache_control;
     }
   }
+  // Explicit client markers and TTLs take precedence over router defaults.
+  if (countCacheControlBlocks(body) > 0) {
+    capCacheControlBlocks(body, false);
+    return body;
+  }
 
   // Head anchors first, before any budget guard: the 1h TTL on system/tools is
   // the point of re-anchoring, and skipping it because the client spent its
@@ -440,6 +442,7 @@ export function hoistToolResultImages(body) {
 }
 
 export function prepareClaudeRequest(body, provider = null, apiKey = null, connectionId = null, rawHeaders = null, sessionId = null) {
+  const clientCache = countCacheControlBlocks(body) > 0;
   // quirk: MiniMax's Claude-compatible endpoint rejects Anthropic's output_config (400 invalid params)
   if (PROVIDERS[provider]?.quirks?.dropOutputConfig) {
     delete body.output_config;
@@ -468,12 +471,12 @@ export function prepareClaudeRequest(body, provider = null, apiKey = null, conne
     }
   }
 
-  // 1. System: remove all cache_control, add only to last block with ttl 1h
-  if (body.system && Array.isArray(body.system)) {
+  // 1. Unmarked requests: preserve router's default 1h system anchor.
+  if (!clientCache && body.system && Array.isArray(body.system)) {
     body.system = body.system.map((block, i) => {
       const { cache_control, ...rest } = block;
       if (i === body.system.length - 1) {
-        return { ...rest, cache_control: { type: "ephemeral", ttl: "1h" } };
+        return { ...rest, cache_control: { ...CACHE_CONTROL_1H } };
       }
       return rest;
     });
@@ -484,15 +487,14 @@ export function prepareClaudeRequest(body, provider = null, apiKey = null, conne
     const len = body.messages.length;
     let filtered = [];
 
-    // Pass 1: remove cache_control + filter empty messages
+    // Pass 1: filter empty messages; preserve explicit cache breakpoints.
     for (let i = 0; i < len; i++) {
       const msg = body.messages[i];
       normalizeMessageContent(msg);
 
-      // Remove cache_control from content blocks
       if (Array.isArray(msg.content)) {
         for (const block of msg.content) {
-          delete block.cache_control;
+          if (!clientCache || block.type === CLAUDE_BLOCK.THINKING || block.type === CLAUDE_BLOCK.REDACTED_THINKING) delete block.cache_control;
         }
       }
 
@@ -502,6 +504,7 @@ export function prepareClaudeRequest(body, provider = null, apiKey = null, conne
         filtered.push(msg);
       }
     }
+
 
     // Pass 1.5: Fix tool_use/tool_result ordering
     // Each tool_use must have tool_result in the NEXT message (not same message with other content)
@@ -522,7 +525,7 @@ export function prepareClaudeRequest(body, provider = null, apiKey = null, conne
       if (msg.role === "assistant" && Array.isArray(msg.content)) {
         // Add cache_control to last non-thinking block of first (from end) assistant with content
         // thinking/redacted_thinking blocks do not support cache_control
-        if (!lastAssistantProcessed && msg.content.length > 0) {
+        if (!clientCache && !lastAssistantProcessed && msg.content.length > 0) {
           for (let j = msg.content.length - 1; j >= 0; j--) {
             const block = msg.content[j];
             if (block.type !== CLAUDE_BLOCK.THINKING && block.type !== CLAUDE_BLOCK.REDACTED_THINKING) {
@@ -602,6 +605,7 @@ export function prepareClaudeRequest(body, provider = null, apiKey = null, conne
               name: tool.function.name,
               description: tool.function.description,
               input_schema: tool.function.parameters,
+              ...(clientCache && tool.cache_control ? { cache_control: tool.cache_control } : {}),
             };
           }
           // When the provider declared a supportedToolTypes whitelist, keep
@@ -616,14 +620,20 @@ export function prepareClaudeRequest(body, provider = null, apiKey = null, conne
         });
     }
 
-    const lastCacheable = lastCacheableToolIndex(body.tools);
-    body.tools = body.tools.map((tool, i) => {
-      const { cache_control, ...rest } = tool;
-      if (i === lastCacheable) {
-        return { ...rest, cache_control: { type: "ephemeral", ttl: "1h" } };
+    if (clientCache) {
+      for (const tool of body.tools) {
+        if (tool.defer_loading === true) delete tool.cache_control;
       }
-      return rest;
-    });
+    } else {
+      const lastCacheable = lastCacheableToolIndex(body.tools);
+      body.tools = body.tools.map((tool, i) => {
+        const { cache_control, ...rest } = tool;
+        if (i === lastCacheable) {
+          return { ...rest, cache_control: { ...CACHE_CONTROL_1H } };
+        }
+        return rest;
+      });
+    }
 
     // Remove tools array and tool_choice if empty after filtering
     if (body.tools.length === 0) {
@@ -646,6 +656,7 @@ export function prepareClaudeRequest(body, provider = null, apiKey = null, conne
     const sid = sessionId || resolveSessionId({ headers: rawHeaders, body, connectionId, scope: "claude" });
     body = applyCloaking(body, apiKey, sid);
   }
+  if (clientCache) capCacheControlBlocks(body, false);
 
   return body;
 }
