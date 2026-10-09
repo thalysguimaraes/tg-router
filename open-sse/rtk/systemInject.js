@@ -8,10 +8,34 @@ import { ROLE } from "../translator/schema/roles.js";
 
 const SEP = "\n\n";
 
+// Prompt injection changes the request body. A request carrying typed media is
+// deliberately left byte-for-byte intact because the extra system block can
+// interfere with multimodal request behavior.
+// Keep this list limited to content discriminators. In particular, do not
+// search the whole body for words such as "image" — tool schemas and ordinary
+// text are allowed to contain those words.
+const RESPONSES_INPUT_FILE = RESPONSES_ITEM.INPUT_FILE || "input_file";
+const MEDIA_BLOCK_TYPES = new Set([
+  OPENAI_BLOCK.IMAGE_URL,
+  OPENAI_BLOCK.IMAGE,
+  OPENAI_BLOCK.INPUT_AUDIO,
+  OPENAI_BLOCK.AUDIO_URL,
+  OPENAI_BLOCK.FILE,
+  CLAUDE_BLOCK.IMAGE,
+  CLAUDE_BLOCK.DOCUMENT,
+  RESPONSES_ITEM.INPUT_IMAGE,
+  RESPONSES_INPUT_FILE,
+]);
+
 export function injectSystemPrompt(body, format, prompt) {
   try {
     if (!body || !prompt) return;
     if (typeof body !== "object") return;
+
+    // Caveman and ponytail are intentionally skipped for every known media
+    // shape. This guard runs before format dispatch so it also covers native
+    // passthrough bodies and wrappers such as Antigravity/Kiro.
+    if (bodyHasMedia(body)) return;
 
     // Kiro wire shape is unique (conversationState) — handle directly.
     if (isKiroBody(body) || format === FORMATS.KIRO) {
@@ -57,6 +81,63 @@ export function injectSystemPrompt(body, format, prompt) {
   } catch (_) {
     // fail-open
   }
+}
+
+// Scan only content-shaped subtrees. This catches media nested inside
+// tool_result blocks without inspecting tools, schemas, arbitrary metadata, or
+// serialized text that happens to mention an image.
+export function bodyHasMedia(body) {
+  const seen = new Set();
+  const contentHasMedia = (value) => {
+    if (!value || typeof value !== "object" || seen.has(value)) return false;
+    seen.add(value);
+    if (isMediaBlock(value)) return true;
+    if (Array.isArray(value)) return value.some(contentHasMedia);
+    return contentHasMedia(value.content) || contentHasMedia(value.parts);
+  };
+  const messagesHaveMedia = (messages) => messages.some((message) =>
+    (Array.isArray(message?.images) && message.images.length > 0)
+    || contentHasMedia(message?.content)
+  );
+  const responsesHaveMedia = (input) => input.some((item) =>
+    isMediaBlock(item)
+    || contentHasMedia(item?.content)
+    || ((item?.type === RESPONSES_ITEM.FUNCTION_CALL_OUTPUT
+      || item?.type === RESPONSES_ITEM.CUSTOM_TOOL_CALL_OUTPUT)
+      && contentHasMedia(item.output))
+  );
+  const geminiTargetHasMedia = (target) => {
+    const contents = Array.isArray(target?.contents) ? target.contents : [];
+    return contents.some((content) => contentHasMedia(content?.parts))
+      || contentHasMedia(target?.systemInstruction?.parts)
+      || contentHasMedia(target?.system_instruction?.parts);
+  };
+  const kiroHasMedia = (state) => {
+    if (!state || typeof state !== "object") return false;
+    const turns = [
+      ...(Array.isArray(state.history) ? state.history : []),
+      state.currentMessage,
+    ];
+    return turns.some((turn) => {
+      const user = turn?.userInputMessage;
+      return (Array.isArray(user?.images) && user.images.length > 0)
+        || contentHasMedia(user?.content)
+        || contentHasMedia(user?.userInputMessageContext?.toolResults)
+        || contentHasMedia(turn?.assistantResponseMessage?.content);
+    });
+  };
+
+  if (Array.isArray(body?.messages) && messagesHaveMedia(body.messages)) return true;
+  if (Array.isArray(body?.input) && responsesHaveMedia(body.input)) return true;
+  if (geminiTargetHasMedia(body) || geminiTargetHasMedia(body?.request)) return true;
+  return kiroHasMedia(body?.conversationState);
+}
+
+function isMediaBlock(value) {
+  if (!value || typeof value !== "object") return false;
+  return MEDIA_BLOCK_TYPES.has(value.type)
+    || (value.inlineData && typeof value.inlineData === "object")
+    || (value.fileData && typeof value.fileData === "object");
 }
 
 function isKiroBody(body) {

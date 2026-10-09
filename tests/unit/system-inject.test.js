@@ -172,6 +172,120 @@ describe("system-inject dispatch by wire shape", () => {
   });
 });
 
+describe("system-inject multimodal safeguard", () => {
+  const imageSource = { type: "base64", media_type: "image/png", data: "Blue" };
+
+  it.each([
+    [
+      "OpenAI typed image block",
+      FORMATS.OPENAI,
+      {
+        messages: [
+          { role: ROLE.SYSTEM, content: "system" },
+          { role: ROLE.USER, content: [{ type: OPENAI_BLOCK.TEXT, text: "look" }, { type: OPENAI_BLOCK.IMAGE_URL, image_url: { url: "data:image/png;base64,Blue" } }] },
+        ],
+      },
+    ],
+    [
+      "nested tool result image",
+      FORMATS.CLAUDE,
+      {
+        system: "system",
+        messages: [{ role: ROLE.USER, content: [{ type: CLAUDE_BLOCK.TOOL_RESULT, content: [{ type: CLAUDE_BLOCK.IMAGE, source: imageSource }] }] }],
+      },
+    ],
+    [
+      "Responses input_image",
+      FORMATS.OPENAI_RESPONSES,
+      {
+        input: [
+          { type: RESPONSES_ITEM.MESSAGE, role: ROLE.SYSTEM, content: [{ type: RESPONSES_ITEM.INPUT_TEXT, text: "system" }] },
+          { type: RESPONSES_ITEM.MESSAGE, role: ROLE.USER, content: [{ type: RESPONSES_ITEM.INPUT_IMAGE, image_url: "data:image/png;base64,Blue" }] },
+        ],
+      },
+    ],
+    [
+      "Gemini inlineData",
+      FORMATS.GEMINI,
+      {
+        systemInstruction: { parts: [{ text: "system" }] },
+        contents: [{ role: "user", parts: [{ text: "look" }, { inlineData: { mimeType: "image/png", data: "Blue" } }] }],
+      },
+    ],
+    [
+      "Gemini fileData",
+      FORMATS.GEMINI,
+      {
+        systemInstruction: { parts: [{ text: "system" }] },
+        contents: [{ role: "user", parts: [{ fileData: { mimeType: "image/png", fileUri: "https://example.test/blue.png" } }] }],
+      },
+    ],
+    [
+      "Kiro images array",
+      FORMATS.KIRO,
+      {
+        conversationState: {
+          history: [{ userInputMessage: { content: "look", images: [{ format: "png", source: { bytes: "Blue" } }] } }],
+        },
+      },
+    ],
+    [
+      "Ollama images array",
+      FORMATS.OLLAMA,
+      {
+        messages: [
+          { role: ROLE.SYSTEM, content: "system" },
+          { role: ROLE.USER, content: "look", images: ["Blue"] },
+        ],
+      },
+    ],
+  ])("leaves %s body byte-for-byte untouched", (_name, format, body) => {
+    const before = structuredClone(body);
+    injectCaveman(body, format, "full");
+    injectPonytail(body, format, "full");
+    expect(body).toEqual(before);
+  });
+
+  it("does not treat image words in tool schemas or tool-result text as media", () => {
+    const body = {
+      messages: [{
+        role: ROLE.SYSTEM,
+        content: "system",
+      }, {
+        role: ROLE.USER,
+        content: [{
+          type: CLAUDE_BLOCK.TOOL_RESULT,
+          content: [{ type: CLAUDE_BLOCK.TEXT, text: "The image_url keyword is ordinary text." }],
+        }],
+      }],
+      tools: [{
+        type: "function",
+        function: {
+          name: "image_tool",
+          description: "Returns an image_url when requested.",
+          parameters: {
+            type: "object",
+            properties: { image: { type: "string" } },
+          },
+        },
+      }],
+    };
+
+    injectCaveman(body, FORMATS.OPENAI, "full");
+    expect(body.messages[0].content).toContain(CAVEMAN_PROMPTS.full);
+    injectPonytail(body, FORMATS.OPENAI, "full");
+    expect(body.messages[0].content).toContain(PONYTAIL_PROMPTS.full);
+  });
+
+  it("preserves text-only injection when images arrays are empty", () => {
+    const body = {
+      messages: [{ role: ROLE.SYSTEM, content: "system" }, { role: ROLE.USER, content: "look", images: [] }],
+    };
+    injectCaveman(body, FORMATS.OLLAMA, "full");
+    expect(body.messages[0].content).toContain(CAVEMAN_PROMPTS.full);
+  });
+});
+
 describe("system-inject claude", () => {
   it("string system appends with SEP and idempotent", () => {
     const body = { system: "base" };
